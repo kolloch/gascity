@@ -365,6 +365,15 @@ func ensureSessionNameAvailableForSelfAndOwner(store beads.Store, name, selfID, 
 		if b.Status == "closed" {
 			continue
 		}
+		// Defense-in-depth: a bead carrying terminal close metadata
+		// (state=gc_swept, orphaned, drained, …) has released its alias
+		// and identifier claims regardless of bd Status. The session_name
+		// permanence check above intentionally runs first so the legacy
+		// "names are permanent" semantic is unaffected; only secondary
+		// alias / identifier collisions below are released.
+		if sessionTerminalStateReleased(b) {
+			continue
+		}
 		if strings.TrimSpace(b.Metadata["alias"]) == name {
 			if continuityIneligibleConfiguredOwner(b, selfOwner) {
 				continue
@@ -394,6 +403,49 @@ func ensureSessionNameAvailableForSelfAndOwner(store beads.Store, name, selfID, 
 
 func failedCreateIdentityReleased(b beads.Bead) bool {
 	return strings.TrimSpace(b.Metadata["state"]) == string(StateFailedCreate)
+}
+
+// sessionTerminalStateReleased reports whether a bead carries terminal close
+// metadata (state or close_reason set to gc_swept, orphaned, drained,
+// stale-session, duplicate, duplicate-repair, reconfigured, or failed-create).
+//
+// Such a bead has been retired by the sweep/orphan/reconcile pipeline. Its
+// alias and session_name claims should be released so a successor session can
+// reuse the identity. We honor terminal metadata regardless of Status because
+// the close pipeline writes terminal state via setMetaBatch before the
+// store.Close call, and a partial close (Close failed, refs/dolt sync race,
+// or stale cache) leaves the bead with state=gc_swept but status=open. That
+// half-closed bead must not block alias reuse — the supervisor observed this
+// failure mode on pe-r7c1 / zack-gastown.furiosa (2026-05-19), where the bead
+// held alias="zack/gastown.furiosa" with state=gc_swept and recurring
+// "alias already belongs to pe-r7c1" warnings across reconciler ticks and
+// process restarts.
+func sessionTerminalStateReleased(b beads.Bead) bool {
+	state := strings.TrimSpace(b.Metadata["state"])
+	switch state {
+	case "gc_swept", "orphaned", "drained", "stale-session",
+		"duplicate", "duplicate-repair", "reconfigured", string(StateFailedCreate):
+		return true
+	}
+	// close_reason is the audit form: validation.on-close=error cities expand
+	// the short state code via CanonicalCloseReason before calling bd close,
+	// so honor both the short code and the canonical expansion.
+	reason := strings.TrimSpace(b.Metadata["close_reason"])
+	switch reason {
+	case "gc_swept", "orphaned", "drained", "stale-session",
+		"duplicate", "duplicate-repair", "reconfigured", string(StateFailedCreate):
+		return true
+	case CanonicalCloseReason("gc_swept"),
+		CanonicalCloseReason("orphaned"),
+		CanonicalCloseReason("drained"),
+		CanonicalCloseReason("stale-session"),
+		CanonicalCloseReason("duplicate"),
+		CanonicalCloseReason("duplicate-repair"),
+		CanonicalCloseReason("reconfigured"),
+		CanonicalCloseReason(string(StateFailedCreate)):
+		return true
+	}
+	return false
 }
 
 func continuityIneligibleConfiguredOwner(b beads.Bead, selfOwner string) bool {
@@ -542,6 +594,11 @@ func noLiveSessionNameCollisions(store beads.Store, name, selfID, selfOwner stri
 		if failedCreateIdentityReleased(b) {
 			continue
 		}
+		// Terminal-state beads (gc_swept, orphaned, …) have released their
+		// identifier claims even if a partial close left status="open".
+		if sessionTerminalStateReleased(b) {
+			continue
+		}
 		// A live bead holding the name as session_name blocks.
 		if strings.TrimSpace(b.Metadata["session_name"]) == name && b.Status != "closed" {
 			return false
@@ -597,6 +654,15 @@ func ensureSessionAliasAvailable(store beads.Store, cfg *config.City, alias, sel
 			continue
 		}
 		if b.Status == "closed" {
+			continue
+		}
+		// Defense-in-depth: a bead carrying terminal close metadata
+		// (state=gc_swept, orphaned, drained, …) has been retired and
+		// its identifier claim is released, even if a partial close
+		// left status="open". Without this guard, half-closed beads
+		// strand their alias across reconciler ticks and restarts —
+		// see pe-r7c1 / zack-gastown.furiosa (2026-05-19).
+		if sessionTerminalStateReleased(b) {
 			continue
 		}
 		if strings.TrimSpace(b.Metadata["session_name"]) == alias {

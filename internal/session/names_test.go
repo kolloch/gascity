@@ -408,6 +408,142 @@ func TestEnsureSessionNameAvailable_AllowsFailedCreateIdentity(t *testing.T) {
 	}
 }
 
+// Regression for pe-r7c1 / zack-gastown.furiosa (2026-05-19): a pool bead
+// swept by GCSweepSessionBeads writes state=gc_swept via setMetaBatch before
+// store.Close. If the close half-succeeds — partial write, cache miss, or
+// refs/dolt sync race — the bead lingers with state=gc_swept but status=open,
+// stranding its alias for hours. The fix releases identifier claims for any
+// bead in a terminal close state regardless of bd Status.
+func TestEnsureAliasAvailable_ReleasesTerminalStateIdentityWhenStatusStillOpen(t *testing.T) {
+	terminalStates := []string{
+		"gc_swept",
+		"orphaned",
+		"drained",
+		"stale-session",
+		"duplicate",
+		"duplicate-repair",
+		"reconfigured",
+		string(StateFailedCreate),
+	}
+	for _, terminal := range terminalStates {
+		t.Run(terminal, func(t *testing.T) {
+			store := beads.NewMemStore()
+			bead, err := store.Create(beads.Bead{
+				Type:   BeadType,
+				Labels: []string{LabelSession},
+				Metadata: map[string]string{
+					"session_name": "polecat-pe-r7c1",
+					"alias":        "zack/gastown.furiosa",
+					"agent_name":   "polecat",
+					"template":     "zack/gastown.polecat",
+					"pool_managed": "true",
+					"pool_slot":    "1",
+					"state":        terminal,
+					"close_reason": CanonicalCloseReason(terminal),
+					"closed_at":    "2026-05-19T00:00:00Z",
+				},
+			})
+			if err != nil {
+				t.Fatalf("Create: %v", err)
+			}
+			// Deliberately do NOT call store.Close — model the partial-close
+			// failure mode where status remains "open" but terminal metadata
+			// is already persisted.
+			got, getErr := store.Get(bead.ID)
+			if getErr != nil {
+				t.Fatalf("Get: %v", getErr)
+			}
+			if got.Status == "closed" {
+				t.Fatalf("test fixture preconditions: bead must remain status=open to model the half-closed sweep; got %q", got.Status)
+			}
+			if err := EnsureAliasAvailable(store, "zack/gastown.furiosa", ""); err != nil {
+				if errors.Is(err, ErrSessionAliasExists) {
+					t.Fatalf("EnsureAliasAvailable(terminal=%s, status=open) error = %v, want nil — terminal-state beads must release their alias claim", terminal, err)
+				}
+				t.Fatalf("EnsureAliasAvailable(terminal=%s) unexpected error: %v", terminal, err)
+			}
+
+			// With config: the configured-named-session create path runs
+			// EnsureAliasAvailableWithConfigForOwner with the named identity
+			// as the prospective owner.
+			cfg := &config.City{
+				NamedSessions: []config.NamedSession{
+					{Template: "gastown.furiosa", Dir: "zack"},
+				},
+			}
+			if err := EnsureAliasAvailableWithConfigForOwner(store, cfg, "zack/gastown.furiosa", "", "zack/gastown.furiosa"); err != nil {
+				if errors.Is(err, ErrSessionAliasExists) {
+					t.Fatalf("EnsureAliasAvailableWithConfigForOwner(terminal=%s, status=open) error = %v, want nil", terminal, err)
+				}
+				t.Fatalf("EnsureAliasAvailableWithConfigForOwner(terminal=%s) unexpected error: %v", terminal, err)
+			}
+		})
+	}
+}
+
+// Companion: an OPEN, live (non-terminal-state) bead still blocks alias
+// reuse. The terminal-state release must not regress the live-collision
+// guard that already protects active named-session beads.
+func TestEnsureAliasAvailable_LiveBeadStillBlocksAlias(t *testing.T) {
+	store := beads.NewMemStore()
+	bead, err := store.Create(beads.Bead{
+		Type:   BeadType,
+		Labels: []string{LabelSession},
+		Metadata: map[string]string{
+			"session_name": "polecat-pe-live",
+			"alias":        "zack/gastown.furiosa",
+			"agent_name":   "polecat",
+			"template":     "zack/gastown.polecat",
+			"pool_managed": "true",
+			"pool_slot":    "1",
+			"state":        "active",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	err = EnsureAliasAvailable(store, "zack/gastown.furiosa", "")
+	if !errors.Is(err, ErrSessionAliasExists) {
+		t.Fatalf("EnsureAliasAvailable(live owner) error = %v, want %v (owner %s)", err, ErrSessionAliasExists, bead.ID)
+	}
+}
+
+// After a fully-closed terminal bead, the alias is also free — confirms the
+// fix does not depend on the partial-close edge case (status=closed alone
+// already releases the alias, but a closed terminal-state bead should still
+// release).
+func TestEnsureAliasAvailable_ReleasesAliasAfterFullSweepClose(t *testing.T) {
+	store := beads.NewMemStore()
+	bead, err := store.Create(beads.Bead{
+		Type:   BeadType,
+		Labels: []string{LabelSession},
+		Metadata: map[string]string{
+			"session_name": "polecat-pe-r7c1",
+			"alias":        "zack/gastown.furiosa",
+			"agent_name":   "polecat",
+			"template":     "zack/gastown.polecat",
+			"pool_managed": "true",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	if err := store.SetMetadataBatch(bead.ID, map[string]string{
+		"state":        "gc_swept",
+		"close_reason": CanonicalCloseReason("gc_swept"),
+		"closed_at":    "2026-05-19T00:00:00Z",
+	}); err != nil {
+		t.Fatalf("SetMetadataBatch: %v", err)
+	}
+	if err := store.Close(bead.ID); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	if err := EnsureAliasAvailable(store, "zack/gastown.furiosa", ""); err != nil {
+		t.Fatalf("EnsureAliasAvailable(fully-closed sweep) = %v, want nil", err)
+	}
+}
+
 func TestEnsureAliasAvailableWithConfig_RejectsConfiguredSingletonAlias(t *testing.T) {
 	store := beads.NewMemStore()
 	cfg := &config.City{
