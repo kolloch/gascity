@@ -18,17 +18,24 @@ gc bd ready --assignee="${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}polecat" --json
 ```
 
 If a bead is returned, claim it with `gc bd update <id> --claim` and follow
-the formula steps. If both come up empty, that is a bug — never wait at the
-prompt. Escalate to the witness:
+the formula steps. If both come up empty, **never wait at the prompt** —
+file an informational FYI to the witness and drain. The mail is an audit
+notice (this session has already drained by the time the witness reads
+it), not a recovery request:
 
 ```bash
 WITNESS_TARGET="${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}witness"
 gc mail send "$WITNESS_TARGET" \
-  -s "ESCALATION: polecat spawned with empty hook [HIGH]" \
-  -m "Session $GC_SESSION_NAME found no assigned work and no routed pool work."
+  -s "ESCALATION: polecat spawned with empty hook [LOW]" \
+  -m "Session $GC_SESSION_NAME found no assigned work and no routed pool work. Draining cleanly — no recovery action needed."
 gc runtime drain-ack
 exit
 ```
+
+Tier is **[LOW]** because the originating session has already drained by
+the time the witness reads this — there is nothing to recover. Keep
+**[HIGH]** for genuine recovery signals (stuck claim, malformed hook,
+missing pack, rate-limit). See the **Escalation** section below.
 
 This rule applies on every entry into this session — first turn after spawn,
 first turn after `gc reload`, first turn after any nudge. **Always start

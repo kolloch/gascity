@@ -508,7 +508,12 @@ func TestPolecatPromptOpensWithImperativeFirstAction(t *testing.T) {
 		"`gc hook`",
 		`gc bd list --assignee="$GC_SESSION_NAME" --status=in_progress`,
 		`gc bd update <id> --claim`,
-		`ESCALATION: polecat spawned with empty hook`,
+		// Tier MUST be [LOW] for the empty-hook spawn case: by the time the
+		// witness sees this mail, the originating session is already gone, so
+		// there is nothing to recover. Keep [HIGH] for genuine recovery
+		// signals (stuck claim, malformed hook, missing pack, rate-limit).
+		// Regression: di-9gm, pe-wisp-iqv8c (17-mail storm 2026-05-20).
+		`ESCALATION: polecat spawned with empty hook [LOW]`,
 		"## FINAL REMINDER: RUN THE DONE SEQUENCE",
 	)
 
