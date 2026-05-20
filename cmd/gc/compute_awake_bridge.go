@@ -97,6 +97,7 @@ func buildAwakeInputFromReconciler(
 			State:                  string(lifecycle.CompatState),
 			SleepReason:            b.Metadata["sleep_reason"],
 			ManualSession:          isManualSessionBead(*b),
+			PoolManaged:            isPoolManagedSessionBead(*b),
 			PendingCreate:          lifecycle.HasWakeCause(session.WakeCausePendingCreate),
 			ExplicitWake:           lifecycle.HasWakeCause(session.WakeCauseExplicit),
 			DependencyOnly:         b.Metadata["dependency_only"] == "true",

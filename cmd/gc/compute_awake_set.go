@@ -55,6 +55,7 @@ type AwakeSessionBead struct {
 	State                  string // "creating", "active", "asleep", "drained", "closed"
 	SleepReason            string
 	ManualSession          bool
+	PoolManaged            bool      // pool_managed=true; eligible for scale-check wake-asleep reuse
 	PendingCreate          bool      // controller claimed this bead for initial start
 	ExplicitWake           bool      // explicit durable wake request is pending
 	DependencyOnly         bool      // only wakeable via dependency gate
@@ -190,6 +191,20 @@ func ComputeAwakeSet(input AwakeInput) map[string]AwakeDecision {
 			desired[bead.SessionName] = "scaled:creating"
 			filled++
 		}
+		// Wake asleep ephemeral pool beads to satisfy remaining demand before
+		// creating fresh sessions. Reusing an asleep session preserves its
+		// worktree and any cached state from the prior run.
+		asleep := collectAsleepBeads(input.SessionBeads, template)
+		for _, bead := range asleep {
+			if filled >= count {
+				break
+			}
+			if sessionHasConcreteAssignedWork(input.WorkBeads, bead) {
+				continue
+			}
+			desired[bead.SessionName] = "scaled:wake"
+			filled++
+		}
 	}
 
 	// WorkSet: defense-in-depth wake signal from work_query.
@@ -217,6 +232,10 @@ func ComputeAwakeSet(input AwakeInput) map[string]AwakeDecision {
 		}
 		if creating := collectCreatingBeads(input.SessionBeads, template); len(creating) > 0 {
 			desired[creating[0].SessionName] = "work-query"
+			continue
+		}
+		if asleep := collectAsleepBeads(input.SessionBeads, template); len(asleep) > 0 {
+			desired[asleep[0].SessionName] = "work-query"
 		}
 	}
 
@@ -497,6 +516,26 @@ func collectCreatingBeads(beads []AwakeSessionBead, template string) []AwakeSess
 		if b.Template == template && b.State == "creating" &&
 			b.NamedIdentity == "" && !b.ConfiguredNamedSession &&
 			!b.ManualSession && !b.Drained && !b.DependencyOnly {
+			result = append(result, b)
+		}
+	}
+	return result
+}
+
+// collectAsleepBeads returns ephemeral pool beads of the given template that
+// are eligible to be woken to satisfy new scale_check demand. Pool sessions
+// only; singleton asleep sessions wake exclusively via direct alias-based
+// assignment, never via generic scale_check demand. Named sessions, manual
+// sessions, drained beads, dependency-only beads, and beads still carrying
+// a pending-create claim (already in the pending-create wake set) are
+// excluded — they have their own lifecycle paths.
+func collectAsleepBeads(beads []AwakeSessionBead, template string) []AwakeSessionBead {
+	var result []AwakeSessionBead
+	for _, b := range beads {
+		if b.Template == template && b.State == "asleep" && b.PoolManaged &&
+			b.NamedIdentity == "" && !b.ConfiguredNamedSession &&
+			!b.ManualSession && !b.Drained && !b.DependencyOnly &&
+			!b.PendingCreate {
 			result = append(result, b)
 		}
 	}

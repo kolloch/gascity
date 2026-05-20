@@ -179,13 +179,16 @@ func computePoolDesiredStates(
 		}
 	}
 	inFlightNewRequests := poolInFlightNewRequests(cfg, sessionBeads, resumeSessionBeadIDs)
+	wakableAsleepRequests := wakableAsleepPoolRequests(cfg, sessionBeads, resumeSessionBeadIDs)
 
 	// Merge scale_check demand. In bead-backed reconciliation, scale_check is
 	// the authoritative signal for new unassigned demand only; resume requests
 	// are calculated independently from assigned work and must not be deducted
 	// from that count. Pool-created sessions that have not claimed work yet
 	// represent already-spent new demand, so they occupy the first new-demand
-	// slots explicitly before anonymous creates are materialized.
+	// slots explicitly before anonymous creates are materialized. Wakable
+	// asleep ephemeral pool beads fill the next slots so the scaler reuses
+	// existing worktrees instead of spawning fresh ones (ga-htl).
 	if len(scaleCheckCounts) > 0 {
 		for i := range cfg.Agents {
 			agent := &cfg.Agents[i]
@@ -200,12 +203,16 @@ func computePoolDesiredStates(
 			newCount := capNewDemandCount(limits, usage, agent, scaleCount)
 			inFlight := inFlightNewRequests[template]
 			inFlightCount := minInt(len(inFlight), newCount)
-			if scaleCount > 0 && len(inFlight) > 0 && trace != nil {
+			asleep := wakableAsleepRequests[template]
+			asleepCount := minInt(len(asleep), newCount-inFlightCount)
+			if scaleCount > 0 && trace != nil && (len(inFlight) > 0 || len(asleep) > 0) {
 				trace.recordDecision(string(TraceSitePoolInFlightReuse), template, "", string(TraceReasonInFlightReuse), "accepted", traceRecordPayload{
 					"scale_check":   scaleCount,
 					"in_flight":     len(inFlight),
 					"reused":        inFlightCount,
-					"anonymous_new": newCount - inFlightCount,
+					"asleep":        len(asleep),
+					"woken":         asleepCount,
+					"anonymous_new": newCount - inFlightCount - asleepCount,
 				}, nil, "")
 			}
 			for j := 0; j < inFlightCount; j++ {
@@ -213,7 +220,12 @@ func computePoolDesiredStates(
 				allRequests = append(allRequests, req)
 				usage.accept(req, limits)
 			}
-			for j := inFlightCount; j < newCount; j++ {
+			for j := 0; j < asleepCount; j++ {
+				req := asleep[j]
+				allRequests = append(allRequests, req)
+				usage.accept(req, limits)
+			}
+			for j := inFlightCount + asleepCount; j < newCount; j++ {
 				req := SessionRequest{
 					Template: template,
 					Tier:     "new",
@@ -276,6 +288,65 @@ func poolSessionConsumesNewDemand(session beads.Bead) bool {
 	// still represent already-spent new demand; lifecycle code owns stale
 	// creating recovery with its clock-aware predicate.
 	return strings.TrimSpace(session.Metadata["state"]) == "creating"
+}
+
+// wakableAsleepPoolRequests returns per-template SessionRequests for asleep
+// ephemeral pool beads that can be woken to satisfy new scale_check demand.
+// Drained beads, named-session beads, manual sessions, beads already in the
+// resume set, and beads still pending their initial start (counted by
+// poolInFlightNewRequests via poolSessionConsumesNewDemand) are excluded —
+// those have their own lifecycle paths. Beads are sorted oldest-first by
+// created_at, matching poolInFlightNewRequests for deterministic selection
+// (ga-htl).
+func wakableAsleepPoolRequests(cfg *config.City, sessionBeads []beads.Bead, resumeSessionBeadIDs map[string]struct{}) map[string][]SessionRequest {
+	requests := make(map[string][]SessionRequest)
+	sortedSessionBeads := append([]beads.Bead(nil), sessionBeads...)
+	sort.SliceStable(sortedSessionBeads, func(i, j int) bool {
+		if !sortedSessionBeads[i].CreatedAt.Equal(sortedSessionBeads[j].CreatedAt) {
+			return sortedSessionBeads[i].CreatedAt.Before(sortedSessionBeads[j].CreatedAt)
+		}
+		return sortedSessionBeads[i].ID < sortedSessionBeads[j].ID
+	})
+	for i := range cfg.Agents {
+		agent := &cfg.Agents[i]
+		if agent.Suspended || !agent.SupportsGenericEphemeralSessions() {
+			continue
+		}
+		template := agent.QualifiedName()
+		for _, sb := range sortedSessionBeads {
+			if sb.ID == "" || sb.Status == "closed" {
+				continue
+			}
+			if _, ok := resumeSessionBeadIDs[sb.ID]; ok {
+				continue
+			}
+			if !isEphemeralSessionBeadForAgent(sb, agent) || !isPoolManagedSessionBead(sb) {
+				continue
+			}
+			if isNamedSessionBead(sb) || isManualSessionBeadForAgent(sb, agent) {
+				continue
+			}
+			if normalizedSessionTemplate(sb, cfg) != template {
+				continue
+			}
+			if strings.TrimSpace(sb.Metadata["state"]) != "asleep" {
+				continue
+			}
+			if isDrainedSessionBead(sb) {
+				continue
+			}
+			if poolSessionConsumesNewDemand(sb) {
+				// Pending-create asleep bead — already counted as in-flight.
+				continue
+			}
+			requests[template] = append(requests[template], SessionRequest{
+				Template:      template,
+				Tier:          "new",
+				SessionBeadID: sb.ID,
+			})
+		}
+	}
+	return requests
 }
 
 // applyNestedCaps enforces workspace, rig, and agent max_active_sessions caps.

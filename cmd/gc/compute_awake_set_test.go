@@ -437,19 +437,23 @@ func TestScaled_Demand1_NoBeads(t *testing.T) {
 	}
 }
 
-func TestScaled_Demand2_OneActive(t *testing.T) {
+func TestScaled_Demand2_OneActiveOneAsleep(t *testing.T) {
 	result := ComputeAwakeSet(AwakeInput{
 		Agents: []AwakeAgent{{QualifiedName: "hello-world/polecat"}},
 		SessionBeads: []AwakeSessionBead{
-			{ID: "mc-1", SessionName: "polecat-mc-1", Template: "hello-world/polecat", State: "active"},
-			{ID: "mc-2", SessionName: "polecat-mc-2", Template: "hello-world/polecat", State: "asleep"},
+			{ID: "mc-1", SessionName: "polecat-mc-1", Template: "hello-world/polecat", State: "active", PoolManaged: true},
+			{ID: "mc-2", SessionName: "polecat-mc-2", Template: "hello-world/polecat", State: "asleep", PoolManaged: true},
 		},
 		ScaleCheckCounts: map[string]int{"hello-world/polecat": 2},
 		RunningSessions:  map[string]bool{"polecat-mc-1": true},
 		Now:              now,
 	})
+	// Active fills slot 1; asleep ephemeral is woken to fill slot 2 instead
+	// of spawning a fresh session (ga-htl).
 	assertAwake(t, result, "polecat-mc-1")
-	assertAsleep(t, result, "polecat-mc-2") // asleep ephemerals not reused
+	assertReason(t, result, "polecat-mc-1", "scaled:demand")
+	assertAwake(t, result, "polecat-mc-2")
+	assertReason(t, result, "polecat-mc-2", "scaled:wake")
 }
 
 func TestScaled_NewDemandDoesNotUseActiveAssignedSessions(t *testing.T) {
@@ -541,16 +545,161 @@ func TestScaled_CreatingBead(t *testing.T) {
 	assertAwake(t, result, "polecat-mc-1")
 }
 
-func TestScaled_AsleepEphemeral_NotReused(t *testing.T) {
+// TestScaled_AsleepEphemeral_WakesForDemand pins ga-htl: an asleep ephemeral
+// pool session is woken to satisfy new scale_check demand instead of leaving
+// it asleep and spawning a fresh session.
+func TestScaled_AsleepEphemeral_WakesForDemand(t *testing.T) {
 	result := ComputeAwakeSet(AwakeInput{
 		Agents: []AwakeAgent{{QualifiedName: "hello-world/polecat"}},
 		SessionBeads: []AwakeSessionBead{
-			{ID: "mc-old", SessionName: "polecat-mc-old", Template: "hello-world/polecat", State: "asleep"},
+			{ID: "mc-old", SessionName: "polecat-mc-old", Template: "hello-world/polecat", State: "asleep", PoolManaged: true},
 		},
 		ScaleCheckCounts: map[string]int{"hello-world/polecat": 1},
 		Now:              now,
 	})
+	assertAwake(t, result, "polecat-mc-old")
+	assertReason(t, result, "polecat-mc-old", "scaled:wake")
+}
+
+// TestScaled_AsleepSingleton_NotWokenViaScaleCheck pins the boundary: a
+// non-pool (singleton) asleep session stays asleep under scale_check demand.
+// Singletons wake exclusively via direct alias-based assignment.
+func TestScaled_AsleepSingleton_NotWokenViaScaleCheck(t *testing.T) {
+	result := ComputeAwakeSet(AwakeInput{
+		Agents: []AwakeAgent{{QualifiedName: "hello-world/polecat"}},
+		SessionBeads: []AwakeSessionBead{
+			{ID: "mc-singleton", SessionName: "polecat-singleton", Template: "hello-world/polecat", State: "asleep"},
+		},
+		ScaleCheckCounts: map[string]int{"hello-world/polecat": 1},
+		Now:              now,
+	})
+	assertAsleep(t, result, "polecat-singleton")
+}
+
+// TestScaled_AsleepEphemeral_NoDemand_StaysAsleep verifies the wake-asleep
+// path only fires when there's actual demand.
+func TestScaled_AsleepEphemeral_NoDemand_StaysAsleep(t *testing.T) {
+	result := ComputeAwakeSet(AwakeInput{
+		Agents: []AwakeAgent{{QualifiedName: "hello-world/polecat"}},
+		SessionBeads: []AwakeSessionBead{
+			{ID: "mc-old", SessionName: "polecat-mc-old", Template: "hello-world/polecat", State: "asleep", PoolManaged: true},
+		},
+		ScaleCheckCounts: map[string]int{"hello-world/polecat": 0},
+		Now:              now,
+	})
 	assertAsleep(t, result, "polecat-mc-old")
+}
+
+// TestScaled_AsleepDrained_NotWokenForDemand verifies that drained asleep
+// beads are excluded from the wake path — they've been retired and the
+// reconciler closes them separately.
+func TestScaled_AsleepDrained_NotWokenForDemand(t *testing.T) {
+	result := ComputeAwakeSet(AwakeInput{
+		Agents: []AwakeAgent{{QualifiedName: "hello-world/polecat"}},
+		SessionBeads: []AwakeSessionBead{
+			{ID: "mc-drained", SessionName: "polecat-mc-drained", Template: "hello-world/polecat", State: "asleep", PoolManaged: true, Drained: true},
+		},
+		ScaleCheckCounts: map[string]int{"hello-world/polecat": 1},
+		Now:              now,
+	})
+	assertAsleep(t, result, "polecat-mc-drained")
+}
+
+// TestScaled_AsleepBeyondDemand_PartialWake verifies that only as many asleep
+// beads as demand are woken; surplus asleep beads stay asleep.
+func TestScaled_AsleepBeyondDemand_PartialWake(t *testing.T) {
+	result := ComputeAwakeSet(AwakeInput{
+		Agents: []AwakeAgent{{QualifiedName: "hello-world/polecat"}},
+		SessionBeads: []AwakeSessionBead{
+			{ID: "mc-a", SessionName: "polecat-mc-a", Template: "hello-world/polecat", State: "asleep", PoolManaged: true},
+			{ID: "mc-b", SessionName: "polecat-mc-b", Template: "hello-world/polecat", State: "asleep", PoolManaged: true},
+			{ID: "mc-c", SessionName: "polecat-mc-c", Template: "hello-world/polecat", State: "asleep", PoolManaged: true},
+		},
+		ScaleCheckCounts: map[string]int{"hello-world/polecat": 1},
+		Now:              now,
+	})
+	awake := 0
+	for _, d := range result {
+		if d.ShouldWake {
+			awake++
+		}
+	}
+	if awake != 1 {
+		t.Errorf("expected exactly 1 woken from 3 asleep with demand=1, got %d", awake)
+	}
+}
+
+// TestScaled_InFlightBeatsAsleep verifies that creating beads fill demand
+// before asleep beads — in-flight work shouldn't be wasted.
+func TestScaled_InFlightBeatsAsleep(t *testing.T) {
+	result := ComputeAwakeSet(AwakeInput{
+		Agents: []AwakeAgent{{QualifiedName: "hello-world/polecat"}},
+		SessionBeads: []AwakeSessionBead{
+			{ID: "mc-creating", SessionName: "polecat-mc-creating", Template: "hello-world/polecat", State: "creating", PoolManaged: true},
+			{ID: "mc-asleep", SessionName: "polecat-mc-asleep", Template: "hello-world/polecat", State: "asleep", PoolManaged: true},
+		},
+		ScaleCheckCounts: map[string]int{"hello-world/polecat": 1},
+		Now:              now,
+	})
+	assertAwake(t, result, "polecat-mc-creating")
+	assertReason(t, result, "polecat-mc-creating", "scaled:creating")
+	assertAsleep(t, result, "polecat-mc-asleep")
+}
+
+// TestScaled_CreatingAndAsleepFillTwo verifies the full priority order:
+// active → creating → asleep when there are enough demand slots for each.
+func TestScaled_CreatingAndAsleepFillTwo(t *testing.T) {
+	result := ComputeAwakeSet(AwakeInput{
+		Agents: []AwakeAgent{{QualifiedName: "hello-world/polecat"}},
+		SessionBeads: []AwakeSessionBead{
+			{ID: "mc-creating", SessionName: "polecat-mc-creating", Template: "hello-world/polecat", State: "creating", PoolManaged: true},
+			{ID: "mc-asleep", SessionName: "polecat-mc-asleep", Template: "hello-world/polecat", State: "asleep", PoolManaged: true},
+		},
+		ScaleCheckCounts: map[string]int{"hello-world/polecat": 2},
+		Now:              now,
+	})
+	assertAwake(t, result, "polecat-mc-creating")
+	assertReason(t, result, "polecat-mc-creating", "scaled:creating")
+	assertAwake(t, result, "polecat-mc-asleep")
+	assertReason(t, result, "polecat-mc-asleep", "scaled:wake")
+}
+
+// TestScaled_AsleepWithConcreteWorkAssigned_NotInWakePool verifies the
+// concrete-assigned-work filter applies to the asleep wake path too.
+// A separate code path (assigned-work) already wakes such sessions; the
+// scaled:wake path should skip them so their slot isn't double-counted.
+func TestScaled_AsleepWithConcreteWorkAssigned_NotInWakePool(t *testing.T) {
+	result := ComputeAwakeSet(AwakeInput{
+		Agents: []AwakeAgent{{QualifiedName: "hello-world/polecat"}},
+		SessionBeads: []AwakeSessionBead{
+			{ID: "mc-asleep", SessionName: "polecat-mc-asleep", Template: "hello-world/polecat", State: "asleep", PoolManaged: true},
+		},
+		WorkBeads: []AwakeWorkBead{
+			{ID: "w-1", Assignee: "mc-asleep", Status: "in_progress"},
+		},
+		ScaleCheckCounts: map[string]int{"hello-world/polecat": 1},
+		Now:              now,
+	})
+	// Assigned-work path wakes it for its work, NOT the scaled:wake path.
+	assertAwake(t, result, "polecat-mc-asleep")
+	assertReason(t, result, "polecat-mc-asleep", "assigned-work")
+}
+
+// TestScaled_AsleepNamedSession_NotWokenByPoolScaler defends against the
+// pool scaler waking a configured named session bead by accident.
+func TestScaled_AsleepNamedSession_NotWokenByPoolScaler(t *testing.T) {
+	result := ComputeAwakeSet(AwakeInput{
+		Agents: []AwakeAgent{{QualifiedName: "hello-world/polecat"}},
+		SessionBeads: []AwakeSessionBead{
+			{
+				ID: "mc-named", SessionName: "polecat-named", Template: "hello-world/polecat", State: "asleep",
+				NamedIdentity: "hello-world/polecat", PoolManaged: true,
+			},
+		},
+		ScaleCheckCounts: map[string]int{"hello-world/polecat": 1},
+		Now:              now,
+	})
+	assertAsleep(t, result, "polecat-named")
 }
 
 func TestScaled_MultipleCapped(t *testing.T) {

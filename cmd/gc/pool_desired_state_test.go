@@ -1280,3 +1280,155 @@ func TestComputePoolDesiredStates_RoutedRigScopedDoesNotSpawnNew(t *testing.T) {
 		t.Fatalf("total requests = %d, want 0", total)
 	}
 }
+
+// TestComputePoolDesiredStates_WakesAsleepInsteadOfSpawningFresh pins ga-htl:
+// when scale_check shows new demand AND an asleep ephemeral pool bead exists,
+// the scaler emits a request pointing to the asleep bead (so the reconciler
+// wakes it) instead of an anonymous create request (which would spawn fresh
+// with a new worktree).
+func TestComputePoolDesiredStates_WakesAsleepInsteadOfSpawningFresh(t *testing.T) {
+	cfg := &config.City{
+		Agents: []config.Agent{poolAgent("claude", "", intPtr(5), 0)},
+	}
+	asleep := poolSessionBeadWithState("sess-asleep", "asleep", "")
+
+	result := ComputePoolDesiredStates(cfg, nil, []beads.Bead{asleep}, map[string]int{"claude": 1})
+
+	if len(result) != 1 || len(result[0].Requests) != 1 {
+		t.Fatalf("result = %#v, want exactly one wake request", result)
+	}
+	req := result[0].Requests[0]
+	if req.SessionBeadID != asleep.ID {
+		t.Fatalf("request SessionBeadID = %q, want %q (asleep bead reuse)", req.SessionBeadID, asleep.ID)
+	}
+	if req.Tier != "new" {
+		t.Fatalf("request Tier = %q, want %q", req.Tier, "new")
+	}
+}
+
+// TestComputePoolDesiredStates_PrefersInFlightOverAsleep verifies that
+// creating beads (already in-flight, already spent demand) are picked before
+// asleep beads when both could satisfy the same demand slot.
+func TestComputePoolDesiredStates_PrefersInFlightOverAsleep(t *testing.T) {
+	cfg := &config.City{
+		Agents: []config.Agent{poolAgent("claude", "", intPtr(5), 0)},
+	}
+	creating := poolSessionBeadWithState("sess-creating", "creating", "")
+	asleep := poolSessionBeadWithState("sess-asleep", "asleep", "")
+
+	result := ComputePoolDesiredStates(cfg, nil, []beads.Bead{creating, asleep}, map[string]int{"claude": 1})
+
+	if len(result) != 1 || len(result[0].Requests) != 1 {
+		t.Fatalf("result = %#v, want exactly one request", result)
+	}
+	if got := result[0].Requests[0].SessionBeadID; got != creating.ID {
+		t.Fatalf("request SessionBeadID = %q, want %q (creating preferred over asleep)", got, creating.ID)
+	}
+}
+
+// TestComputePoolDesiredStates_MixedFillOrder verifies the full priority
+// chain: in-flight first, then asleep, then anonymous new.
+func TestComputePoolDesiredStates_MixedFillOrder(t *testing.T) {
+	cfg := &config.City{
+		Agents: []config.Agent{poolAgent("claude", "", intPtr(10), 0)},
+	}
+	creating := poolSessionBeadWithState("sess-creating", "creating", "")
+	asleep := poolSessionBeadWithState("sess-asleep", "asleep", "")
+
+	result := ComputePoolDesiredStates(cfg, nil, []beads.Bead{creating, asleep}, map[string]int{"claude": 3})
+
+	if len(result) != 1 || len(result[0].Requests) != 3 {
+		t.Fatalf("result = %#v, want three requests", result)
+	}
+	var (
+		gotCreating  bool
+		gotAsleep    bool
+		anonymousNew int
+	)
+	for _, req := range result[0].Requests {
+		switch req.SessionBeadID {
+		case creating.ID:
+			gotCreating = true
+		case asleep.ID:
+			gotAsleep = true
+		case "":
+			anonymousNew++
+		default:
+			t.Fatalf("unexpected SessionBeadID %q in request", req.SessionBeadID)
+		}
+	}
+	if !gotCreating || !gotAsleep || anonymousNew != 1 {
+		t.Fatalf("creating=%v asleep=%v anonymous=%d, want true/true/1", gotCreating, gotAsleep, anonymousNew)
+	}
+}
+
+// TestComputePoolDesiredStates_AsleepDrainedDoesNotConsumeDemand verifies
+// that drained asleep beads (sleep_reason="drained") are excluded from the
+// wake-asleep path; the scaler still spawns fresh for the demand.
+func TestComputePoolDesiredStates_AsleepDrainedDoesNotConsumeDemand(t *testing.T) {
+	cfg := &config.City{
+		Agents: []config.Agent{poolAgent("claude", "", intPtr(5), 0)},
+	}
+	drained := poolSessionBeadWithState("sess-drained", "asleep", "")
+	drained.Metadata["sleep_reason"] = "drained"
+
+	result := ComputePoolDesiredStates(cfg, nil, []beads.Bead{drained}, map[string]int{"claude": 1})
+
+	if len(result) != 1 || len(result[0].Requests) != 1 {
+		t.Fatalf("result = %#v, want one anonymous-new request", result)
+	}
+	if got := result[0].Requests[0].SessionBeadID; got != "" {
+		t.Fatalf("request SessionBeadID = %q, want empty (drained asleep excluded)", got)
+	}
+}
+
+// TestComputePoolDesiredStates_AsleepWithoutDemand_NoRequest verifies that
+// asleep beads alone (without scale_check demand) do not generate requests.
+func TestComputePoolDesiredStates_AsleepWithoutDemand_NoRequest(t *testing.T) {
+	cfg := &config.City{
+		Agents: []config.Agent{poolAgent("claude", "", intPtr(5), 0)},
+	}
+	asleep := poolSessionBeadWithState("sess-asleep", "asleep", "")
+
+	result := ComputePoolDesiredStates(cfg, nil, []beads.Bead{asleep}, map[string]int{"claude": 0})
+
+	total := 0
+	for _, ds := range result {
+		total += len(ds.Requests)
+	}
+	if total != 0 {
+		t.Fatalf("total requests = %d, want 0 (no demand)", total)
+	}
+}
+
+// TestComputePoolDesiredStates_MoreAsleepThanDemand_PartialReuse verifies
+// that only as many asleep beads as needed are picked; surplus stay asleep
+// and do not generate requests.
+func TestComputePoolDesiredStates_MoreAsleepThanDemand_PartialReuse(t *testing.T) {
+	cfg := &config.City{
+		Agents: []config.Agent{poolAgent("claude", "", intPtr(10), 0)},
+	}
+	asleepA := poolSessionBeadWithState("sess-asleep-a", "asleep", "")
+	asleepA.CreatedAt = time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
+	asleepB := poolSessionBeadWithState("sess-asleep-b", "asleep", "")
+	asleepB.CreatedAt = time.Date(2026, 5, 2, 12, 0, 0, 0, time.UTC)
+	asleepC := poolSessionBeadWithState("sess-asleep-c", "asleep", "")
+	asleepC.CreatedAt = time.Date(2026, 5, 3, 12, 0, 0, 0, time.UTC)
+
+	result := ComputePoolDesiredStates(cfg, nil, []beads.Bead{asleepC, asleepA, asleepB}, map[string]int{"claude": 2})
+
+	if len(result) != 1 || len(result[0].Requests) != 2 {
+		t.Fatalf("result = %#v, want 2 requests", result)
+	}
+	// Oldest two by created_at should be picked: sess-asleep-a, sess-asleep-b.
+	picked := make(map[string]bool, 2)
+	for _, req := range result[0].Requests {
+		picked[req.SessionBeadID] = true
+	}
+	if !picked[asleepA.ID] || !picked[asleepB.ID] {
+		t.Fatalf("picked = %v, want oldest two (a, b)", picked)
+	}
+	if picked[asleepC.ID] {
+		t.Fatalf("unexpectedly picked newest asleep bead %q", asleepC.ID)
+	}
+}
