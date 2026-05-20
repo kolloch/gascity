@@ -265,4 +265,3 @@ prompt_template = "agents/polecat/prompt.template.md"
 		}
 	}
 }
-
