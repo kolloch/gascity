@@ -4321,7 +4321,9 @@ func TestCityRuntimeSafeTick_RecoversFromPanicAndLogsTrigger(t *testing.T) {
 }
 
 // safeTick must forward normal (non-panicking) returns unchanged so the
-// wrapper is transparent in the common case.
+// wrapper is transparent in the common case. Heartbeat lines are
+// expected on every tick (see TestCityRuntimeSafeTick_LogsHeartbeat);
+// what must NOT appear on a clean tick is the panic log.
 func TestCityRuntimeSafeTick_PassesThroughWhenNoPanic(t *testing.T) {
 	var stderr bytes.Buffer
 	cr := &CityRuntime{
@@ -4334,9 +4336,342 @@ func TestCityRuntimeSafeTick_PassesThroughWhenNoPanic(t *testing.T) {
 	if !called {
 		t.Fatal("tick body was not invoked")
 	}
-	if stderr.Len() != 0 {
-		t.Errorf("stderr = %q, want empty on clean tick", stderr.String())
+	if strings.Contains(stderr.String(), "panicked") {
+		t.Errorf("stderr = %q, want no panic log on clean tick", stderr.String())
 	}
+}
+
+// safeTick emits a "tick start" / "tick end (dur=…)" pair on stderr on
+// every invocation so a wedge inside cr.tick (no matching end) is
+// visible in the logs. Regression for ga-cfq.
+func TestCityRuntimeSafeTick_LogsHeartbeat(t *testing.T) {
+	var stderr bytes.Buffer
+	cr := &CityRuntime{
+		cityName:  "test-city",
+		logPrefix: "test-city",
+		stderr:    &stderr,
+	}
+	cr.safeTick(func() {}, "patrol")
+
+	got := stderr.String()
+	if !strings.Contains(got, "tick start (trigger=patrol)") {
+		t.Errorf("stderr = %q, want 'tick start (trigger=patrol)'", got)
+	}
+	if !strings.Contains(got, "tick end (trigger=patrol, dur=") {
+		t.Errorf("stderr = %q, want 'tick end (trigger=patrol, dur=...)'", got)
+	}
+	// Heartbeat order matters: start must precede end so a watcher tailing
+	// the log sees the wedge as a started-but-not-ended pair.
+	if strings.Index(got, "tick start") > strings.Index(got, "tick end") {
+		t.Errorf("stderr = %q, want 'tick start' to appear before 'tick end'", got)
+	}
+}
+
+// safeTick stamps atomic timestamps and the current trigger so the
+// watchdog goroutine can detect wedges. Regression for ga-cfq.
+func TestCityRuntimeSafeTick_StampsAtomicTickState(t *testing.T) {
+	cr := &CityRuntime{
+		cityName:  "test-city",
+		logPrefix: "test-city",
+		stderr:    io.Discard,
+	}
+	cr.safeTick(func() {}, "patrol")
+
+	start := cr.lastTickStartNanos.Load()
+	end := cr.lastTickEndNanos.Load()
+	if start == 0 {
+		t.Fatal("lastTickStartNanos was not stamped")
+	}
+	if end < start {
+		t.Fatalf("lastTickEndNanos (%d) < lastTickStartNanos (%d): end must follow start", end, start)
+	}
+	triggerPtr := cr.lastTickTrigger.Load()
+	if triggerPtr == nil {
+		t.Fatal("lastTickTrigger was not stamped")
+	}
+	if *triggerPtr != "patrol" {
+		t.Errorf("lastTickTrigger = %q, want 'patrol'", *triggerPtr)
+	}
+}
+
+// safeTick must still stamp the END timestamp when the inner function
+// panics — otherwise the watchdog would see the panicked tick as
+// permanently in-flight and log spurious wedges. Regression for ga-cfq.
+func TestCityRuntimeSafeTick_StampsEndOnPanic(t *testing.T) {
+	var stderr bytes.Buffer
+	cr := &CityRuntime{
+		cityName:  "test-city",
+		logPrefix: "test-city",
+		stderr:    &stderr,
+	}
+	cr.safeTick(func() { panic("boom") }, "patrol")
+
+	start := cr.lastTickStartNanos.Load()
+	end := cr.lastTickEndNanos.Load()
+	if end < start {
+		t.Fatalf("lastTickEndNanos (%d) < lastTickStartNanos (%d): end must be stamped even on panic", end, start)
+	}
+}
+
+// checkTickWatchdog must stay quiet when no tick has ever fired.
+func TestCheckTickWatchdog_NoTickYet_StaysQuiet(t *testing.T) {
+	var stderr bytes.Buffer
+	cr := &CityRuntime{cityName: "test-city", logPrefix: "test-city", stderr: &stderr}
+	var lastWarned int64
+	cr.checkTickWatchdog(time.Now(), 100*time.Millisecond, &lastWarned)
+	if stderr.Len() != 0 {
+		t.Errorf("stderr = %q, want silent (no tick yet)", stderr.String())
+	}
+}
+
+// checkTickWatchdog must stay quiet when the in-flight tick is within
+// the threshold. Slow-but-progressing ticks should not spam stderr.
+func TestCheckTickWatchdog_WithinThreshold_StaysQuiet(t *testing.T) {
+	var stderr bytes.Buffer
+	cr := &CityRuntime{cityName: "test-city", logPrefix: "test-city", stderr: &stderr}
+	now := time.Now()
+	cr.lastTickStartNanos.Store(now.UnixNano())
+	var lastWarned int64
+	cr.checkTickWatchdog(now.Add(50*time.Millisecond), 100*time.Millisecond, &lastWarned)
+	if stderr.Len() != 0 {
+		t.Errorf("stderr = %q, want silent (within threshold)", stderr.String())
+	}
+}
+
+// checkTickWatchdog must stay quiet when the last tick has completed.
+func TestCheckTickWatchdog_TickCompleted_StaysQuiet(t *testing.T) {
+	var stderr bytes.Buffer
+	cr := &CityRuntime{cityName: "test-city", logPrefix: "test-city", stderr: &stderr}
+	now := time.Now()
+	cr.lastTickStartNanos.Store(now.UnixNano())
+	cr.lastTickEndNanos.Store(now.Add(10 * time.Millisecond).UnixNano())
+	var lastWarned int64
+	cr.checkTickWatchdog(now.Add(500*time.Millisecond), 100*time.Millisecond, &lastWarned)
+	if stderr.Len() != 0 {
+		t.Errorf("stderr = %q, want silent (tick already completed)", stderr.String())
+	}
+}
+
+// checkTickWatchdog must log once when a tick exceeds the threshold,
+// then rate-limit further warnings for the same wedge so persistent
+// wedges do not flood stderr. Regression for ga-cfq.
+func TestCheckTickWatchdog_WedgedTick_LogsOnceWithTrigger(t *testing.T) {
+	var stderr bytes.Buffer
+	cr := &CityRuntime{cityName: "test-city", logPrefix: "test-city", stderr: &stderr}
+	now := time.Now()
+	cr.lastTickStartNanos.Store(now.UnixNano())
+	trigger := "patrol"
+	cr.lastTickTrigger.Store(&trigger)
+
+	var lastWarned int64
+	cr.checkTickWatchdog(now.Add(250*time.Millisecond), 100*time.Millisecond, &lastWarned)
+	got := stderr.String()
+	if !strings.Contains(got, "reconciler tick watchdog: no tick completed") {
+		t.Errorf("stderr = %q, want watchdog warning", got)
+	}
+	if !strings.Contains(got, "in-flight trigger=patrol") {
+		t.Errorf("stderr = %q, want 'in-flight trigger=patrol'", got)
+	}
+
+	// Re-check while the same wedge persists: must NOT re-log.
+	beforeLen := stderr.Len()
+	cr.checkTickWatchdog(now.Add(500*time.Millisecond), 100*time.Millisecond, &lastWarned)
+	if stderr.Len() != beforeLen {
+		t.Errorf("stderr grew on second check (rate-limit broken): %q", stderr.String()[beforeLen:])
+	}
+}
+
+// checkTickWatchdog must re-log when a NEW wedge starts (different
+// start nanos), so a recurring stall on each tick is visible. The
+// rate-limit is per-wedge, not per-process. Regression for ga-cfq.
+func TestCheckTickWatchdog_NewWedge_LogsAgain(t *testing.T) {
+	var stderr bytes.Buffer
+	cr := &CityRuntime{cityName: "test-city", logPrefix: "test-city", stderr: &stderr}
+	now := time.Now()
+	trigger := "patrol"
+	cr.lastTickTrigger.Store(&trigger)
+
+	// First wedge.
+	cr.lastTickStartNanos.Store(now.UnixNano())
+	var lastWarned int64
+	cr.checkTickWatchdog(now.Add(250*time.Millisecond), 100*time.Millisecond, &lastWarned)
+
+	// First wedge completes.
+	cr.lastTickEndNanos.Store(now.Add(300 * time.Millisecond).UnixNano())
+
+	// New tick starts and also wedges.
+	newStart := now.Add(500 * time.Millisecond)
+	cr.lastTickStartNanos.Store(newStart.UnixNano())
+	cr.checkTickWatchdog(newStart.Add(250*time.Millisecond), 100*time.Millisecond, &lastWarned)
+
+	if got := strings.Count(stderr.String(), "reconciler tick watchdog"); got != 2 {
+		t.Errorf("watchdog log count = %d, want 2 (one per distinct wedge); stderr=%q", got, stderr.String())
+	}
+}
+
+// Acceptance for ga-cfq: an actual safeTick whose body wedges past the
+// threshold is detected by the watchdog body. This is the synthetic
+// equivalent of injecting a sleep into beadReconcileTick /
+// dispatchOrders / ensureManagedDoltPublishedForTick.
+func TestCityRuntimeSafeTick_WatchdogDetectsWedgedSubcall(t *testing.T) {
+	var mu sync.Mutex
+	var stderr bytes.Buffer
+	// safeTick's heartbeat writes interleave with checkTickWatchdog,
+	// so guard the buffer.
+	cr := &CityRuntime{
+		cityName:  "test-city",
+		logPrefix: "test-city",
+		stderr:    &syncWriter{mu: &mu, w: &stderr},
+	}
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		cr.safeTick(func() {
+			close(started)
+			<-release
+		}, "patrol")
+	}()
+	<-started
+
+	// Wait past threshold, then drive the watchdog body manually so
+	// the test doesn't depend on the real ticker cadence.
+	threshold := 50 * time.Millisecond
+	time.Sleep(3 * threshold)
+	var lastWarned int64
+	cr.checkTickWatchdog(time.Now(), threshold, &lastWarned)
+
+	mu.Lock()
+	got := stderr.String()
+	mu.Unlock()
+	if !strings.Contains(got, "reconciler tick watchdog: no tick completed") {
+		t.Errorf("stderr = %q, want watchdog warning for wedged safeTick", got)
+	}
+	if !strings.Contains(got, "in-flight trigger=patrol") {
+		t.Errorf("stderr = %q, want 'in-flight trigger=patrol'", got)
+	}
+
+	close(release)
+	<-done
+}
+
+// syncWriter serializes writes so heartbeat lines from safeTick and
+// watchdog lines from checkTickWatchdog can interleave safely under -race.
+type syncWriter struct {
+	mu *sync.Mutex
+	w  io.Writer
+}
+
+func (s *syncWriter) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.w.Write(p)
+}
+
+// recoverPanic must NOT touch the heartbeat atomics — its callers run
+// concurrently with the main reconciler tick (currently only the
+// reload-accept goroutine), and updating the atomics from a concurrent
+// fast call would mask wedges in the main goroutine from the watchdog.
+// Regression for ga-cfq.
+func TestCityRuntimeRecoverPanic_DoesNotTouchHeartbeatAtomics(t *testing.T) {
+	cr := &CityRuntime{
+		cityName:  "test-city",
+		logPrefix: "test-city",
+		stderr:    io.Discard,
+	}
+	// Pre-stamp atomics as if a wedged main tick is in flight.
+	wedgeStart := time.Now().UnixNano()
+	cr.lastTickStartNanos.Store(wedgeStart)
+	// lastTickEndNanos intentionally left 0 (no completion yet).
+
+	cr.recoverPanic(func() {}, "reload-accept")
+
+	if got := cr.lastTickStartNanos.Load(); got != wedgeStart {
+		t.Errorf("lastTickStartNanos = %d, want %d (recoverPanic must not overwrite)", got, wedgeStart)
+	}
+	if got := cr.lastTickEndNanos.Load(); got != 0 {
+		t.Errorf("lastTickEndNanos = %d, want 0 (recoverPanic must not stamp end)", got)
+	}
+}
+
+// recoverPanic still catches panics and logs them with the trigger.
+func TestCityRuntimeRecoverPanic_RecoversAndLogsPanic(t *testing.T) {
+	var stderr bytes.Buffer
+	cr := &CityRuntime{
+		cityName:  "test-city",
+		logPrefix: "test-city",
+		stderr:    &stderr,
+	}
+	panicked := cr.recoverPanic(func() { panic("boom") }, "reload-accept")
+	if !panicked {
+		t.Error("recoverPanic returned panicked=false, want true")
+	}
+	got := stderr.String()
+	if !strings.Contains(got, "panicked") {
+		t.Errorf("stderr = %q, want panic log", got)
+	}
+	if !strings.Contains(got, "trigger=reload-accept") {
+		t.Errorf("stderr = %q, want 'trigger=reload-accept'", got)
+	}
+}
+
+// The watchdog must remain accurate when a fast concurrent recoverPanic
+// runs while the main reconciler tick is wedged. This is the canonical
+// scenario the bug describes: `gc supervisor reload` (which fires
+// handleReloadRequest via recoverPanic) is invoked during a wedge —
+// historically that masked the wedge, leaving `gc supervisor reload
+// returns ok but does nothing` as the only symptom.
+// Regression for ga-cfq.
+func TestCityRuntimeWatchdog_NotMaskedByConcurrentReloadAccept(t *testing.T) {
+	var mu sync.Mutex
+	var stderr bytes.Buffer
+	cr := &CityRuntime{
+		cityName:  "test-city",
+		logPrefix: "test-city",
+		stderr:    &syncWriter{mu: &mu, w: &stderr},
+	}
+
+	// Start a "wedged" main-loop safeTick.
+	started := make(chan struct{})
+	release := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		cr.safeTick(func() {
+			close(started)
+			<-release
+		}, "patrol")
+	}()
+	<-started
+
+	// Simulate `gc supervisor reload` arriving during the wedge: it
+	// fires handleReloadRequest through recoverPanic on the
+	// reload-accept goroutine. Several rapid calls (an impatient
+	// operator) must not reset the watchdog's view of the wedge.
+	for i := 0; i < 3; i++ {
+		cr.recoverPanic(func() {}, "reload-accept")
+	}
+
+	// Wait past threshold, then run the watchdog body manually.
+	threshold := 50 * time.Millisecond
+	time.Sleep(3 * threshold)
+	var lastWarned int64
+	cr.checkTickWatchdog(time.Now(), threshold, &lastWarned)
+
+	mu.Lock()
+	got := stderr.String()
+	mu.Unlock()
+	if !strings.Contains(got, "reconciler tick watchdog: no tick completed") {
+		t.Errorf("stderr = %q, want watchdog warning despite concurrent recoverPanic", got)
+	}
+	if !strings.Contains(got, "in-flight trigger=patrol") {
+		t.Errorf("stderr = %q, want 'in-flight trigger=patrol' (not reload-accept)", got)
+	}
+
+	close(release)
+	<-done
 }
 
 // A panic during startup reconciliation must NOT cause run() to exit

@@ -117,6 +117,14 @@ type CityRuntime struct {
 	forceStopShutdown        *atomic.Bool
 	logPrefix                string // "gc start" or "gc supervisor"
 	stdout, stderr           io.Writer
+
+	// Tick observability: stamped by safeTick, read by runTickWatchdog.
+	// Together they surface wedges inside cr.tick sub-calls
+	// (beadReconcileTick, dispatchOrders, ensureManagedDoltPublishedForTick)
+	// that otherwise leave the reconciler silent. See ga-cfq.
+	lastTickStartNanos atomic.Int64
+	lastTickEndNanos   atomic.Int64
+	lastTickTrigger    atomic.Pointer[string]
 }
 
 const runtimeDemandSnapshotMaxAge = 30 * time.Second
@@ -373,6 +381,12 @@ func (cr *CityRuntime) run(ctx context.Context) {
 
 	retryDelay := cr.cfg.Daemon.PatrolIntervalDuration()
 	startupRetryLimit := cr.cfg.Daemon.MaxRestartsOrDefault()
+
+	// Tick watchdog covers startup AND steady-state ticks: a wedged
+	// startup safeTick (adoption-barrier, startup, convergence-startup)
+	// surfaces just as a stuck patrol does. Threshold = 2× patrol so a
+	// slow-but-progressing tick doesn't spam stderr. See ga-cfq.
+	go cr.runTickWatchdog(ctx, 2*retryDelay)
 	waitForRetry := func() bool {
 		timer := time.NewTimer(retryDelay)
 		defer timer.Stop()
@@ -608,7 +622,12 @@ func (cr *CityRuntime) run(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case req := <-cr.reloadReqCh:
-				cr.safeTick(func() {
+				// recoverPanic (not safeTick): handleReloadRequest is a
+				// fast mutex op; routing it through safeTick would
+				// repeatedly overwrite the watchdog's heartbeat atomics
+				// while the main reconciler goroutine is wedged, masking
+				// the very condition the watchdog exists to surface.
+				cr.recoverPanic(func() {
 					cr.handleReloadRequest(&req)
 				}, "reload-accept")
 			}
@@ -676,19 +695,104 @@ func (cr *CityRuntime) run(ctx context.Context) {
 // Trigger identifies which tick site fired so operators can correlate
 // the log with the cause.
 func (cr *CityRuntime) safeTick(fn func(), trigger string) (panicked bool) {
+	// Per-tick heartbeat: a stuck sub-call shows up as a "tick start"
+	// with no matching "tick end". Atomic stamps let runTickWatchdog
+	// detect the wedge from a separate goroutine. Diagnostic only —
+	// see ga-cfq. Callers that run outside the main reconciler
+	// goroutine (e.g., the reload-accept goroutine) must use
+	// recoverPanic instead, so their fast-path completions cannot mask
+	// a wedge in the main goroutine from the watchdog.
+	trig := trigger
+	cr.lastTickTrigger.Store(&trig)
+	started := time.Now()
+	cr.lastTickStartNanos.Store(started.UnixNano())
+	fmt.Fprintf(cr.stderr, "%s: tick start (trigger=%s)\n", //nolint:errcheck // best-effort stderr
+		cr.logPrefix, trigger)
+	defer func() {
+		ended := time.Now()
+		cr.lastTickEndNanos.Store(ended.UnixNano())
+		fmt.Fprintf(cr.stderr, "%s: tick end (trigger=%s, dur=%s)\n", //nolint:errcheck // best-effort stderr
+			cr.logPrefix, trigger, ended.Sub(started))
+	}()
+	return cr.recoverPanic(fn, trigger)
+}
+
+// recoverPanic wraps fn in the same panic-recovery shape as safeTick
+// without stamping the heartbeat atomics or emitting tick start/end
+// lines. Use this for safeTick-style guards in goroutines that run
+// concurrently with the main reconciler tick (currently only the
+// reload-accept goroutine), so their fast completions do not overwrite
+// runTickWatchdog's view of the main goroutine's in-flight tick.
+func (cr *CityRuntime) recoverPanic(fn func(), trigger string) (panicked bool) {
 	defer func() {
 		if r := recover(); r != nil {
 			panicked = true
 			// Include the recovered type and a stack trace so a latent
 			// invariant bug (e.g. nil deref) is diagnosable from the log
-			// alone — crucial because safeTick intentionally swallows
-			// the panic and the bug may only surface via repetition.
+			// alone — crucial because this intentionally swallows the
+			// panic and the bug may only surface via repetition.
 			fmt.Fprintf(cr.stderr, "%s: reconciler tick panicked (trigger=%s): %v (type=%T)\n%s\n", //nolint:errcheck // best-effort stderr
 				cr.logPrefix, trigger, r, r, debug.Stack())
 		}
 	}()
 	fn()
 	return false
+}
+
+// runTickWatchdog logs to stderr when no safeTick invocation has
+// completed within threshold. Diagnostic only — no behavior change.
+// It runs as a goroutine spawned from run() and exits on ctx
+// cancellation. The check cadence is half the threshold (floored at
+// 100ms) so a wedge is surfaced within roughly one threshold of its
+// start time. See ga-cfq.
+func (cr *CityRuntime) runTickWatchdog(ctx context.Context, threshold time.Duration) {
+	if threshold <= 0 {
+		return
+	}
+	check := threshold / 2
+	if check < 100*time.Millisecond {
+		check = 100 * time.Millisecond
+	}
+	ticker := time.NewTicker(check)
+	defer ticker.Stop()
+	var lastWarnedStartNanos int64
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			cr.checkTickWatchdog(now, threshold, &lastWarnedStartNanos)
+		}
+	}
+}
+
+// checkTickWatchdog is the watchdog body extracted for testability.
+// It logs once per wedge (keyed by the in-flight tick's start nanos)
+// when the current tick has been running longer than threshold,
+// avoiding stderr floods while a wedge persists.
+func (cr *CityRuntime) checkTickWatchdog(now time.Time, threshold time.Duration, lastWarnedStartNanos *int64) {
+	startNanos := cr.lastTickStartNanos.Load()
+	if startNanos == 0 {
+		return // no tick has fired yet
+	}
+	endNanos := cr.lastTickEndNanos.Load()
+	if endNanos >= startNanos {
+		return // last tick completed; nothing in flight
+	}
+	elapsed := now.Sub(time.Unix(0, startNanos))
+	if elapsed < threshold {
+		return
+	}
+	if *lastWarnedStartNanos == startNanos {
+		return // already warned for this wedge
+	}
+	trigger := ""
+	if p := cr.lastTickTrigger.Load(); p != nil {
+		trigger = *p
+	}
+	fmt.Fprintf(cr.stderr, "%s: reconciler tick watchdog: no tick completed in %s (in-flight trigger=%s)\n", //nolint:errcheck // best-effort stderr
+		cr.logPrefix, elapsed, trigger)
+	*lastWarnedStartNanos = startNanos
 }
 
 func convergenceStartupComplete(cr *CityRuntime) bool {
