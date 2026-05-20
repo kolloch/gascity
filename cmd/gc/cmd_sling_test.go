@@ -1448,6 +1448,81 @@ func TestCmdSlingRefusesMissingBead(t *testing.T) {
 	}
 }
 
+// TestCmdSlingOnFormulaRefusesPlaceholderBeadID guards ga-f6a: when a user
+// passes a placeholder/typo'd bead-id alongside --on (e.g. an unexpanded
+// shell variable like NEW_BEAD_ID), sling must refuse instead of silently
+// creating an empty task bead in the target rig and attaching the formula.
+func TestCmdSlingOnFormulaRefusesPlaceholderBeadID(t *testing.T) {
+	cityDir := setupCmdSlingBeadExistsFixture(t)
+
+	var stdout, stderr bytes.Buffer
+	code := cmdSling(
+		[]string{"frontend/worker", "NEW_BEAD_ID"},
+		false, false, false, // isFormula, doNudge, force=false
+		"", nil, "",
+		true, false, false, "mol-polecat-work", // noConvoy, owned, reassign, onFormula
+		false, false, false, // noFormula, fromStdin, dryRun
+		"", "",
+		&stdout, &stderr,
+	)
+	if code == 0 {
+		t.Fatalf("cmdSling returned 0, want non-zero; stdout=%s stderr=%s", stdout.String(), stderr.String())
+	}
+	got := stderr.String()
+	if !strings.Contains(got, "NEW_BEAD_ID") {
+		t.Errorf("stderr missing bead-id arg; got: %s", got)
+	}
+	if !strings.Contains(got, "not found") {
+		t.Errorf("stderr missing 'not found' phrasing; got: %s", got)
+	}
+	if !strings.Contains(got, "--on") {
+		t.Errorf("stderr should reference --on; got: %s", got)
+	}
+
+	// No bead must be created in either the city or rig store.
+	for _, dir := range []string{cityDir, filepath.Join(cityDir, "frontend")} {
+		store, err := openStoreAtForCity(dir, cityDir)
+		if err != nil {
+			t.Fatalf("openStoreAtForCity(%s): %v", dir, err)
+		}
+		bs, err := store.List(beads.ListQuery{AllowScan: true})
+		if err != nil {
+			t.Fatalf("List(%s): %v", dir, err)
+		}
+		if len(bs) != 0 {
+			t.Fatalf("store %s has %d beads after refused sling, want 0: %#v", dir, len(bs), bs)
+		}
+	}
+}
+
+// TestCmdSlingOnFormulaRefusesPlaceholderBeadIDDryRun mirrors the live-mode
+// guard for --dry-run, so previews of the same invocation also error
+// instead of telling the user "would create new task bead + attach formula".
+func TestCmdSlingOnFormulaRefusesPlaceholderBeadIDDryRun(t *testing.T) {
+	setupCmdSlingBeadExistsFixture(t)
+
+	var stdout, stderr bytes.Buffer
+	code := cmdSling(
+		[]string{"frontend/worker", "NEW_BEAD_ID"},
+		false, false, false,
+		"", nil, "",
+		true, false, false, "mol-polecat-work",
+		false, false, true, // dryRun=true
+		"", "",
+		&stdout, &stderr,
+	)
+	if code == 0 {
+		t.Fatalf("cmdSling dry-run returned 0, want non-zero; stdout=%s stderr=%s", stdout.String(), stderr.String())
+	}
+	got := stderr.String()
+	if !strings.Contains(got, "NEW_BEAD_ID") {
+		t.Errorf("stderr missing bead-id arg; got: %s", got)
+	}
+	if !strings.Contains(got, "not found") {
+		t.Errorf("stderr missing 'not found' phrasing; got: %s", got)
+	}
+}
+
 func TestPrintMissingBeadErrorFormulaBackedDoesNotSuggestForce(t *testing.T) {
 	var stderr bytes.Buffer
 	printMissingBeadError(&stderr, &sling.MissingBeadError{BeadID: "FE-ghost1", StoreRef: "rig:frontend"}, false)

@@ -332,6 +332,16 @@ func cmdSlingWithJSON(args []string, isFormula, doNudge, force bool, title strin
 		if err != nil {
 			return fail("inline_bead_resolve_failed", fmt.Sprintf("gc sling: %v", err))
 		}
+		// --on attaches a formula to an existing bead, so inline-text
+		// creation is incompatible with that intent: if the user typed a
+		// non-bead-id arg (typo, leftover placeholder like NEW_BEAD_ID)
+		// alongside --on, silently creating an empty task would route it
+		// to the target pool. Refuse and surface the bead-id instead.
+		if (createInlineBead || previewInlineText) && onFormula != "" {
+			return fail("bead_not_found", fmt.Sprintf(
+				"gc sling: bead %q not found in store %s; --on=%s requires an existing bead (inline-text auto-creation is disabled when --on is set)",
+				beadOrFormula, storeRef, onFormula))
+		}
 		inlineText = previewInlineText
 		if createInlineBead {
 			created, err := store.Create(beads.Bead{Title: beadOrFormula, Description: stdinDescription, Type: "task"})
