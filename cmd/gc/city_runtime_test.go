@@ -4954,7 +4954,7 @@ func TestCityRuntimeRun_RetriesConvergenceStartupUntilIndexPopulated(t *testing.
 
 	deadline := time.After(5 * time.Second)
 	for {
-		if cr.convStoreAdapter != nil && cr.convStoreAdapter.activeIndex != nil {
+		if scope := cr.convScopes[""]; scope != nil && scope.adapter.activeIndex != nil {
 			cancel()
 			break
 		}
