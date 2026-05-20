@@ -21,6 +21,7 @@ import (
 type fakeCityResolver struct {
 	cities             map[string]*fakeState // keyed by city name
 	listed             []CityInfo
+	starting           map[string]bool // cities registered but not yet Running (mid-adoption)
 	pending            map[string]string
 	supervisorRecorder events.Recorder
 }
@@ -35,6 +36,13 @@ func (f *fakeCityResolver) ListCities() []CityInfo {
 			Running: true,
 		})
 	}
+	for name := range f.starting {
+		out = append(out, CityInfo{
+			Name:    name,
+			Running: false,
+			Status:  "adopting_sessions",
+		})
+	}
 	return out
 }
 
@@ -43,6 +51,19 @@ func (f *fakeCityResolver) CityState(name string) State {
 		return s
 	}
 	return nil
+}
+
+// IsCityRegistered satisfies the CityLookup extension so per-city
+// requests aimed at cities still mid-adoption surface as 503 instead
+// of 404.
+func (f *fakeCityResolver) IsCityRegistered(name string) bool {
+	if _, ok := f.cities[name]; ok {
+		return true
+	}
+	if f.starting != nil && f.starting[name] {
+		return true
+	}
+	return false
 }
 
 func (f *fakeCityResolver) StorePendingRequestID(cityPath, requestID string) error {
@@ -112,9 +133,9 @@ func TestSupervisorCitiesList(t *testing.T) {
 	}
 }
 
-func TestSupervisorCityServiceProxy404sUntilCityRunning(t *testing.T) {
+func TestSupervisorCityServiceProxy404sForUnknownCity(t *testing.T) {
 	sm := newTestSupervisorMux(t, map[string]*fakeState{})
-	req := httptest.NewRequest(http.MethodGet, "/v0/city/starting/svc/review-intake/healthz", nil)
+	req := httptest.NewRequest(http.MethodGet, "/v0/city/unknown/svc/review-intake/healthz", nil)
 	rec := httptest.NewRecorder()
 
 	sm.ServeHTTP(rec, req)
@@ -125,6 +146,91 @@ func TestSupervisorCityServiceProxy404sUntilCityRunning(t *testing.T) {
 	const want = `{"status":404,"title":"Not Found","detail":"not_found: city not found or not running"}`
 	if strings.TrimSpace(rec.Body.String()) != want {
 		t.Fatalf("body = %s, want %s", rec.Body.String(), want)
+	}
+	if got := rec.Header().Get("Retry-After"); got != "" {
+		t.Fatalf("Retry-After = %q, want empty for 404", got)
+	}
+}
+
+func TestSupervisorCityServiceProxy503WhileStarting(t *testing.T) {
+	resolver := &fakeCityResolver{
+		starting: map[string]bool{"booting": true},
+	}
+	sm := NewSupervisorMux(resolver, nil, false, "test", time.Now())
+	req := httptest.NewRequest(http.MethodGet, "/v0/city/booting/svc/review-intake/healthz", nil)
+	rec := httptest.NewRecorder()
+
+	sm.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d (body: %s)", rec.Code, http.StatusServiceUnavailable, rec.Body.String())
+	}
+	const want = `{"status":503,"title":"Service Unavailable","detail":"city_starting: city is starting up or mid-adoption"}`
+	if strings.TrimSpace(rec.Body.String()) != want {
+		t.Fatalf("body = %s, want %s", rec.Body.String(), want)
+	}
+	if got := rec.Header().Get("Retry-After"); got != "30" {
+		t.Fatalf("Retry-After = %q, want 30", got)
+	}
+	if got := rec.Header().Get("Content-Type"); got != "application/problem+json; charset=utf-8" {
+		t.Fatalf("Content-Type = %q, want application/problem+json", got)
+	}
+}
+
+func TestBindCity503DuringAdoption(t *testing.T) {
+	resolver := &fakeCityResolver{
+		starting: map[string]bool{"booting": true},
+	}
+	sm := NewSupervisorMux(resolver, nil, false, "test", time.Now())
+	req := httptest.NewRequest(http.MethodGet, "/v0/city/booting/health", nil)
+	rec := httptest.NewRecorder()
+
+	sm.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want %d (body: %s)", rec.Code, http.StatusServiceUnavailable, rec.Body.String())
+	}
+	if got := rec.Header().Get("Retry-After"); got != "30" {
+		t.Fatalf("Retry-After = %q, want 30", got)
+	}
+	var problem struct {
+		Status int    `json:"status"`
+		Detail string `json:"detail"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &problem); err != nil {
+		t.Fatalf("decode body: %v (body: %s)", err, rec.Body.String())
+	}
+	if problem.Status != http.StatusServiceUnavailable {
+		t.Fatalf("body status = %d, want 503", problem.Status)
+	}
+	if !IsCityStartingDetail(problem.Detail) {
+		t.Fatalf("detail = %q, want city_starting prefix", problem.Detail)
+	}
+}
+
+func TestBindCity404ForUnknownCity(t *testing.T) {
+	resolver := &fakeCityResolver{}
+	sm := NewSupervisorMux(resolver, nil, false, "test", time.Now())
+	req := httptest.NewRequest(http.MethodGet, "/v0/city/unknown/health", nil)
+	rec := httptest.NewRecorder()
+
+	sm.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want %d (body: %s)", rec.Code, http.StatusNotFound, rec.Body.String())
+	}
+	if got := rec.Header().Get("Retry-After"); got != "" {
+		t.Fatalf("Retry-After = %q, want empty for 404", got)
+	}
+	var problem struct {
+		Status int    `json:"status"`
+		Detail string `json:"detail"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &problem); err != nil {
+		t.Fatalf("decode body: %v (body: %s)", err, rec.Body.String())
+	}
+	if !IsCityNotFoundOrNotRunningDetail(problem.Detail) {
+		t.Fatalf("detail = %q, want city-not-found prefix", problem.Detail)
 	}
 }
 

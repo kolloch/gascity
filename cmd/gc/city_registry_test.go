@@ -297,6 +297,47 @@ func TestCityRegistryCityState(t *testing.T) {
 	}
 }
 
+func TestCityRegistryIsCityRegistered(t *testing.T) {
+	reg := newCityRegistry()
+	cs := &controllerState{}
+	mc := &managedCity{
+		name: "city-r",
+		cr:   &CityRuntime{cityName: "city-r", cs: cs},
+	}
+	reg.Add("/path/r", mc)
+
+	// Registered but not yet started — still counts as registered.
+	if !reg.IsCityRegistered("city-r") {
+		t.Fatalf("IsCityRegistered for newly-added city = false, want true (mid-adoption)")
+	}
+
+	// Mark started.
+	reg.UpdateCallback("/path/r", func(m *managedCity) {
+		m.started = true
+	})
+	if !reg.IsCityRegistered("city-r") {
+		t.Fatalf("IsCityRegistered for running city = false, want true")
+	}
+
+	// Unknown city.
+	if reg.IsCityRegistered("nonexistent") {
+		t.Fatalf("IsCityRegistered for nonexistent = true, want false")
+	}
+
+	// Tombstoned → no longer registered (going away).
+	mc.tombstoned.Store(true)
+	reg.BatchUpdate(func(
+		_ map[string]*managedCity,
+		_ map[string]cityInitProgress,
+		_ map[string]*initFailRecord,
+		_ map[string]*panicRecord,
+	) {
+	})
+	if reg.IsCityRegistered("city-r") {
+		t.Fatalf("IsCityRegistered after tombstone = true, want false")
+	}
+}
+
 func TestCityRegistryTombstoned(t *testing.T) {
 	reg := newCityRegistry()
 	cs := &controllerState{}

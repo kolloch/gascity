@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"strings"
 
 	"github.com/danielgtaylor/huma/v2"
@@ -56,10 +57,49 @@ func IsCityNotFoundOrNotRunningDetail(detail string) bool {
 	return strings.HasPrefix(strings.TrimSpace(detail), cityNotFoundOrNotRunningDetailPrefix)
 }
 
+const cityStartingDetailPrefix = "city_starting: city is starting up or mid-adoption: "
+
+// CityStartingDetail returns the stable 503 detail used when a
+// city-scoped route targets a city that is registered but not yet
+// Running (mid-adoption, mid-startup). Paired with a Retry-After
+// header so clients know to retry instead of failing.
+func CityStartingDetail(name string) string {
+	return cityStartingDetailPrefix + name
+}
+
+// IsCityStartingDetail reports whether detail is the stable 503
+// payload used for city-scoped requests during city startup/adoption.
+func IsCityStartingDetail(detail string) bool {
+	return strings.HasPrefix(strings.TrimSpace(detail), cityStartingDetailPrefix)
+}
+
+// cityRetryAfterSeconds is the suggested Retry-After value (in seconds)
+// emitted with 503 responses when a per-city endpoint is hit during
+// city startup/adoption. Tuned to match the slowest observed adoption
+// phases; clients should treat it as a hint, not a hard guarantee.
+const cityRetryAfterSeconds = "30"
+
+// cityUnavailableError translates a missing per-city Server into the
+// appropriate Huma error: 503 + Retry-After when the city is known to
+// the resolver but not yet Running, 404 when the city is genuinely
+// unknown. Used by bindCity and sseCityPrecheck so per-city Huma
+// endpoints surface the same 404/503 distinction as the mux-level
+// /svc/* proxy.
+func cityUnavailableError(sm *SupervisorMux, name string) error {
+	if sm.cityIsRegistered(name) {
+		return huma.ErrorWithHeaders(
+			huma.Error503ServiceUnavailable(CityStartingDetail(name)),
+			http.Header{"Retry-After": []string{cityRetryAfterSeconds}},
+		)
+	}
+	return huma.Error404NotFound(CityNotFoundOrNotRunningDetail(name))
+}
+
 // bindCity wraps a per-city handler method expression as a Huma
 // handler registered on the supervisor API. The returned function
 // resolves the per-city Server for input.GetCityName() and delegates.
-// Returns 404 Problem Details when the named city is not running.
+// Returns 404 when the city is unknown, or 503 + Retry-After when the
+// city is registered but not yet running (mid-adoption).
 func bindCity[I any, O any](
 	sm *SupervisorMux,
 	fn func(*Server, context.Context, *I) (*O, error),
@@ -72,7 +112,7 @@ func bindCity[I any, O any](
 		name := named.GetCityName()
 		srv := sm.resolveCityServer(name)
 		if srv == nil {
-			return nil, huma.Error404NotFound(CityNotFoundOrNotRunningDetail(name))
+			return nil, cityUnavailableError(sm, name)
 		}
 		return fn(srv, ctx, input)
 	}
@@ -181,7 +221,8 @@ func cityRegister[I any, O any](sm *SupervisorMux, op huma.Operation,
 // sseCityPrecheck wraps an SSE precheck method on Server with
 // per-request city resolution. registerSSE runs the precheck before
 // committing response headers, so a missing city translates into a
-// 404 Problem Details on the wire.
+// 404 (unknown) or 503 + Retry-After (mid-adoption) Problem Details
+// on the wire — same distinction as bindCity.
 func sseCityPrecheck[I any](sm *SupervisorMux,
 	fn func(*Server, context.Context, *I) error,
 ) func(context.Context, *I) error {
@@ -189,7 +230,7 @@ func sseCityPrecheck[I any](sm *SupervisorMux,
 		name := cityScopeName(input)
 		srv := sm.resolveCityServer(name)
 		if srv == nil {
-			return huma.Error404NotFound(CityNotFoundOrNotRunningDetail(name))
+			return cityUnavailableError(sm, name)
 		}
 		return fn(srv, ctx, input)
 	}

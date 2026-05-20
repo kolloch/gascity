@@ -19,12 +19,18 @@ import (
 // error paths. Huma handlers do not use these — they return typed
 // huma.StatusError values that Huma serializes.
 type problemBody struct {
-	status int
-	body   []byte
+	status  int
+	body    []byte
+	headers http.Header // optional extra headers (e.g. Retry-After on 503)
 }
 
 func (p problemBody) writeTo(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "application/problem+json; charset=utf-8")
+	for k, vs := range p.headers {
+		for _, v := range vs {
+			w.Header().Add(k, v)
+		}
+	}
 	w.WriteHeader(p.status)
 	_, _ = w.Write(p.body)
 }
@@ -41,6 +47,17 @@ var (
 	problemCityNotFound = problemBody{
 		status: http.StatusNotFound,
 		body:   []byte(`{"status":404,"title":"Not Found","detail":"not_found: city not found or not running"}`),
+	}
+	// problemCityStarting is returned in place of problemCityNotFound when
+	// a per-city request targets a city that IS registered but not yet
+	// Running (mid-adoption, mid-init). 503 + Retry-After lets clients
+	// distinguish "city is starting up, refresh in 30s" from "no such city,"
+	// so they can show a transient loading state instead of falling back
+	// to error-recovery paths intended for unknown cities.
+	problemCityStarting = problemBody{
+		status:  http.StatusServiceUnavailable,
+		body:    []byte(`{"status":503,"title":"Service Unavailable","detail":"city_starting: city is starting up or mid-adoption"}`),
+		headers: http.Header{"Retry-After": []string{"30"}},
 	}
 	problemServiceRouteNotFound = problemBody{
 		status: http.StatusNotFound,

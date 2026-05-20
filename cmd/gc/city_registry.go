@@ -400,6 +400,24 @@ func (r *cityRegistry) CityState(name string) api.State {
 	return view.cs
 }
 
+// IsCityRegistered satisfies the api.CityLookup extension. Returns
+// true for cities that are running or starting (registered but not
+// yet Running, e.g. mid-adoption); false for tombstoned cities,
+// init-failure-only entries that never landed in byName, and unknown
+// names. Lets the supervisor return 503 + Retry-After when a
+// per-city endpoint targets a city mid-startup, instead of 404.
+func (r *cityRegistry) IsCityRegistered(name string) bool {
+	snap := r.snap.Load()
+	view, ok := snap.byName[name]
+	if !ok {
+		return false
+	}
+	if view.Tombstoned {
+		return false
+	}
+	return true
+}
+
 // ListCities returns info about all managed cities. Lock-free read from
 // the atomic snapshot. All cities (running, initializing, and failed) are
 // included in snap.all by rebuildSnapshotLocked.

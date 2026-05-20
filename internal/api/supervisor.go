@@ -35,6 +35,25 @@ type CityResolver interface {
 	CityState(name string) State
 }
 
+// CityLookup is an optional CityResolver extension that distinguishes
+// "city is registered but not yet running" from "city is genuinely
+// unknown." Resolvers that implement this enable the supervisor to
+// return 503 + Retry-After (instead of the catch-all 404) when a
+// per-city endpoint is hit while the named city is mid-adoption or
+// mid-startup, so clients can show a transient "starting up, refresh
+// soon" state instead of routing the response through error-recovery
+// paths meant for unknown cities.
+//
+// Resolvers that do not implement CityLookup retain the legacy 404
+// behavior for every non-running city.
+type CityLookup interface {
+	// IsCityRegistered reports whether the named city is known to the
+	// resolver, regardless of running state. Returns true for cities
+	// that are running, starting, or otherwise registered; false for
+	// tombstoned and never-registered cities.
+	IsCityRegistered(name string) bool
+}
+
 // ErrPendingRequestExists indicates that a matching async request is already
 // waiting for a terminal request-result event.
 var ErrPendingRequestExists = errors.New("pending request already exists")
@@ -270,6 +289,10 @@ func (sm *SupervisorMux) serveCityRequest(w http.ResponseWriter, r *http.Request
 		sm.cacheMu.Lock()
 		delete(sm.cache, cityName)
 		sm.cacheMu.Unlock()
+		if sm.cityIsRegistered(cityName) {
+			problemCityStarting.writeTo(w)
+			return
+		}
 		problemCityNotFound.writeTo(w)
 		return
 	}
@@ -289,6 +312,18 @@ func (sm *SupervisorMux) serveCityRequest(w http.ResponseWriter, r *http.Request
 		log.Printf("SLOW serveCityRequest %s: resolve=%s getServer=%s handler=%s total=%s",
 			path, t1.Sub(t0), t2.Sub(t1), t3.Sub(t2), total)
 	}
+}
+
+// cityIsRegistered reports whether the supervisor's resolver knows
+// about the named city, regardless of running state. False when the
+// resolver does not implement CityLookup (preserves legacy 404
+// behavior for resolvers that have not opted into the distinction).
+func (sm *SupervisorMux) cityIsRegistered(name string) bool {
+	lookup, ok := sm.resolver.(CityLookup)
+	if !ok {
+		return false
+	}
+	return lookup.IsCityRegistered(name)
 }
 
 // getCityServer returns a cached per-city Server, creating one if the
