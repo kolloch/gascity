@@ -706,7 +706,7 @@ func TestDefaultScaleCheckCountsReportsMissingRigStore(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("create city routed bead: %v", err)
 	}
-	targets := defaultScaleCheckTargetsForAgent(cityPath, cfg, agent, cityStore, nil)
+	targets := defaultScaleCheckTargetsForAgent(cityPath, cfg, agent, cityStore, nil, nil)
 
 	counts, partialTemplates, errs := defaultScaleCheckCounts(targets)
 	if got := counts["repos/repo/worker"]; got != 1 {
@@ -752,7 +752,7 @@ func TestDefaultScaleCheckCountsCountsCrossRigRoutedBeads(t *testing.T) {
 		t.Fatalf("create city routed bead: %v", err)
 	}
 
-	targets := defaultScaleCheckTargetsForAgent(cityPath, cfg, agent, cityStore, map[string]beads.Store{"gascity": rigStore})
+	targets := defaultScaleCheckTargetsForAgent(cityPath, cfg, agent, cityStore, map[string]beads.Store{"gascity": rigStore}, nil)
 	counts, partialTemplates, errs := defaultScaleCheckCounts(targets)
 	if len(errs) != 0 {
 		t.Fatalf("defaultScaleCheckCounts errs = %v, want none", errs)
@@ -798,13 +798,137 @@ func TestDefaultScaleCheckCountsDeduplicatesAcrossStores(t *testing.T) {
 	// pointer identities — wrap one in a passthrough to defeat the
 	// pointer-equality short-circuit while still returning the same beads.
 	wrappedCity := &readyPassthroughStore{Store: shared}
-	targets := defaultScaleCheckTargetsForAgent(cityPath, cfg, agent, wrappedCity, map[string]beads.Store{"gascity": shared})
+	targets := defaultScaleCheckTargetsForAgent(cityPath, cfg, agent, wrappedCity, map[string]beads.Store{"gascity": shared}, nil)
 	counts, _, errs := defaultScaleCheckCounts(targets)
 	if len(errs) != 0 {
 		t.Fatalf("defaultScaleCheckCounts errs = %v", errs)
 	}
 	if got := counts["gascity/polecat"]; got != 1 {
 		t.Fatalf("defaultScaleCheckCounts = %d, want 1 (bead must dedup across overlapping stores)", got)
+	}
+}
+
+// TestDefaultScaleCheckCountsSameRigPrefixStillCounts is a regression guard
+// for the ga-o3s federation change: when the routed bead lives in the
+// agent's own rig store (the canonical same-rig path), it must still count
+// exactly once even though the rig store now appears alongside the city
+// store and every other rig store in the federated target list.
+func TestDefaultScaleCheckCountsSameRigPrefixStillCounts(t *testing.T) {
+	cityPath := t.TempDir()
+	cfg := &config.City{
+		Rigs: []config.Rig{{
+			Name: "gascity",
+			Path: filepath.Join(cityPath, "gascity"),
+		}},
+	}
+	agent := &config.Agent{Name: "polecat", Dir: "gascity"}
+	cityStore := beads.NewMemStore()
+	rigStore := beads.NewMemStore()
+
+	if _, err := rigStore.Create(beads.Bead{
+		ID:     "ga-same-rig-1",
+		Title:  "same-rig routed work",
+		Type:   "task",
+		Status: "open",
+		Metadata: map[string]string{
+			"gc.routed_to": "gascity/polecat",
+		},
+	}); err != nil {
+		t.Fatalf("create rig routed bead: %v", err)
+	}
+
+	targets := defaultScaleCheckTargetsForAgent(cityPath, cfg, agent, cityStore, map[string]beads.Store{"gascity": rigStore}, nil)
+	counts, _, errs := defaultScaleCheckCounts(targets)
+	if len(errs) != 0 {
+		t.Fatalf("defaultScaleCheckCounts errs = %v, want none", errs)
+	}
+	if got := counts["gascity/polecat"]; got != 1 {
+		t.Fatalf("defaultScaleCheckCounts = %d, want 1 (same-rig routed bead must still count exactly once)", got)
+	}
+}
+
+// TestDefaultScaleCheckCountsCountsRigToRigRoutedBeads exercises the ga-o3s
+// federation across two rig stores: a bead lives in rig A's store but is
+// routed at a pool template owned by rig B. Without federation the scaler
+// only sees rig B's own store and rig B's pool stays asleep; with
+// federation the bead surfaces as demand for rig B's pool.
+func TestDefaultScaleCheckCountsCountsRigToRigRoutedBeads(t *testing.T) {
+	cityPath := t.TempDir()
+	cfg := &config.City{
+		Rigs: []config.Rig{
+			{Name: "gascity", Path: filepath.Join(cityPath, "gascity")},
+			{Name: "saitoc", Path: filepath.Join(cityPath, "saitoc")},
+		},
+	}
+	agent := &config.Agent{Name: "polecat", Dir: "saitoc"}
+	cityStore := beads.NewMemStore()
+	gascityStore := beads.NewMemStore()
+	saitocStore := beads.NewMemStore()
+
+	if _, err := gascityStore.Create(beads.Bead{
+		ID:     "ga-rig-to-rig-1",
+		Title:  "cross-rig routed work in foreign rig store",
+		Type:   "task",
+		Status: "open",
+		Metadata: map[string]string{
+			"gc.routed_to": "saitoc/polecat",
+		},
+	}); err != nil {
+		t.Fatalf("create gascity routed bead: %v", err)
+	}
+
+	targets := defaultScaleCheckTargetsForAgent(cityPath, cfg, agent, cityStore, map[string]beads.Store{"gascity": gascityStore, "saitoc": saitocStore}, nil)
+	counts, partials, errs := defaultScaleCheckCounts(targets)
+	if len(errs) != 0 {
+		t.Fatalf("defaultScaleCheckCounts errs = %v, want none", errs)
+	}
+	if len(partials) != 0 {
+		t.Fatalf("defaultScaleCheckCounts partials = %v, want none", partials)
+	}
+	if got := counts["saitoc/polecat"]; got != 1 {
+		t.Fatalf("defaultScaleCheckCounts = %d, want 1 (rig-to-rig routed bead must count via federation)", got)
+	}
+}
+
+// TestDefaultScaleCheckCountsExcludesSuspendedRigStores verifies that a
+// routed bead living in a suspended rig's store does NOT contribute demand.
+// Suspended rigs are excluded from federation so they don't drive scaler
+// activity for pools they can no longer serve.
+func TestDefaultScaleCheckCountsExcludesSuspendedRigStores(t *testing.T) {
+	cityPath := t.TempDir()
+	cfg := &config.City{
+		Rigs: []config.Rig{
+			{Name: "gascity", Path: filepath.Join(cityPath, "gascity")},
+			{Name: "saitoc", Path: filepath.Join(cityPath, "saitoc")},
+		},
+	}
+	agent := &config.Agent{Name: "polecat", Dir: "saitoc"}
+	cityStore := beads.NewMemStore()
+	gascityStore := beads.NewMemStore()
+	saitocStore := beads.NewMemStore()
+
+	if _, err := gascityStore.Create(beads.Bead{
+		ID:     "ga-suspended-1",
+		Title:  "routed bead in suspended rig store",
+		Type:   "task",
+		Status: "open",
+		Metadata: map[string]string{
+			"gc.routed_to": "saitoc/polecat",
+		},
+	}); err != nil {
+		t.Fatalf("create gascity routed bead: %v", err)
+	}
+
+	suspendedRigPaths := map[string]bool{
+		filepath.Clean(filepath.Join(cityPath, "gascity")): true,
+	}
+	targets := defaultScaleCheckTargetsForAgent(cityPath, cfg, agent, cityStore, map[string]beads.Store{"gascity": gascityStore, "saitoc": saitocStore}, suspendedRigPaths)
+	counts, _, errs := defaultScaleCheckCounts(targets)
+	if len(errs) != 0 {
+		t.Fatalf("defaultScaleCheckCounts errs = %v, want none", errs)
+	}
+	if got := counts["saitoc/polecat"]; got != 0 {
+		t.Fatalf("defaultScaleCheckCounts = %d, want 0 (suspended rig must not contribute demand)", got)
 	}
 }
 
