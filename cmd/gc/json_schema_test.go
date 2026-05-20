@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/santhosh-tekuri/jsonschema/v6"
 	"github.com/spf13/cobra"
 )
 
@@ -98,6 +99,66 @@ func TestJSONSchemaRoleSpecificResult(t *testing.T) {
 	}
 	if _, ok := schema["x-gc-jsonl"].(map[string]any); !ok {
 		t.Fatalf("schema missing x-gc-jsonl object: %+v", schema)
+	}
+}
+
+func TestJSONSchemaRoleSpecificResultForMailAndTraceShard(t *testing.T) {
+	for _, args := range [][]string{
+		{"mail", "inbox", "--json-schema=result"},
+		{"mail", "read", "--json-schema=result"},
+		{"mail", "peek", "--json-schema=result"},
+		{"mail", "thread", "--json-schema=result"},
+		{"mail", "count", "--json-schema=result"},
+		{"trace", "status", "--json-schema=result"},
+		{"trace", "show", "--json-schema=result"},
+	} {
+		t.Run(strings.Join(args[:len(args)-1], " "), func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			code := run(args, &stdout, &stderr)
+			if code != 0 {
+				t.Fatalf("run(%v) = %d, stderr=%q stdout=%q", args, code, stderr.String(), stdout.String())
+			}
+			if stderr.Len() != 0 {
+				t.Fatalf("stderr = %q, want empty", stderr.String())
+			}
+
+			var schema map[string]any
+			if err := json.Unmarshal(stdout.Bytes(), &schema); err != nil {
+				t.Fatalf("result schema is not JSON: %v\n%s", err, stdout.String())
+			}
+			if schema["$schema"] == "" {
+				t.Fatalf("schema missing $schema: %+v", schema)
+			}
+		})
+	}
+}
+
+func validateJSONResultSchema(t *testing.T, commandPath []string, data []byte) {
+	t.Helper()
+
+	rawSchema, err := readBuiltinSchema(commandPath, jsonSchemaResultRole)
+	if err != nil {
+		t.Fatalf("read %s result schema: %v", strings.Join(commandPath, " "), err)
+	}
+	schemaDoc, err := jsonschema.UnmarshalJSON(bytes.NewReader(rawSchema))
+	if err != nil {
+		t.Fatalf("unmarshal schema: %v", err)
+	}
+	compiler := jsonschema.NewCompiler()
+	schemaName := strings.Join(commandPath, "-") + "-result.schema.json"
+	if err := compiler.AddResource(schemaName, schemaDoc); err != nil {
+		t.Fatalf("add schema resource: %v", err)
+	}
+	schema, err := compiler.Compile(schemaName)
+	if err != nil {
+		t.Fatalf("compile schema: %v", err)
+	}
+	doc, err := jsonschema.UnmarshalJSON(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+	if err := schema.Validate(doc); err != nil {
+		t.Fatalf("payload does not match %s result schema: %v\n%s", strings.Join(commandPath, " "), err, string(data))
 	}
 }
 

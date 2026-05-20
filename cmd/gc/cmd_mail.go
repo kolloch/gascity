@@ -35,6 +35,32 @@ const (
 	mailInjectPreviewScanSize = 4096
 )
 
+type mailInboxJSONResult struct {
+	SchemaVersion string         `json:"schema_version"`
+	Recipient     string         `json:"recipient"`
+	Recipients    []string       `json:"recipients,omitempty"`
+	Messages      []mail.Message `json:"messages"`
+}
+
+type mailThreadJSONResult struct {
+	SchemaVersion string         `json:"schema_version"`
+	ThreadID      string         `json:"thread_id"`
+	Messages      []mail.Message `json:"messages"`
+}
+
+type mailMessageJSONResult struct {
+	SchemaVersion string       `json:"schema_version"`
+	Message       mail.Message `json:"message"`
+}
+
+type mailCountJSONResult struct {
+	SchemaVersion string   `json:"schema_version"`
+	Recipient     string   `json:"recipient"`
+	Recipients    []string `json:"recipients,omitempty"`
+	Total         int      `json:"total"`
+	Unread        int      `json:"unread"`
+}
+
 func newMailNudgeFunc(sender string) nudgeFunc {
 	return func(recipient string) error {
 		target, err := resolveNudgeTarget(recipient, io.Discard)
@@ -954,7 +980,8 @@ Use --all to broadcast to all live sessions (excluding sender and "human").`,
 }
 
 func newMailInboxCmd(stdout, stderr io.Writer) *cobra.Command {
-	return &cobra.Command{
+	var jsonOut bool
+	cmd := &cobra.Command{
 		Use:   "inbox [session]",
 		Short: "List unread messages (defaults to your inbox)",
 		Long: `List all unread messages for a session alias or human.
@@ -963,16 +990,19 @@ Shows message ID, sender, subject, and body in a table. The recipient defaults
 to $GC_SESSION_ID, $GC_ALIAS, $GC_AGENT, or "human". Pass a session alias to view another inbox.`,
 		Args: cobra.ArbitraryArgs,
 		RunE: func(_ *cobra.Command, args []string) error {
-			if cmdMailInbox(args, stdout, stderr) != 0 {
+			if cmdMailInboxWithJSON(args, jsonOut, stdout, stderr) != 0 {
 				return errExit
 			}
 			return nil
 		},
 	}
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit JSON result")
+	return cmd
 }
 
 func newMailReadCmd(stdout, stderr io.Writer) *cobra.Command {
-	return &cobra.Command{
+	var jsonOut bool
+	cmd := &cobra.Command{
 		Use:   "read <id>",
 		Short: "Read a message and mark it as read",
 		Long: `Display a message and mark it as read.
@@ -981,16 +1011,19 @@ Shows the full message details (ID, sender, recipient, subject, date, body).
 The message stays in the store — use "gc mail archive" to permanently close it.`,
 		Args: cobra.ArbitraryArgs,
 		RunE: func(_ *cobra.Command, args []string) error {
-			if cmdMailRead(args, stdout, stderr) != 0 {
+			if cmdMailReadWithJSON(args, jsonOut, stdout, stderr) != 0 {
 				return errExit
 			}
 			return nil
 		},
 	}
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit JSON result")
+	return cmd
 }
 
 func newMailPeekCmd(stdout, stderr io.Writer) *cobra.Command {
-	return &cobra.Command{
+	var jsonOut bool
+	cmd := &cobra.Command{
 		Use:   "peek <id>",
 		Short: "Show a message without marking it as read",
 		Long: `Display a message without marking it as read.
@@ -999,12 +1032,14 @@ Same output as "gc mail read" but does not change the message's read status.
 The message will continue to appear in inbox results.`,
 		Args: cobra.ArbitraryArgs,
 		RunE: func(_ *cobra.Command, args []string) error {
-			if cmdMailPeek(args, stdout, stderr) != 0 {
+			if cmdMailPeekWithJSON(args, jsonOut, stdout, stderr) != 0 {
 				return errExit
 			}
 			return nil
 		},
 	}
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit JSON result")
+	return cmd
 }
 
 func newMailReplyCmd(stdout, stderr io.Writer) *cobra.Command {
@@ -1083,34 +1118,40 @@ deleted in a single batch round-trip.`,
 }
 
 func newMailThreadCmd(stdout, stderr io.Writer) *cobra.Command {
-	return &cobra.Command{
+	var jsonOut bool
+	cmd := &cobra.Command{
 		Use:   "thread <id>",
 		Short: "List all messages in a thread",
 		Long:  `Show all messages sharing a thread ID or message ID, ordered by time.`,
 		Args:  cobra.ArbitraryArgs,
 		RunE: func(_ *cobra.Command, args []string) error {
-			if cmdMailThread(args, stdout, stderr) != 0 {
+			if cmdMailThreadWithJSON(args, jsonOut, stdout, stderr) != 0 {
 				return errExit
 			}
 			return nil
 		},
 	}
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit JSON result")
+	return cmd
 }
 
 func newMailCountCmd(stdout, stderr io.Writer) *cobra.Command {
-	return &cobra.Command{
+	var jsonOut bool
+	cmd := &cobra.Command{
 		Use:   "count [session]",
 		Short: "Show total/unread message count",
 		Long: `Show total and unread message counts for a session alias or human.
 The recipient defaults to $GC_SESSION_ID, $GC_ALIAS, $GC_AGENT, or "human".`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(_ *cobra.Command, args []string) error {
-			if cmdMailCount(args, stdout, stderr) != 0 {
+			if cmdMailCountWithJSON(args, jsonOut, stdout, stderr) != 0 {
 				return errExit
 			}
 			return nil
 		},
 	}
+	cmd.Flags().BoolVar(&jsonOut, "json", false, "emit JSON result")
+	return cmd
 }
 
 // cmdMailSend is the CLI entry point for sending mail. It opens the provider,
@@ -1319,6 +1360,10 @@ func doMailSendAll(mp mail.Provider, rec events.Recorder, validRecipients map[st
 
 // cmdMailInbox is the CLI entry point for checking the inbox.
 func cmdMailInbox(args []string, stdout, stderr io.Writer) int {
+	return cmdMailInboxWithJSON(args, false, stdout, stderr)
+}
+
+func cmdMailInboxWithJSON(args []string, jsonOut bool, stdout, stderr io.Writer) int {
 	mp, code := openCityMailProvider(stderr, "gc mail inbox")
 	if mp == nil {
 		return code
@@ -1329,7 +1374,7 @@ func cmdMailInbox(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	return doMailInboxTarget(mp, target, stdout, stderr)
+	return doMailInboxTargetWithJSON(mp, target, jsonOut, stdout, stderr)
 }
 
 // doMailInbox lists unread messages for a recipient.
@@ -1338,10 +1383,27 @@ func doMailInbox(mp mail.Provider, recipient string, stdout, stderr io.Writer) i
 }
 
 func doMailInboxTarget(mp mail.Provider, target resolvedMailTarget, stdout, stderr io.Writer) int {
+	return doMailInboxTargetWithJSON(mp, target, false, stdout, stderr)
+}
+
+func doMailInboxTargetWithJSON(mp mail.Provider, target resolvedMailTarget, jsonOut bool, stdout, stderr io.Writer) int {
 	messages, err := collectMailMessages(mp.Inbox, target.recipients)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc mail inbox: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
+	}
+
+	if jsonOut {
+		if err := writeCLIJSONLine(stdout, mailInboxJSONResult{
+			SchemaVersion: "1",
+			Recipient:     target.display,
+			Recipients:    jsonRecipients(target),
+			Messages:      messages,
+		}); err != nil {
+			fmt.Fprintf(stderr, "gc mail inbox: %v\n", err) //nolint:errcheck
+			return 1
+		}
+		return 0
 	}
 
 	if len(messages) == 0 {
@@ -1358,19 +1420,22 @@ func doMailInboxTarget(mp mail.Provider, target resolvedMailTarget, stdout, stde
 	return 0
 }
 
-// cmdMailRead is the CLI entry point for reading a message.
-func cmdMailRead(args []string, stdout, stderr io.Writer) int {
+func cmdMailReadWithJSON(args []string, jsonOut bool, stdout, stderr io.Writer) int {
 	mp, code := openCityMailProvider(stderr, "gc mail read")
 	if mp == nil {
 		return code
 	}
 	rec := openCityRecorder(stderr)
-	return doMailRead(mp, rec, args, stdout, stderr)
+	return doMailReadWithJSON(mp, rec, args, jsonOut, stdout, stderr)
 }
 
 // doMailRead displays a message and marks it as read. Accepts an injected
 // provider and recorder for testability.
 func doMailRead(mp mail.Provider, rec events.Recorder, args []string, stdout, stderr io.Writer) int {
+	return doMailReadWithJSON(mp, rec, args, false, stdout, stderr)
+}
+
+func doMailReadWithJSON(mp mail.Provider, rec events.Recorder, args []string, jsonOut bool, stdout, stderr io.Writer) int {
 	if len(args) < 1 {
 		fmt.Fprintln(stderr, "gc mail read: missing message ID") //nolint:errcheck // best-effort stderr
 		return 1
@@ -1384,28 +1449,42 @@ func doMailRead(mp mail.Provider, rec events.Recorder, args []string, stdout, st
 		return 1
 	}
 
-	printMessage(m, stdout)
-
 	rec.Record(events.Event{
 		Type:    events.MailRead,
 		Actor:   eventActor(),
 		Subject: id,
 		Payload: mailEventPayload(nil),
 	})
+
+	if jsonOut {
+		if err := writeCLIJSONLine(stdout, mailMessageJSONResult{
+			SchemaVersion: "1",
+			Message:       m,
+		}); err != nil {
+			fmt.Fprintf(stderr, "gc mail read: %v\n", err) //nolint:errcheck
+			return 1
+		}
+	} else {
+		printMessage(m, stdout)
+	}
+
 	return 0
 }
 
-// cmdMailPeek shows a message without marking it as read.
-func cmdMailPeek(args []string, stdout, stderr io.Writer) int {
+func cmdMailPeekWithJSON(args []string, jsonOut bool, stdout, stderr io.Writer) int {
 	mp, code := openCityMailProvider(stderr, "gc mail peek")
 	if mp == nil {
 		return code
 	}
-	return doMailPeek(mp, args, stdout, stderr)
+	return doMailPeekWithJSON(mp, args, jsonOut, stdout, stderr)
 }
 
 // doMailPeek displays a message without marking it as read.
 func doMailPeek(mp mail.Provider, args []string, stdout, stderr io.Writer) int {
+	return doMailPeekWithJSON(mp, args, false, stdout, stderr)
+}
+
+func doMailPeekWithJSON(mp mail.Provider, args []string, jsonOut bool, stdout, stderr io.Writer) int {
 	if len(args) < 1 {
 		fmt.Fprintln(stderr, "gc mail peek: missing message ID") //nolint:errcheck // best-effort stderr
 		return 1
@@ -1416,6 +1495,17 @@ func doMailPeek(mp mail.Provider, args []string, stdout, stderr io.Writer) int {
 	if err != nil {
 		fmt.Fprintf(stderr, "gc mail peek: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
+	}
+
+	if jsonOut {
+		if err := writeCLIJSONLine(stdout, mailMessageJSONResult{
+			SchemaVersion: "1",
+			Message:       m,
+		}); err != nil {
+			fmt.Fprintf(stderr, "gc mail peek: %v\n", err) //nolint:errcheck
+			return 1
+		}
+		return 0
 	}
 
 	printMessage(m, stdout)
@@ -1662,27 +1752,49 @@ func doMailDeleteMany(mp mail.Provider, rec events.Recorder, ids []string, stdou
 	return exit
 }
 
-// cmdMailThread lists messages in a thread.
-func cmdMailThread(args []string, stdout, stderr io.Writer) int {
+func cmdMailThreadWithJSON(args []string, jsonOut bool, stdout, stderr io.Writer) int {
 	mp, code := openCityMailProvider(stderr, "gc mail thread")
 	if mp == nil {
 		return code
 	}
-	return doMailThread(mp, args, stdout, stderr)
+	return doMailThreadWithJSON(mp, args, jsonOut, stdout, stderr)
 }
 
 // doMailThread shows all messages in a thread.
 func doMailThread(mp mail.Provider, args []string, stdout, stderr io.Writer) int {
+	return doMailThreadWithJSON(mp, args, false, stdout, stderr)
+}
+
+func doMailThreadWithJSON(mp mail.Provider, args []string, jsonOut bool, stdout, stderr io.Writer) int {
 	if len(args) < 1 {
 		fmt.Fprintln(stderr, "gc mail thread: missing thread or message ID") //nolint:errcheck // best-effort stderr
 		return 1
 	}
-	id := args[0]
+	id := strings.TrimSpace(args[0])
+	if id == "" {
+		fmt.Fprintln(stderr, "gc mail thread: missing thread or message ID") //nolint:errcheck // best-effort stderr
+		return 1
+	}
 
 	msgs, err := mp.Thread(id)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc mail thread: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
+	}
+	if msgs == nil {
+		msgs = []mail.Message{}
+	}
+
+	if jsonOut {
+		if err := writeCLIJSONLine(stdout, mailThreadJSONResult{
+			SchemaVersion: "1",
+			ThreadID:      canonicalMailThreadID(id, msgs),
+			Messages:      msgs,
+		}); err != nil {
+			fmt.Fprintf(stderr, "gc mail thread: %v\n", err) //nolint:errcheck
+			return 1
+		}
+		return 0
 	}
 
 	if len(msgs) == 0 {
@@ -1704,8 +1816,16 @@ func doMailThread(mp mail.Provider, args []string, stdout, stderr io.Writer) int
 	return 0
 }
 
-// cmdMailCount shows total/unread count.
-func cmdMailCount(args []string, stdout, stderr io.Writer) int {
+func canonicalMailThreadID(fallback string, msgs []mail.Message) string {
+	for _, msg := range msgs {
+		if strings.TrimSpace(msg.ThreadID) != "" {
+			return msg.ThreadID
+		}
+	}
+	return fallback
+}
+
+func cmdMailCountWithJSON(args []string, jsonOut bool, stdout, stderr io.Writer) int {
 	mp, code := openCityMailProvider(stderr, "gc mail count")
 	if mp == nil {
 		return code
@@ -1716,7 +1836,7 @@ func cmdMailCount(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	return doMailCountTarget(mp, target, stdout, stderr)
+	return doMailCountTargetWithJSON(mp, target, jsonOut, stdout, stderr)
 }
 
 // doMailCount displays total/unread message counts.
@@ -1725,6 +1845,10 @@ func doMailCount(mp mail.Provider, recipient string, stdout, stderr io.Writer) i
 }
 
 func doMailCountTarget(mp mail.Provider, target resolvedMailTarget, stdout, stderr io.Writer) int {
+	return doMailCountTargetWithJSON(mp, target, false, stdout, stderr)
+}
+
+func doMailCountTargetWithJSON(mp mail.Provider, target resolvedMailTarget, jsonOut bool, stdout, stderr io.Writer) int {
 	var total, unread int
 	var err error
 	if counter, ok := mp.(multiRecipientMailCounter); ok {
@@ -1736,8 +1860,28 @@ func doMailCountTarget(mp mail.Provider, target resolvedMailTarget, stdout, stde
 		fmt.Fprintf(stderr, "gc mail count: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
+	if jsonOut {
+		if err := writeCLIJSONLine(stdout, mailCountJSONResult{
+			SchemaVersion: "1",
+			Recipient:     target.display,
+			Recipients:    jsonRecipients(target),
+			Total:         total,
+			Unread:        unread,
+		}); err != nil {
+			fmt.Fprintf(stderr, "gc mail count: %v\n", err) //nolint:errcheck
+			return 1
+		}
+		return 0
+	}
 	fmt.Fprintf(stdout, "%d total, %d unread for %s\n", total, unread, target.display) //nolint:errcheck // best-effort stdout
 	return 0
+}
+
+func jsonRecipients(target resolvedMailTarget) []string {
+	if len(target.recipients) <= 1 {
+		return nil
+	}
+	return append([]string(nil), target.recipients...)
 }
 
 // printMessage displays a message's full details.

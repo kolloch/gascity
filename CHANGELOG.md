@@ -7,8 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `gc mail inbox`, `gc mail read`, `gc mail peek`, `gc mail thread`,
+  and `gc mail count` now accept `--json` and emit schema-versioned result
+  envelopes for script and dashboard consumers.
+
 ### Fixed
 
+- Empty JSON result collections for `gc mail thread`, `gc trace status`, and
+  `gc trace show` now encode as `[]` instead of `null`; `gc trace show` also
+  reports a concise no-records message in the default text mode.
 - Managed bd provider startup now detects a bd-standalone dolt server running
   against the same `.beads/dolt` database before invoking the managed-bd
   lifecycle script, and refuses with a message naming `bd dolt stop` as the
@@ -62,6 +71,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `gc trace status` and `gc trace show` now default to human-readable output;
+  scripts that need machine-readable trace data should pass `--json`. The
+  `--json` result shapes are also envelope objects now: `gc trace status
+  --json` uses `active_arms` instead of `arms` and includes
+  `schema_version`, `as_of`, `controller_running`, and `controller_pid`;
+  `gc trace show --json` returns `schema_version`, `city_path`, `count`, and
+  `records` instead of a bare record array. See
+  `schemas/trace/status/result.schema.json` and
+  `schemas/trace/show/result.schema.json` for the exact contracts.
 - `gc bd` and the internal `bd` shell-out path now auto-inject bd's
   `--readonly` and `--dolt-auto-commit=off` global flags ahead of known
   read-only subcommands (`list`, `ready`, `show`, `count`, `stats`,
