@@ -156,7 +156,7 @@ func TestSupervisorCityServiceProxy503WhileStarting(t *testing.T) {
 	resolver := &fakeCityResolver{
 		starting: map[string]bool{"booting": true},
 	}
-	sm := NewSupervisorMux(resolver, nil, false, "test", time.Now())
+	sm := NewSupervisorMux(resolver, nil, false, "test", "", time.Now())
 	req := httptest.NewRequest(http.MethodGet, "/v0/city/booting/svc/review-intake/healthz", nil)
 	rec := httptest.NewRecorder()
 
@@ -181,7 +181,7 @@ func TestBindCity503DuringAdoption(t *testing.T) {
 	resolver := &fakeCityResolver{
 		starting: map[string]bool{"booting": true},
 	}
-	sm := NewSupervisorMux(resolver, nil, false, "test", time.Now())
+	sm := NewSupervisorMux(resolver, nil, false, "test", "", time.Now())
 	req := httptest.NewRequest(http.MethodGet, "/v0/city/booting/health", nil)
 	rec := httptest.NewRecorder()
 
@@ -210,7 +210,7 @@ func TestBindCity503DuringAdoption(t *testing.T) {
 
 func TestBindCity404ForUnknownCity(t *testing.T) {
 	resolver := &fakeCityResolver{}
-	sm := NewSupervisorMux(resolver, nil, false, "test", time.Now())
+	sm := NewSupervisorMux(resolver, nil, false, "test", "", time.Now())
 	req := httptest.NewRequest(http.MethodGet, "/v0/city/unknown/health", nil)
 	rec := httptest.NewRecorder()
 
