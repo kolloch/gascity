@@ -278,7 +278,7 @@ func buildDesiredStateWithSessionBeads(
 			// not create a parallel generic worker for the same backing template.
 			poolDir := agentCommandDir(cityPath, &cfg.Agents[i], cfg.Rigs)
 			if store != nil && strings.TrimSpace(cfg.Agents[i].ScaleCheck) == "" {
-				defaultNamedScaleTargets = append(defaultNamedScaleTargets, defaultScaleCheckTargetForAgent(cityPath, cfg, &cfg.Agents[i], store, rigStores))
+				defaultNamedScaleTargets = append(defaultNamedScaleTargets, defaultScaleCheckTargetsForAgent(cityPath, cfg, &cfg.Agents[i], store, rigStores)...)
 				continue
 			}
 			pendingPools = append(pendingPools, poolEvalWork{agentIdx: i, sp: sp, poolDir: poolDir, newDemand: store != nil})
@@ -294,7 +294,7 @@ func buildDesiredStateWithSessionBeads(
 		// new unassigned demand while assigned work drives resume requests.
 		poolDir := agentCommandDir(cityPath, &cfg.Agents[i], cfg.Rigs)
 		if store != nil && strings.TrimSpace(cfg.Agents[i].ScaleCheck) == "" {
-			defaultScaleTargets = append(defaultScaleTargets, defaultScaleCheckTargetForAgent(cityPath, cfg, &cfg.Agents[i], store, rigStores))
+			defaultScaleTargets = append(defaultScaleTargets, defaultScaleCheckTargetsForAgent(cityPath, cfg, &cfg.Agents[i], store, rigStores)...)
 			continue
 		}
 		env, err := controllerQueryRuntimeEnv(cityPath, cfg, &cfg.Agents[i])
@@ -791,32 +791,53 @@ func readyAssignedWorkAssignees(cfg *config.City, sessionBeads *sessionBeadSnaps
 	return result
 }
 
-func defaultScaleCheckTargetForAgent(
+// defaultScaleCheckTargetsForAgent returns the scale-check targets that should
+// be queried for an agent's routed-pool demand. Agents not bound to a rig get
+// a single city-store target. Rig-attached agents get BOTH the rig's own store
+// AND the city store, so that cross-rig routed beads (e.g. a city-level pe-*
+// bead whose `gc.routed_to` points at "<rig>/<template>") still count toward
+// new demand. Without the city target, work routed via `gc sling --force`
+// across rigs sits invisible and the scaler never spawns a polecat to claim
+// it (ga-wy6). When the rig store is unavailable the rig target carries a
+// diagnostic error so callers still report the partial state, but the city
+// fallback continues to surface real cross-rig demand.
+func defaultScaleCheckTargetsForAgent(
 	cityPath string,
 	cfg *config.City,
 	agentCfg *config.Agent,
 	cityStore beads.Store,
 	rigStores map[string]beads.Store,
-) defaultScaleCheckTarget {
-	target := defaultScaleCheckTarget{
-		template: agentCfg.QualifiedName(),
-		storeKey: "city",
-		store:    cityStore,
-	}
+) []defaultScaleCheckTarget {
+	template := agentCfg.QualifiedName()
 	rigName := configuredRigName(cityPath, agentCfg, cfg.Rigs)
 	if rigName == "" {
-		return target
+		return []defaultScaleCheckTarget{{
+			template: template,
+			storeKey: "city",
+			store:    cityStore,
+		}}
 	}
-	target.storeKey = "rig:" + rigName
+	rigTarget := defaultScaleCheckTarget{
+		template: template,
+		storeKey: "rig:" + rigName,
+	}
 	if rigStores != nil {
 		if rigStore := rigStores[rigName]; rigStore != nil {
-			target.store = rigStore
-			return target
+			rigTarget.store = rigStore
 		}
 	}
-	target.store = nil
-	target.err = fmt.Errorf("default scale_check %s: rig store %q unavailable", target.template, rigName)
-	return target
+	if rigTarget.store == nil {
+		rigTarget.err = fmt.Errorf("default scale_check %s: rig store %q unavailable", template, rigName)
+	}
+	targets := []defaultScaleCheckTarget{rigTarget}
+	if cityStore != nil && cityStore != rigTarget.store {
+		targets = append(targets, defaultScaleCheckTarget{
+			template: template,
+			storeKey: "city",
+			store:    cityStore,
+		})
+	}
+	return targets
 }
 
 func defaultScaleCheckCounts(targets []defaultScaleCheckTarget) (map[string]int, map[string]bool, []error) {
@@ -861,6 +882,12 @@ func defaultScaleCheckCounts(targets []defaultScaleCheckTarget) (map[string]int,
 		group.templates[template] = struct{}{}
 	}
 
+	// counted tracks (template, beadID) pairs already counted toward demand.
+	// Rig-attached agents now query both the rig and city stores so cross-rig
+	// routed beads (ga-wy6) are visible; a bead returned by both stores must
+	// only count once. Empty bead IDs (e.g., synthetic test beads) fall back
+	// to per-template scoping.
+	counted := make(map[string]map[string]struct{})
 	for key, group := range groups {
 		ready, err := readyForControllerDemand(group.store)
 		if err != nil {
@@ -883,6 +910,17 @@ func defaultScaleCheckCounts(targets []defaultScaleCheckTarget) (map[string]int,
 			// for legitimate routed work and the bead never gets claimed (ga-2pz).
 			if assignee != "" && assignee != template {
 				continue
+			}
+			seen, ok := counted[template]
+			if !ok {
+				seen = make(map[string]struct{})
+				counted[template] = seen
+			}
+			if b.ID != "" {
+				if _, already := seen[b.ID]; already {
+					continue
+				}
+				seen[b.ID] = struct{}{}
 			}
 			counts[template]++
 		}

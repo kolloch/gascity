@@ -35,6 +35,13 @@ func (s listFailStore) List(_ beads.ListQuery) ([]beads.Bead, error) {
 	return nil, errors.New("list failed")
 }
 
+// readyPassthroughStore wraps a beads.Store with a distinct pointer identity
+// so defaultScaleCheckTargetsForAgent doesn't short-circuit the city target
+// when the rig and city stores happen to share underlying data.
+type readyPassthroughStore struct {
+	beads.Store
+}
+
 type readyFailStore struct {
 	beads.Store
 	readyCalls int
@@ -672,6 +679,13 @@ func TestDefaultNamedSessionDemandUsesPartialReadyRows(t *testing.T) {
 	}
 }
 
+// TestDefaultScaleCheckCountsReportsMissingRigStore verifies that when a
+// rig store is unavailable, the diagnostic is still emitted and the template
+// is marked partial — but cross-rig routed beads visible in the city store
+// still count as demand (ga-wy6 fallback). Before the cross-rig fix, this
+// scenario silently dropped the city-store bead, so a `pe-*` bead routed to
+// a rig pool would sit invisible until someone re-filed it with the rig's
+// prefix.
 func TestDefaultScaleCheckCountsReportsMissingRigStore(t *testing.T) {
 	cityPath := t.TempDir()
 	cfg := &config.City{
@@ -683,7 +697,7 @@ func TestDefaultScaleCheckCountsReportsMissingRigStore(t *testing.T) {
 	agent := &config.Agent{Name: "worker", Dir: filepath.Join("repos", "repo")}
 	cityStore := beads.NewMemStore()
 	if _, err := cityStore.Create(beads.Bead{
-		Title:  "wrong-store routed work",
+		Title:  "cross-rig routed work",
 		Type:   "task",
 		Status: "open",
 		Metadata: map[string]string{
@@ -692,11 +706,11 @@ func TestDefaultScaleCheckCountsReportsMissingRigStore(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("create city routed bead: %v", err)
 	}
-	target := defaultScaleCheckTargetForAgent(cityPath, cfg, agent, cityStore, nil)
+	targets := defaultScaleCheckTargetsForAgent(cityPath, cfg, agent, cityStore, nil)
 
-	counts, partialTemplates, errs := defaultScaleCheckCounts([]defaultScaleCheckTarget{target})
-	if got := counts["repos/repo/worker"]; got != 0 {
-		t.Fatalf("defaultScaleCheckCounts = %d, want 0", got)
+	counts, partialTemplates, errs := defaultScaleCheckCounts(targets)
+	if got := counts["repos/repo/worker"]; got != 1 {
+		t.Fatalf("defaultScaleCheckCounts = %d, want 1 (city-store fallback must count cross-rig demand)", got)
 	}
 	if len(errs) != 1 {
 		t.Fatalf("defaultScaleCheckCounts errs = %v, want one missing rig-store diagnostic", errs)
@@ -709,11 +723,103 @@ func TestDefaultScaleCheckCountsReportsMissingRigStore(t *testing.T) {
 	}
 }
 
-func TestBuildDesiredStateDefaultScaleCheckMissingRigStoreReportsZeroDemand(t *testing.T) {
+// TestDefaultScaleCheckCountsCountsCrossRigRoutedBeads verifies that a city
+// bead whose `gc.routed_to` points at a rig-attached pool template counts as
+// demand for that pool even when the rig store is available and has no
+// matching beads. This is the canonical ga-wy6 fix: previously the scaler
+// only queried the rig's own store, so a `gc sling --force` cross-rig route
+// would never wake/spawn a polecat.
+func TestDefaultScaleCheckCountsCountsCrossRigRoutedBeads(t *testing.T) {
+	cityPath := t.TempDir()
+	cfg := &config.City{
+		Rigs: []config.Rig{{
+			Name: "gascity",
+			Path: filepath.Join(cityPath, "gascity"),
+		}},
+	}
+	agent := &config.Agent{Name: "polecat", Dir: "gascity"}
+	cityStore := beads.NewMemStore()
+	rigStore := beads.NewMemStore()
+
+	if _, err := cityStore.Create(beads.Bead{
+		Title:  "pe-style cross-rig work",
+		Type:   "task",
+		Status: "open",
+		Metadata: map[string]string{
+			"gc.routed_to": "gascity/polecat",
+		},
+	}); err != nil {
+		t.Fatalf("create city routed bead: %v", err)
+	}
+
+	targets := defaultScaleCheckTargetsForAgent(cityPath, cfg, agent, cityStore, map[string]beads.Store{"gascity": rigStore})
+	counts, partialTemplates, errs := defaultScaleCheckCounts(targets)
+	if len(errs) != 0 {
+		t.Fatalf("defaultScaleCheckCounts errs = %v, want none", errs)
+	}
+	if len(partialTemplates) != 0 {
+		t.Fatalf("defaultScaleCheckCounts partialTemplates = %v, want none", partialTemplates)
+	}
+	if got := counts["gascity/polecat"]; got != 1 {
+		t.Fatalf("defaultScaleCheckCounts = %d, want 1 (cross-rig routed bead must count)", got)
+	}
+}
+
+// TestDefaultScaleCheckCountsDeduplicatesAcrossStores verifies that when a
+// bead is somehow visible in both the rig and city stores (e.g., shared dolt
+// path), it counts only once. Without dedup, the cross-rig fix could
+// inflate demand and over-spawn pool sessions.
+func TestDefaultScaleCheckCountsDeduplicatesAcrossStores(t *testing.T) {
+	cityPath := t.TempDir()
+	cfg := &config.City{
+		Rigs: []config.Rig{{
+			Name: "gascity",
+			Path: filepath.Join(cityPath, "gascity"),
+		}},
+	}
+	agent := &config.Agent{Name: "polecat", Dir: "gascity"}
+	// Shared store: city and rig both point at the same backing data, simulating
+	// a shared dolt path or a misconfiguration. The bead would be returned by
+	// both target queries.
+	shared := beads.NewMemStore()
+	if _, err := shared.Create(beads.Bead{
+		ID:     "ga-shared-1",
+		Title:  "shared routed bead",
+		Type:   "task",
+		Status: "open",
+		Metadata: map[string]string{
+			"gc.routed_to": "gascity/polecat",
+		},
+	}); err != nil {
+		t.Fatalf("create shared routed bead: %v", err)
+	}
+
+	// Force both rig and city targets to be queried by giving them distinct
+	// pointer identities — wrap one in a passthrough to defeat the
+	// pointer-equality short-circuit while still returning the same beads.
+	wrappedCity := &readyPassthroughStore{Store: shared}
+	targets := defaultScaleCheckTargetsForAgent(cityPath, cfg, agent, wrappedCity, map[string]beads.Store{"gascity": shared})
+	counts, _, errs := defaultScaleCheckCounts(targets)
+	if len(errs) != 0 {
+		t.Fatalf("defaultScaleCheckCounts errs = %v", errs)
+	}
+	if got := counts["gascity/polecat"]; got != 1 {
+		t.Fatalf("defaultScaleCheckCounts = %d, want 1 (bead must dedup across overlapping stores)", got)
+	}
+}
+
+// TestBuildDesiredStateDefaultScaleCheckMissingRigStoreFallsBackToCity
+// verifies that a city-store bead routed at a rig-attached pool template
+// still drives scaler demand even when the rig store is unavailable. The
+// diagnostic is still emitted (and the template is still marked partial),
+// but the cross-rig fallback ensures the bead is not silently dropped
+// (ga-wy6). Before the fix, the same setup produced ScaleCheckCounts=0 and
+// no desired session, leaving the bead stranded.
+func TestBuildDesiredStateDefaultScaleCheckMissingRigStoreFallsBackToCity(t *testing.T) {
 	cityPath := t.TempDir()
 	store := beads.NewMemStore()
 	if _, err := store.Create(beads.Bead{
-		Title:  "rig-owned routed work",
+		Title:  "cross-rig routed work",
 		Type:   "task",
 		Status: "open",
 		Metadata: map[string]string{
@@ -739,17 +845,14 @@ func TestBuildDesiredStateDefaultScaleCheckMissingRigStoreReportsZeroDemand(t *t
 
 	var stderr strings.Builder
 	got := buildDesiredState("test-city", cityPath, time.Now().UTC(), cfg, runtime.NewFake(), store, &stderr)
-	if demand := got.ScaleCheckCounts["repos/repo/worker"]; demand != 0 {
-		t.Fatalf("ScaleCheckCounts[repos/repo/worker] = %d, want 0 without rig store", demand)
+	if demand := got.ScaleCheckCounts["repos/repo/worker"]; demand != 1 {
+		t.Fatalf("ScaleCheckCounts[repos/repo/worker] = %d, want 1 (city-store fallback must count cross-rig demand)", demand)
 	}
 	if got.StoreQueryPartial {
 		t.Fatalf("StoreQueryPartial = true, want false for scoped default scale_check failure")
 	}
 	if !got.ScaleCheckPartialTemplates["repos/repo/worker"] {
 		t.Fatalf("ScaleCheckPartialTemplates = %v, want missing rig-store template marked partial", got.ScaleCheckPartialTemplates)
-	}
-	if len(got.State) != 0 {
-		t.Fatalf("desired sessions = %d, want none without rig store demand", len(got.State))
 	}
 	if !strings.Contains(stderr.String(), `rig store "repo" unavailable`) {
 		t.Fatalf("stderr = %q, want missing rig-store diagnostic", stderr.String())
