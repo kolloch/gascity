@@ -29,6 +29,10 @@ func findCityWithOptions(dir string, opts cityDiscoveryOptions) (string, error) 
 
 	var legacy string
 	for {
+		if host, ok := worktreeHostCity(dir); ok {
+			dir = host
+			continue
+		}
 		if citylayout.HasCityConfig(dir) {
 			return dir, nil
 		}
@@ -48,6 +52,29 @@ func findCityWithOptions(dir string, opts cityDiscoveryOptions) (string, error) 
 		return legacy, nil
 	}
 	return "", fmt.Errorf("not in a city directory (no city.toml or .gc/ found)")
+}
+
+// worktreeHostCity returns the host city path when dir lies inside some
+// city's `.gc/worktrees/` tree. The standard gc layout places worktrees at
+// <city>/.gc/worktrees/<rig>/..., and because a gc worktree is a git
+// worktree of the rig repo — which is itself a checkout of the city repo —
+// every tracked file (city.toml included) appears at the worktree root.
+// Returning the worktree as the city would lose access to the host city's
+// machine-local .gc/site.toml and runtime state, breaking rig resolution
+// and routing managed-runtime traffic to the wrong dolt server. Jumping
+// straight to the host city keeps city.toml-driven config and on-disk
+// state pointing at the same place.
+func worktreeHostCity(dir string) (string, bool) {
+	marker := string(filepath.Separator) + ".gc" + string(filepath.Separator) + "worktrees" + string(filepath.Separator)
+	idx := strings.Index(dir, marker)
+	if idx < 0 {
+		return "", false
+	}
+	host := dir[:idx]
+	if !citylayout.HasCityConfig(host) {
+		return "", false
+	}
+	return host, true
 }
 
 func implicitCityDiscoveryOptions() cityDiscoveryOptions {

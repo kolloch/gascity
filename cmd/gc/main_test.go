@@ -616,6 +616,79 @@ func TestFindCity(t *testing.T) {
 			t.Errorf("error = %q, want 'not in a city directory'", err)
 		}
 	})
+
+	t.Run("worktree_root_resolves_to_host_city", func(t *testing.T) {
+		// gc worktrees inherit city.toml from their rig repo because the
+		// rig repo is itself a checkout of the city repo. Walking up from
+		// the worktree must skip that inherited copy and resolve to the
+		// real host city, otherwise rig resolution and managed-runtime
+		// state both end up pointed at the worktree (di-49h).
+		cityDir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte("[workspace]\nname = \"host\"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		worktree := filepath.Join(cityDir, ".gc", "worktrees", "dipcity", "refinery")
+		if err := os.MkdirAll(worktree, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(worktree, "city.toml"), []byte("[workspace]\nname = \"host\"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+
+		got, err := findCity(worktree)
+		if err != nil {
+			t.Fatalf("findCity(%q) error: %v", worktree, err)
+		}
+		if got != cityDir {
+			t.Errorf("findCity(%q) = %q, want %q", worktree, got, cityDir)
+		}
+	})
+
+	t.Run("subdir_of_worktree_resolves_to_host_city", func(t *testing.T) {
+		cityDir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte("[workspace]\nname = \"host\"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		worktree := filepath.Join(cityDir, ".gc", "worktrees", "dipcity", "polecats", "gastown.furiosa")
+		if err := os.MkdirAll(filepath.Join(worktree, "deep", "sub", "dir"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(worktree, "city.toml"), []byte("[workspace]\nname = \"host\"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		startDir := filepath.Join(worktree, "deep", "sub", "dir")
+
+		got, err := findCity(startDir)
+		if err != nil {
+			t.Fatalf("findCity(%q) error: %v", startDir, err)
+		}
+		if got != cityDir {
+			t.Errorf("findCity(%q) = %q, want %q", startDir, got, cityDir)
+		}
+	})
+
+	t.Run("worktrees_marker_without_host_city_falls_through_to_normal_walk", func(t *testing.T) {
+		// `.gc/worktrees/` in a path is only treated as a worktree
+		// marker when the host candidate is itself a city. Without a
+		// city.toml at the host, findCity falls through to its normal
+		// walk semantics rather than warping to a non-city ancestor.
+		root := t.TempDir()
+		dir := filepath.Join(root, ".gc", "worktrees", "rig", "agent")
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		// No city.toml anywhere; root has a .gc/ runtime root by virtue
+		// of being the worktrees container's parent, so the legacy match
+		// resolves to root — identical to behavior without the warp.
+
+		got, err := findCity(dir)
+		if err != nil {
+			t.Fatalf("findCity(%q) error: %v", dir, err)
+		}
+		if got != root {
+			t.Errorf("findCity(%q) = %q, want %q", dir, got, root)
+		}
+	})
 }
 
 // --- resolveCity ---
