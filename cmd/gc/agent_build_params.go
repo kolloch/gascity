@@ -248,10 +248,17 @@ func effectivePackDirs(cityDirs []string, rigDirs map[string][]string, rigName s
 
 // templateNameFor returns the configuration template name for an agent.
 // For pool instances, this is the original template name (PoolName).
-// For regular agents, it's the qualified name.
+// For named_session expansions, the template name is cfgAgent's own
+// qualified name (e.g. "pringle/crew") — qualifiedName is the session
+// identity (e.g. "pringle/utz") and resolveAgentIdentity can't map it
+// back to the template, so `gc internal materialize-skills` exits 1.
+// For regular agents, qualifiedName already equals the template name.
 func templateNameFor(cfgAgent *config.Agent, qualifiedName string) string {
 	if cfgAgent.PoolName != "" {
 		return cfgAgent.PoolName
+	}
+	if t := cfgAgent.QualifiedName(); t != "" && t != qualifiedName {
+		return t
 	}
 	return qualifiedName
 }
