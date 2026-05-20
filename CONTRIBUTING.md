@@ -34,8 +34,12 @@ endpoints. When `internal/api/openapi.json` or files under
 `cmd/gc/dashboard/web/src/generated/schema.d.ts` (TS types from the
 spec) and rebuilds `cmd/gc/dashboard/web/dist/` (the compiled bundle
 that the Go static server embeds via `go:embed`). The hook needs
-Node / npm on your PATH; if npm is missing, the hook warns and
-skips the rebuild (CI enforces it). The hook runs dashboard typecheck,
+Node 20 or newer (CI pins 22 via `.nvmrc`) and npm on your PATH; if
+npm is missing the hook warns and skips the rebuild (CI enforces it).
+Ubuntu 24.04 ships Node 18, which the dashboard's `@hey-api/openapi-ts`
+toolchain rejects — see
+[Prerequisites](docs/getting-started/installation.md#prerequisites)
+for the NodeSource install snippet. The hook runs dashboard typecheck,
 Vitest, and production build for dashboard/API-schema changes. Run
 `make dashboard-dev` to
 iterate with Vite HMR, `make dashboard-build` to produce a fresh

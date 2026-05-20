@@ -32,11 +32,26 @@ for you; the other methods require manual installation.
 | gh | Optional | — | `brew install gh` | [cli.github.com](https://cli.github.com/) | GitHub gate checks |
 | Go 1.25+ | Source only | 1.25 | `brew install go` | [golang.org](https://go.dev/dl/) | Compiler |
 | make | Source only | — | (built-in) | `apt install make` (or `build-essential`) | Drives `make install` |
+| Node.js | Dashboard source only | 20 | `brew install node` | [NodeSource](https://github.com/nodesource/distributions) | Dashboard SPA + OpenAPI codegen |
 
 Use a final Dolt 1.86.2 or newer. Gas City's managed Dolt checks reject older
 and pre-release builds because they can miss the upstream GC/writer deadlock
 fix in dolthub/dolt commit `ccf7bde206`, which can hang `dolt_backup sync`
 under heavy write load.
+
+Node 20 or newer is only required when you change the dashboard SPA under
+`cmd/gc/dashboard/web/` or regenerate the OpenAPI spec — the compiled
+bundle and generated TS client ship in the repo, so `make build` alone
+does not need Node. The dashboard's `@hey-api/openapi-ts` toolchain
+rejects Node 18, which is still the default on Ubuntu 24.04 (noble);
+install a newer version from NodeSource if your distro lags:
+
+```bash
+curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+sudo apt-get install -y nodejs
+```
+
+CI pins Node 22 (matching the repo's `.nvmrc` / `.node-version`).
 
 The exact versions CI pins are in [`deps.env`](https://github.com/gastownhall/gascity/blob/main/deps.env).
 
