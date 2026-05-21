@@ -313,7 +313,7 @@ func (e *reconcilerTestEnv) reconcileWithPoolDesiredAndDrainOps(sessions []beads
 func TestReconcileSessionBeads_DrainAckKeepsBeadOpen(t *testing.T) {
 	env := newReconcilerTestEnv()
 	env.cfg = &config.City{
-		Agents: []config.Agent{{Name: "worker"}},
+		Agents: []config.Agent{{Name: "worker", SleepAfterIdle: config.SessionSleepOff}},
 	}
 	env.addDesired("worker", "worker", true)
 	session := env.createSessionBead("worker", "worker")
@@ -373,6 +373,43 @@ func TestReconcileSessionBeads_DrainAckKeepsBeadOpen(t *testing.T) {
 	}
 	if got.Metadata["pending_create_claim"] != "" {
 		t.Fatalf("pending_create_claim = %q, want cleared after drain-ack", got.Metadata["pending_create_claim"])
+	}
+}
+
+func TestReconcileSessionBeads_DesiredFastPathSkipsAttachmentActivityObservation(t *testing.T) {
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{
+		Agents: []config.Agent{{Name: "worker", SleepAfterIdle: config.SessionSleepOff}},
+	}
+	env.desiredState["worker"] = TemplateParams{
+		Command:      "test-cmd",
+		SessionName:  "worker",
+		TemplateName: "worker",
+		Hints:        agent.StartupHints{ProcessNames: []string{"worker"}},
+	}
+	if err := env.sp.Start(context.Background(), "worker", runtime.Config{Command: "test-cmd"}); err != nil {
+		t.Fatalf("Start(worker): %v", err)
+	}
+	session := env.createSessionBead("worker", "worker")
+	env.markSessionActive(&session)
+	agentCfg := sessionCoreConfigForHash(env.desiredState["worker"], session)
+	env.setSessionMetadata(&session, map[string]string{
+		"started_config_hash": runtime.CoreFingerprint(agentCfg),
+		"started_live_hash":   runtime.LiveFingerprint(agentCfg),
+	})
+	if err := env.sp.SetMeta("worker", "GC_SESSION_ID", session.ID); err != nil {
+		t.Fatalf("SetMeta(GC_SESSION_ID): %v", err)
+	}
+
+	woken := env.reconcile([]beads.Bead{session})
+	if woken != 0 {
+		t.Fatalf("woken = %d, want 0", woken)
+	}
+	if got := env.sp.CountCalls("IsAttached", "worker"); got != 0 {
+		t.Fatalf("IsAttached calls = %d, want 0 on desired fast path", got)
+	}
+	if got := env.sp.CountCalls("GetLastActivity", "worker"); got != 0 {
+		t.Fatalf("GetLastActivity calls = %d, want 0 on desired fast path", got)
 	}
 }
 
