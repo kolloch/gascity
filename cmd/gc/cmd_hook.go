@@ -12,7 +12,9 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/session"
 )
 
 func newHookCmd(stdout, stderr io.Writer) *cobra.Command {
@@ -159,7 +161,39 @@ func cmdHookWithFormat(args []string, inject bool, hookFormat string, stdout, st
 	runner := func(command, dir string) (string, error) {
 		return shellWorkQueryWithEnv(command, dir, queryEnv)
 	}
-	return doHook(workQuery, workDir, inject, runner, stdout, stderr)
+
+	// Lazy filter builder: drops in_progress beads claimed by another live
+	// session so polecat B's hook doesn't re-acquire polecat A's bead (ga-8q6).
+	// Built lazily — only when the work_query actually returns at least one
+	// in_progress row with a non-empty assignee — so the common no-work path
+	// avoids the extra session-bead scan and TestCmdHookSessionTemplate...
+	// stays green. Self identifiers come out of the env / resolved names.
+	buildFilter := func() liveAssigneeFilter {
+		selfIdents := selfIdentifiers(resolvedAgentName, agentForQuery, sessionForQuery)
+		return buildLiveAssigneeFilter(cityPath, selfIdents)
+	}
+
+	return doHookWithLiveFilter(workQuery, workDir, inject, runner, buildFilter, stdout, stderr)
+}
+
+// selfIdentifiers returns the set of strings that refer to the current
+// session. Used to keep beads assigned to "this session" out of the
+// double-dispatch filter — they're legitimately mine to work on. Sources:
+// resolved agent name, work-query agent identity, work-query session
+// name, plus GC_SESSION_ID / GC_SESSION_NAME / GC_ALIAS / GC_AGENT env.
+func selfIdentifiers(parts ...string) map[string]struct{} {
+	out := map[string]struct{}{}
+	for _, s := range parts {
+		if v := strings.TrimSpace(s); v != "" {
+			out[v] = struct{}{}
+		}
+	}
+	for _, k := range []string{"GC_SESSION_ID", "GC_SESSION_NAME", "GC_ALIAS", "GC_AGENT"} {
+		if v := strings.TrimSpace(os.Getenv(k)); v != "" {
+			out[v] = struct{}{}
+		}
+	}
+	return out
 }
 
 // hookQueryEnv returns the full work-query environment for a hook subprocess.
@@ -238,6 +272,17 @@ func workQueryEnvForDir(env []string, dir string) []string {
 // returns 0 if work exists, 1 if empty. With inject: skips the work query and
 // returns 0.
 func doHook(workQuery, dir string, inject bool, runner WorkQueryRunner, stdout, stderr io.Writer) int {
+	return doHookWithLiveFilter(workQuery, dir, inject, runner, nil, stdout, stderr)
+}
+
+// doHookWithLiveFilter is doHook plus a post-filter that drops in_progress
+// beads claimed by another live polecat session. buildFilter is invoked
+// only after the work_query returns at least one candidate row that the
+// filter could actually drop (status=in_progress with a non-empty
+// assignee) — that keeps the no-work-found path free of session-bead
+// scanning. A nil builder disables the filter entirely (used by tests and
+// by the bare doHook wrapper).
+func doHookWithLiveFilter(workQuery, dir string, inject bool, runner WorkQueryRunner, buildFilter func() liveAssigneeFilter, stdout, stderr io.Writer) int {
 	if inject {
 		return 0
 	}
@@ -254,6 +299,9 @@ func doHook(workQuery, dir string, inject bool, runner WorkQueryRunner, stdout, 
 	trimmed := strings.TrimSpace(output)
 	normalized := normalizeWorkQueryOutput(trimmed)
 	normalized = filterUnreadyHookCandidates(normalized, time.Now())
+	if buildFilter != nil && hasClaimedInProgressRow(normalized) {
+		normalized = filterClaimedByLiveOthers(normalized, buildFilter())
+	}
 	hasWork := workQueryHasReadyWork(normalized)
 
 	// Non-inject mode: print normalized, ready-only output. Return 0 only when work exists.
@@ -265,6 +313,163 @@ func doHook(workQuery, dir string, inject bool, runner WorkQueryRunner, stdout, 
 	}
 	fmt.Fprint(stdout, normalized) //nolint:errcheck // best-effort stdout
 	return 0
+}
+
+// hasClaimedInProgressRow reports whether any row in the work_query
+// output looks like a candidate for the live-assignee filter — i.e.
+// status=in_progress with a non-empty assignee. Used to short-circuit
+// the filter build (which scans session beads) when the work_query has
+// returned nothing the filter could possibly drop.
+func hasClaimedInProgressRow(output string) bool {
+	if output == "" {
+		return false
+	}
+	var decoded any
+	if err := json.Unmarshal([]byte(output), &decoded); err != nil {
+		return false
+	}
+	arr, ok := decoded.([]any)
+	if !ok {
+		return false
+	}
+	for _, item := range arr {
+		obj, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		status, _ := obj["status"].(string)
+		if !strings.EqualFold(strings.TrimSpace(status), "in_progress") {
+			continue
+		}
+		assignee, _ := obj["assignee"].(string)
+		if strings.TrimSpace(assignee) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// liveAssigneeFilter is the set of identifiers (session bead ID, runtime
+// session name, alias, agent name) for live OTHER sessions — sessions in
+// state active/awake/creating that are not the current hook caller. The
+// zero value drops nothing; populated values cause filterClaimedByLiveOthers
+// to drop in_progress rows whose assignee falls in the set.
+//
+// Rationale: routed work moves through the pool with
+// gc.routed_to=<rig>/<template>, and bd ready returns the next eligible
+// row. Without this filter, polecat B's work_query fired while polecat A
+// already holds an in_progress bead re-acquires the same row and
+// double-dispatches the work (see ga-8q6). When the previous holder is
+// already drained/closed, the bead is rescue-able and kept.
+type liveAssigneeFilter struct {
+	liveOtherAssignees map[string]struct{}
+}
+
+func (f liveAssigneeFilter) shouldDrop(item map[string]any) bool {
+	if len(f.liveOtherAssignees) == 0 {
+		return false
+	}
+	status, _ := item["status"].(string)
+	if !strings.EqualFold(strings.TrimSpace(status), "in_progress") {
+		return false
+	}
+	assignee, _ := item["assignee"].(string)
+	assignee = strings.TrimSpace(assignee)
+	if assignee == "" {
+		return false
+	}
+	_, live := f.liveOtherAssignees[assignee]
+	return live
+}
+
+// filterClaimedByLiveOthers re-encodes output with in_progress rows
+// dropped when their assignee belongs to a live OTHER session. Non-JSON
+// and non-array outputs are returned unchanged so the function composes
+// safely with the rest of the normalize/filter chain.
+func filterClaimedByLiveOthers(output string, filter liveAssigneeFilter) string {
+	if output == "" || len(filter.liveOtherAssignees) == 0 {
+		return output
+	}
+	var decoded any
+	if err := json.Unmarshal([]byte(output), &decoded); err != nil {
+		return output
+	}
+	arr, ok := decoded.([]any)
+	if !ok {
+		return output
+	}
+	filtered := make([]any, 0, len(arr))
+	for _, item := range arr {
+		obj, ok := item.(map[string]any)
+		if !ok {
+			filtered = append(filtered, item)
+			continue
+		}
+		if filter.shouldDrop(obj) {
+			continue
+		}
+		filtered = append(filtered, obj)
+	}
+	reencoded, err := json.Marshal(filtered)
+	if err != nil {
+		return output
+	}
+	return string(reencoded)
+}
+
+// buildLiveAssigneeFilter opens the city store and returns a filter
+// listing all live OTHER sessions' identifiers. Sessions in state
+// active/awake/creating contribute their bead ID, runtime session name,
+// alias, and agent name; any of those that also appears in selfIdents
+// is skipped so the current session's own claimed beads pass through.
+// On any store-access error the returned filter is empty so hooks keep
+// working even when session metadata is unavailable.
+func buildLiveAssigneeFilter(cityPath string, selfIdents map[string]struct{}) liveAssigneeFilter {
+	if cityPath == "" {
+		return liveAssigneeFilter{}
+	}
+	store, err := openCityStoreAt(cityPath)
+	if err != nil || store == nil {
+		return liveAssigneeFilter{}
+	}
+	sessionBeads, err := session.ListAllSessionBeads(store, beads.ListQuery{})
+	if err != nil && !beads.IsPartialResult(err) {
+		return liveAssigneeFilter{}
+	}
+	live := map[string]struct{}{}
+	for _, b := range sessionBeads {
+		if b.Status == "closed" {
+			continue
+		}
+		if !isLiveSessionState(b.Metadata["state"]) {
+			continue
+		}
+		for _, id := range []string{
+			b.ID,
+			b.Metadata["session_name"],
+			b.Metadata["alias"],
+			b.Metadata["agent_name"],
+		} {
+			id = strings.TrimSpace(id)
+			if id == "" {
+				continue
+			}
+			if _, isSelf := selfIdents[id]; isSelf {
+				continue
+			}
+			live[id] = struct{}{}
+		}
+	}
+	return liveAssigneeFilter{liveOtherAssignees: live}
+}
+
+func isLiveSessionState(raw string) bool {
+	switch strings.TrimSpace(raw) {
+	case "active", "awake", "creating":
+		return true
+	default:
+		return false
+	}
 }
 
 func workQueryHasReadyWork(output string) bool {
