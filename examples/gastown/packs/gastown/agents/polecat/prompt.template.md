@@ -141,7 +141,12 @@ Your formula: `mol-polecat-work`
 # Step 1: Check for assigned work
 gc bd list --assignee="$GC_SESSION_NAME" --status=in_progress
 {{ .WorkQuery }}                                             # Find pool work
-gc bd update <id> --claim                                       # Atomic grab
+gc bd update <id> --claim                                       # Atomic CAS: fails non-zero if another session claimed first
+
+# If the claim exits non-zero, another session won the race — do NOT begin
+# work on that bead. Re-run the work query or exit (di-tz1, pe-wisp-8ocps2).
+# `gc hook` already post-filters foreign-claimed rows, so a re-query usually
+# returns either a different bead or "no work."
 
 # Step 2: Work found? -> Follow formula steps. Nothing? -> Check mail
 gc mail inbox

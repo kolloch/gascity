@@ -254,6 +254,7 @@ func doHook(workQuery, dir string, inject bool, runner WorkQueryRunner, stdout, 
 	trimmed := strings.TrimSpace(output)
 	normalized := normalizeWorkQueryOutput(trimmed)
 	normalized = filterUnreadyHookCandidates(normalized, time.Now())
+	normalized = filterClaimedByOtherSession(normalized, currentHookIdentities())
 	hasWork := workQueryHasReadyWork(normalized)
 
 	// Non-inject mode: print normalized, ready-only output. Return 0 only when work exists.
@@ -366,6 +367,96 @@ func isDepBlockedHookCandidate(item map[string]any) bool {
 		}
 	}
 	return false
+}
+
+// filterClaimedByOtherSession strips beads from work_query output whose
+// assignee is set to an identifier other than (a) one of the caller's
+// session identities, or (b) the bead's own gc.routed_to pool placeholder.
+//
+// This catches the case where the underlying bd ready query has surfaced a
+// bead another live session has already claimed — a defense against the
+// TOCTOU window between the hook read and the prompt's
+// `bd update --claim` write (pe-wisp-8ocps2, di-tz1). Without it, two
+// pool members can race to act on the same work.
+//
+// Pure function over JSON; takes the caller's identity list so tests stay
+// deterministic and the controller-side probe (no session env) can call
+// it with an empty list.
+func filterClaimedByOtherSession(output string, identities []string) string {
+	if output == "" {
+		return output
+	}
+	var decoded any
+	if err := json.Unmarshal([]byte(output), &decoded); err != nil {
+		return output
+	}
+	arr, ok := decoded.([]any)
+	if !ok {
+		return output
+	}
+	idSet := make(map[string]struct{}, len(identities))
+	for _, id := range identities {
+		id = strings.TrimSpace(id)
+		if id != "" {
+			idSet[id] = struct{}{}
+		}
+	}
+	filtered := make([]any, 0, len(arr))
+	for _, item := range arr {
+		obj, ok := item.(map[string]any)
+		if !ok {
+			filtered = append(filtered, item)
+			continue
+		}
+		if isClaimedByOtherSession(obj, idSet) {
+			continue
+		}
+		filtered = append(filtered, obj)
+	}
+	reencoded, err := json.Marshal(filtered)
+	if err != nil {
+		return output
+	}
+	return string(reencoded)
+}
+
+func isClaimedByOtherSession(item map[string]any, identities map[string]struct{}) bool {
+	rawAssignee, ok := item["assignee"]
+	if !ok {
+		return false
+	}
+	assignee, ok := rawAssignee.(string)
+	if !ok {
+		return false
+	}
+	assignee = strings.TrimSpace(assignee)
+	if assignee == "" {
+		return false
+	}
+	if _, ok := identities[assignee]; ok {
+		return false
+	}
+	if md, ok := item["metadata"].(map[string]any); ok {
+		if rt, ok := md["gc.routed_to"].(string); ok {
+			if strings.TrimSpace(rt) == assignee {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// currentHookIdentities reports the identifiers the running hook caller
+// considers "self" for claim-ownership checks. The order mirrors
+// EffectiveWorkQuery's Tier 1/2 search: GC_SESSION_ID (bead ID) takes
+// precedence, then GC_SESSION_NAME (tmux session name), then GC_ALIAS
+// (named identity). Empty values are dropped by the filter.
+func currentHookIdentities() []string {
+	return []string{
+		os.Getenv("GC_SESSION_ID"),
+		os.Getenv("GC_SESSION_NAME"),
+		os.Getenv("GC_ALIAS"),
+	}
 }
 
 func normalizeWorkQueryOutput(output string) string {
