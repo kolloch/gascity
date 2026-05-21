@@ -200,7 +200,7 @@ func ComputeAwakeSet(input AwakeInput) map[string]AwakeDecision {
 			if filled >= count {
 				break
 			}
-			if sessionHasConcreteAssignedWork(input.WorkBeads, bead) {
+			if sessionHasAssignedWork(input.WorkBeads, input.NamedSessions, bead) {
 				continue
 			}
 			desired[bead.SessionName] = "scaled:wake"
