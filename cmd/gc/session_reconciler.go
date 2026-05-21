@@ -1546,7 +1546,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 		// so no work is lost mid-flight. The next tick retries.
 		if maxAgeTr != nil && alive {
 			creationCompleteAt, hasAnchor := parseRFC3339Metadata(session.Metadata["creation_complete_at"])
-			if hasAnchor && maxAgeTr.shouldRestart(name, creationCompleteAt, clk.Now()) {
+			if hasAnchor && maxAgeTr.shouldRestart(name, tp.TemplateName, creationCompleteAt, clk.Now()) {
 				blocker := lifecycleTimerBlocker(session.Metadata, clk.Now())
 				switch {
 				case blocker != "":
@@ -1604,7 +1604,10 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 		}
 
 		// Idle timeout: restart sessions idle longer than configured threshold.
-		if it != nil && alive && it.checkIdle(name, sp, clk.Now()) {
+		// Pass the agent template so the tracker can fall back to a per-template
+		// timeout for pool sessions whose bead-derived runtime names are not
+		// registered directly.
+		if it != nil && alive && it.checkIdle(name, tp.TemplateName, sp, clk.Now()) {
 			blocker := lifecycleTimerBlocker(session.Metadata, clk.Now())
 			switch {
 			case blocker != "":
