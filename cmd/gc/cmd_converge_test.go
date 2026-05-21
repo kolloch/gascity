@@ -78,16 +78,22 @@ func TestConvergeListAllRigsAggregatesCityAndRigStores(t *testing.T) {
 		t.Fatalf("Execute: %v\nstderr:\n%s", err, stderr.String())
 	}
 
-	var entries []struct {
-		ID    string `json:"id"`
-		Rig   string `json:"rig"`
-		Title string `json:"title"`
+	var payload struct {
+		OK      bool `json:"ok"`
+		Entries []struct {
+			ID    string `json:"id"`
+			Rig   string `json:"rig"`
+			Title string `json:"title"`
+		} `json:"entries"`
 	}
-	if err := json.Unmarshal(stdout.Bytes(), &entries); err != nil {
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
 		t.Fatalf("unmarshal output %q: %v", stdout.String(), err)
 	}
+	if !payload.OK {
+		t.Fatalf("ok = false, want true: %s", stdout.String())
+	}
 	got := map[string]string{}
-	for _, entry := range entries {
+	for _, entry := range payload.Entries {
 		got[entry.Title] = entry.Rig
 	}
 	if got["city loop"] != "" {
@@ -156,15 +162,21 @@ func TestConvergeListAllRigsContinuesAfterRigStoreError(t *testing.T) {
 	if !strings.Contains(stderr.String(), `rig "broken"`) {
 		t.Fatalf("stderr = %q, want per-rig error", stderr.String())
 	}
-	var entries []struct {
-		Rig   string `json:"rig"`
-		Title string `json:"title"`
+	var payload struct {
+		OK      bool `json:"ok"`
+		Entries []struct {
+			Rig   string `json:"rig"`
+			Title string `json:"title"`
+		} `json:"entries"`
 	}
-	if err := json.Unmarshal(stdout.Bytes(), &entries); err != nil {
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
 		t.Fatalf("unmarshal output %q: %v", stdout.String(), err)
 	}
+	if !payload.OK {
+		t.Fatalf("ok = false, want true: %s", stdout.String())
+	}
 	got := map[string]string{}
-	for _, entry := range entries {
+	for _, entry := range payload.Entries {
 		got[entry.Title] = entry.Rig
 	}
 	if _, ok := got["city loop"]; !ok {
@@ -225,15 +237,21 @@ func TestConvergeListAllRigsAppliesStateFilterAcrossScopes(t *testing.T) {
 		t.Fatalf("Execute: %v\nstderr:\n%s", err, stderr.String())
 	}
 
-	var entries []struct {
-		Title string `json:"title"`
-		State string `json:"state"`
+	var payload struct {
+		OK      bool `json:"ok"`
+		Entries []struct {
+			Title string `json:"title"`
+			State string `json:"state"`
+		} `json:"entries"`
 	}
-	if err := json.Unmarshal(stdout.Bytes(), &entries); err != nil {
+	if err := json.Unmarshal(stdout.Bytes(), &payload); err != nil {
 		t.Fatalf("unmarshal output %q: %v", stdout.String(), err)
 	}
+	if !payload.OK {
+		t.Fatalf("ok = false, want true: %s", stdout.String())
+	}
 	got := map[string]string{}
-	for _, entry := range entries {
+	for _, entry := range payload.Entries {
 		got[entry.Title] = entry.State
 	}
 	if len(got) != 2 {

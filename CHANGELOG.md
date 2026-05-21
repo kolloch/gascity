@@ -71,6 +71,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `gc sling --json` now emits one JSONL result record, matching its checked-in
+  result schema; earlier JSON support emitted an indented multi-line object.
 - `gc trace status` and `gc trace show` now default to human-readable output;
   scripts that need machine-readable trace data should pass `--json`. The
   `--json` result shapes are also envelope objects now: `gc trace status

@@ -122,6 +122,34 @@ func TestMailSendSuccess(t *testing.T) {
 	}
 }
 
+func TestMailSendJSON(t *testing.T) {
+	store := beads.NewMemStore()
+	mp := beadmail.New(store)
+	recipients := map[string]bool{"human": true, "mayor": true}
+
+	var stdout, stderr bytes.Buffer
+	code := doMailSendJSON(mp, events.Discard, recipients, "human", []string{"mayor", "build is green"}, nil, true, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("doMailSendJSON = %d, want 0; stderr: %s", code, stderr.String())
+	}
+	var got struct {
+		SchemaVersion string `json:"schema_version"`
+		OK            bool   `json:"ok"`
+		Command       string `json:"command"`
+		Count         int    `json:"count"`
+		Messages      []struct {
+			ID string `json:"id"`
+			To string `json:"to"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("stdout is not JSON: %v\n%s", err, stdout.String())
+	}
+	if got.SchemaVersion != "1" || !got.OK || got.Command != "mail.send" || got.Count != 1 || len(got.Messages) != 1 || got.Messages[0].To != "mayor" {
+		t.Fatalf("payload = %+v", got)
+	}
+}
+
 func TestMailSendMissingArgs(t *testing.T) {
 	store := beads.NewMemStore()
 	mp := beadmail.New(store)
@@ -2547,7 +2575,7 @@ func TestMailSendAll(t *testing.T) {
 	recipients := map[string]bool{"human": true, "coder": true, "committer": true, "tester": true}
 
 	var stdout, stderr bytes.Buffer
-	code := doMailSendAll(mp, events.Discard, recipients, "coder", []string{"status update: tests passing"}, nil, &stdout, &stderr)
+	code := doMailSendAll(mp, events.Discard, recipients, "coder", []string{"status update: tests passing"}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("doMailSendAll = %d, want 0; stderr: %s", code, stderr.String())
 	}
@@ -2577,7 +2605,7 @@ func TestMailSendAllMissingBody(t *testing.T) {
 	recipients := map[string]bool{"human": true, "coder": true}
 
 	var stderr bytes.Buffer
-	code := doMailSendAll(mp, events.Discard, recipients, "human", nil, nil, &bytes.Buffer{}, &stderr)
+	code := doMailSendAll(mp, events.Discard, recipients, "human", nil, &bytes.Buffer{}, &stderr)
 	if code != 1 {
 		t.Errorf("doMailSendAll = %d, want 1", code)
 	}
@@ -2593,7 +2621,7 @@ func TestMailSendAllNoRecipients(t *testing.T) {
 	recipients := map[string]bool{"human": true, "coder": true}
 
 	var stderr bytes.Buffer
-	code := doMailSendAll(mp, events.Discard, recipients, "coder", []string{"hello?"}, nil, &bytes.Buffer{}, &stderr)
+	code := doMailSendAll(mp, events.Discard, recipients, "coder", []string{"hello?"}, &bytes.Buffer{}, &stderr)
 	if code != 1 {
 		t.Errorf("doMailSendAll = %d, want 1", code)
 	}
@@ -2608,7 +2636,7 @@ func TestMailSendAllExcludesSender(t *testing.T) {
 	recipients := map[string]bool{"human": true, "alice": true, "bob": true}
 
 	var stdout bytes.Buffer
-	code := doMailSendAll(mp, events.Discard, recipients, "alice", []string{"broadcast"}, nil, &stdout, &bytes.Buffer{})
+	code := doMailSendAll(mp, events.Discard, recipients, "alice", []string{"broadcast"}, &stdout, &bytes.Buffer{})
 	if code != 0 {
 		t.Fatalf("doMailSendAll = %d, want 0", code)
 	}
