@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Managed bd provider startup now detects a bd-standalone dolt server running
+  against the same `.beads/dolt` database before invoking the managed-bd
+  lifecycle script, and refuses with a message naming `bd dolt stop` as the
+  unblock. This covers `gc start`, `gc init`, and `gc rig add` provider
+  convergence paths. Previously, running `bd dolt start` while a city was
+  registered at the same path would leave the standalone dolt holding the
+  exclusive write lock; the city-managed dolt could not acquire it and startup
+  failed with a generic "dolt server could not start via gc helper" error that
+  did not point at the lock holder. Stale `.beads/dolt-server.pid` files and
+  live PIDs that do not look like `dolt sql-server` are ignored so leftover
+  files and PID reuse do not block startup.
 - Kiro provider launch behavior is now explicit in release notes and provider
   docs: the built-in Kiro provider starts `kiro-cli` with `chat`,
   `--no-interactive`, `--agent gascity`, and `--trust-all-tools` by default.
