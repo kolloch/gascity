@@ -781,6 +781,7 @@ func TestPolecatPromptDocumentsReleaseToPool(t *testing.T) {
 		"**unset the assignee**",
 		"do NOT reassign to",
 		`gc bd update <issue> --status=open --assignee=""`,
+		`--set-metadata gc.routed_to="${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}polecat"`,
 		"invisible to the spawn query",
 	)
 
@@ -791,7 +792,7 @@ func TestPolecatPromptDocumentsReleaseToPool(t *testing.T) {
 	}
 	assertContainsInOrder(t, string(formulaData),
 		"Need to release bead back to pool",
-		`gc bd update <id> --status=open --assignee=""`,
+		`gc bd update <id> --status=open --assignee="" --set-metadata gc.routed_to="${GC_RIG:+$GC_RIG/}{{binding_prefix}}polecat"`,
 		"UNSET assignee",
 		"DO NOT assign to Witness, Refinery, or any singleton",
 	)
