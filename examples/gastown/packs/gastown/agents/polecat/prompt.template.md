@@ -266,9 +266,56 @@ Nudges from other agents may arrive via your hook. When working:
 
 ---
 
+## Pre-Push CI Gate
+
+**Before `git push origin HEAD` in the done sequence, the rig's configured
+quality checks MUST have passed.** The formula's `self-review` step is the
+canonical pre-push gate — it runs each command from the rig's
+`[rigs.<name>.formula_vars]` block in city.toml:
+
+- `setup_command` (e.g., `pnpm install`)
+- `typecheck_command` (e.g., `tsc --noEmit`)
+- `lint_command` (e.g., `cargo clippy --workspace --all-targets -- -D warnings`)
+- `build_command` (e.g., `go build ./...`)
+- `test_command` (e.g., `cargo test --workspace`)
+
+Empty values are skipped. **Skipping `self-review` and jumping straight
+to the done sequence bypasses this gate** — that is how broken work reaches
+main. The refinery re-runs the same checks on the rebased SHA as
+defense-in-depth (see refinery prompt's "Pre-Merge CI Gate"), but the
+polecat's pre-push gate catches issues one rebase earlier, while the
+polecat still owns the branch.
+
+If the rig you are working in requires extra checks not yet wired into
+the formula vars (e.g. clippy with non-default features, or a docs build
+gated on changed paths), wrap them inside the existing command:
+
+```toml
+[rigs.<rig>.formula_vars]
+build_command = "go build ./... && if git diff --name-only origin/{{ .DefaultBranch }}..HEAD | grep -q '^docs/'; then (cd docs && npm ci && npm run build); fi"
+lint_command  = "cargo clippy --workspace --all-targets -- -D warnings && cargo clippy -p fs-bench --all-targets --features uring -- -D warnings"
+```
+
+This keeps rig-specific commands in rig config — the gastown pack itself
+stays rig-agnostic, and other rigs (e.g. gas-ui) without a Rust toolchain
+are unaffected because their `lint_command` stays empty.
+
+**Failure handling:** if the branch caused a check failure, fix it, commit,
+and re-run the gate. If the failure is pre-existing on `{{ .DefaultBranch }}`,
+file a bug bead via the procedure in the formula's `self-review` step —
+do NOT bypass the gate.
+
+---
+
 ## FINAL REMINDER: RUN THE DONE SEQUENCE
 
-**Before your session ends, you MUST run the done sequence.**
+**Before your session ends:**
+
+1. The **Pre-Push CI Gate** (formula `self-review` step) MUST have passed.
+   If you modified the branch after `self-review` ran, re-run the
+   configured commands now — `git push` is gated on a green check set,
+   not on a stale one.
+2. Then run the done sequence:
 
 ```bash
 git push origin HEAD

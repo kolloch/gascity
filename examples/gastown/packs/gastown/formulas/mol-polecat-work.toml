@@ -197,6 +197,31 @@ git add -A && git commit -m "chore: capture remaining work ({{issue}})"
 This is a belt-and-suspenders check — self-review should have caught this,
 but we never push with untracked work left behind.
 
+**1.5. Pre-Push CI Gate (defense-in-depth):**
+
+The `self-review` step already ran the rig's configured quality checks.
+Re-run them here as a safeguard — if you fixed any uncommitted work in
+step 1 above, the state the gate gave green to has now changed.
+
+```bash
+{{setup_command}}
+{{typecheck_command}}
+{{lint_command}}
+{{build_command}}
+{{test_command}}
+```
+
+Empty values are skipped silently. **ALL configured checks MUST pass
+before push.** If your branch caused a failure, fix it, commit, and
+re-run this block. If pre-existing on {{base_branch}}, file a bead per
+the `self-review` procedure — do NOT bypass the gate.
+
+This gate is intentionally redundant with `self-review`'s gate: skipping
+it means trusting that nothing changed between self-review and now, and
+the LLM that gets here is not necessarily the same one that ran
+self-review (think mid-formula restart). Re-running is cheap; pushing a
+broken branch and waiting for refinery rejection is not.
+
 **2. Push your branch:**
 ```bash
 git push origin HEAD

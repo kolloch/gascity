@@ -479,6 +479,160 @@ func TestPolecatPromptDoneSequenceSignalsRefinery(t *testing.T) {
 	}
 }
 
+// TestPolecatPromptHasPrePushCIGate pins the "Pre-Push CI Gate" section
+// added for ga-w7e (sibling of za-mmql). Background: za-mmql's audit of
+// six main-CI breaks in <12h traced 4 of them to broken work that pushed
+// from a polecat session whose done sequence did not re-assert the
+// formula's self-review checks. The polecat prompt's done sequence was
+// "too loose" — it described the push but never named the gate that must
+// have passed first. Adding an explicit gate section gives the LLM the
+// rule before it sees `git push origin HEAD`.
+//
+// The gate MUST:
+//   - precede the FINAL REMINDER done sequence,
+//   - name the five rig-configurable formula vars by name (so any rig can
+//     opt in via [rigs.<name>.formula_vars] without a pack edit),
+//   - reference self-review as the canonical pre-push gate,
+//   - show the conditional-wrap pattern for rig-specific checks (e.g.
+//     clippy with non-default features, docs build on docs/ change) so
+//     operators don't try to fork the pack to add rig-specific commands,
+//   - and the FINAL REMINDER must reference the gate by name so the LLM
+//     sees the requirement when reading the done sequence.
+func TestPolecatPromptHasPrePushCIGate(t *testing.T) {
+	dir := exampleDir()
+	path := filepath.Join(dir, "packs", "gastown", "agents", "polecat", "prompt.template.md")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading polecat prompt: %v", err)
+	}
+	body := string(data)
+
+	assertContainsInOrder(t, body,
+		"## Pre-Push CI Gate",
+		"`self-review`",
+		"`[rigs.<name>.formula_vars]`",
+		"`setup_command`",
+		"`typecheck_command`",
+		"`lint_command`",
+		"`build_command`",
+		"`test_command`",
+		"defense-in-depth",
+		"## FINAL REMINDER: RUN THE DONE SEQUENCE",
+		"**Pre-Push CI Gate**",
+	)
+
+	// Rig-specific opt-in pattern must be documented so operators wire
+	// extra checks (clippy with features, docs build on docs/ change)
+	// into formula_vars instead of editing the pack template.
+	if !strings.Contains(body, "cargo clippy --workspace --all-targets -- -D warnings") {
+		t.Fatalf("polecat prompt must show the clippy --workspace opt-in pattern in formula_vars")
+	}
+	if !strings.Contains(body, "cargo clippy -p fs-bench --all-targets --features uring -- -D warnings") {
+		t.Fatalf("polecat prompt must show the clippy uring-features opt-in pattern in formula_vars")
+	}
+	if !strings.Contains(body, "grep -q '^docs/'") {
+		t.Fatalf("polecat prompt must show the docs-changed conditional pattern (grep -q '^docs/')")
+	}
+}
+
+// TestRefineryPromptHasPreMergeCIGate pins the "Pre-Merge CI Gate" section
+// added for ga-w7e. Background: za-mmql identified that the refinery
+// rebased polecat branches onto main and pushed the rebased commit
+// without re-running CI on the new SHA. Pre-rebase polecat-branch CI
+// passing on a different code state did not guarantee post-rebase main-CI
+// would pass — semantic merge conflicts with intervening changes produced
+// broken main runs. The formula's run-tests step DOES execute the
+// configured commands on the rebased SHA (the temp branch), but the
+// refinery prompt did not name that as the load-bearing pre-merge gate.
+//
+// The gate MUST:
+//   - reference the formula's run-tests step,
+//   - name the same five rig-configurable formula vars as the polecat's
+//     pre-push gate,
+//   - explicitly say "polecat and refinery checklists MUST agree" so
+//     operators don't drift into a polecat-only or refinery-only config,
+//   - document the chosen architecture (local rebased-SHA checks) and
+//     the two alternatives (GitHub merge_group, per-PR merge) — the
+//     bead's acceptance criteria requires the choice be documented in
+//     the pack so future readers know why merge_group is NOT the
+//     default.
+func TestRefineryPromptHasPreMergeCIGate(t *testing.T) {
+	dir := exampleDir()
+	path := filepath.Join(dir, "packs", "gastown", "agents", "refinery", "prompt.template.md")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading refinery prompt: %v", err)
+	}
+	body := string(data)
+
+	assertContainsInOrder(t, body,
+		"## Pre-Merge CI Gate",
+		"`run-tests`",
+		"rebased SHA",
+		"`setup_command`",
+		"`typecheck_command`",
+		"`lint_command`",
+		"`build_command`",
+		"`test_command`",
+		"`[rigs.<name>.formula_vars]`",
+		"polecat and refinery checklists MUST agree",
+		"### Why local rebased-SHA checks (not merge_group / PR)",
+		"**Local rebased-SHA checks**",
+		"**GitHub `merge_group`**",
+		"**Per-PR merge**",
+	)
+
+	// "rebase-and-push gap" is the canonical term used in za-mmql and
+	// ga-w7e — the prompt should name it so future readers can trace
+	// the documentation back to the audit.
+	if !strings.Contains(body, "rebase-and-push gap") {
+		t.Fatalf("refinery prompt must name the 'rebase-and-push gap' (za-mmql audit terminology)")
+	}
+}
+
+// TestPolecatFormulaSubmitRunsPrePushChecks pins the defense-in-depth
+// pre-push gate added to mol-polecat-work's submit-and-exit step for
+// ga-w7e. Background: self-review already runs the rig's configured
+// quality checks, but a polecat session may have been restarted between
+// self-review and submit (LLM rotation, context exhaustion), and step 1
+// of submit-and-exit can introduce new commits when it captures
+// remaining untracked work. Re-running the configured checks just
+// before `git push origin HEAD` catches both cases — they are the same
+// commands self-review ran, and empty values are skipped silently, so
+// rigs without a configured check pay nothing.
+//
+// The gate MUST:
+//   - sit between step 1 (clean-state verification) and step 2 (push),
+//   - re-run all five configured commands (in any order is OK, but they
+//     must all appear before "## **2. Push your branch**"),
+//   - explicitly name itself a defense-in-depth re-run of self-review
+//     so a future reader doesn't delete it as a duplicate.
+func TestPolecatFormulaSubmitRunsPrePushChecks(t *testing.T) {
+	dir := exampleDir()
+	path := filepath.Join(dir, "packs", "gastown", "formulas", "mol-polecat-work.toml")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading polecat formula: %v", err)
+	}
+	body := string(data)
+
+	assertContainsInOrder(t, body,
+		"**1. Final clean-state verification (safeguard):**",
+		"**1.5. Pre-Push CI Gate (defense-in-depth):**",
+		"{{setup_command}}",
+		"{{typecheck_command}}",
+		"{{lint_command}}",
+		"{{build_command}}",
+		"{{test_command}}",
+		"**2. Push your branch:**",
+		"git push origin HEAD",
+	)
+
+	if !strings.Contains(body, "defense-in-depth") {
+		t.Fatalf("polecat formula submit step must name the gate as defense-in-depth so it is not deleted as a self-review duplicate")
+	}
+}
+
 // TestPolecatPromptOpensWithImperativeFirstAction guards against the
 // regression observed 2026-05-18 (ga-2ph): freshly-spawned or reload-
 // survivor polecat sessions sometimes sat idle at the Claude Code prompt

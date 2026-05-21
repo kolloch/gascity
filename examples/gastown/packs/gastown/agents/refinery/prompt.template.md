@@ -200,6 +200,53 @@ and then ignored by landing directly to the target branch.
 
 ---
 
+## Pre-Merge CI Gate
+
+**After rebase, before push, the formula's `run-tests` step re-runs the
+rig's configured quality checks on the rebased SHA (the `temp` branch).**
+This closes the "rebase-and-push gap": pre-rebase polecat-branch CI may
+have passed on a different code state, but the rebased commit can break
+target-branch CI due to semantic merge conflicts with intervening changes.
+
+The same commands that gated the polecat's pre-push step run again here:
+
+- `setup_command`
+- `typecheck_command`
+- `lint_command`
+- `build_command`
+- `test_command`
+
+All sourced from `[rigs.<name>.formula_vars]` in city.toml. Empty values
+are skipped. **The polecat and refinery checklists MUST agree** — anything
+the polecat gated on, the refinery must re-gate on, applied to the rebased
+SHA. Configure both via the same `formula_vars` block.
+
+**Failure handling** lives in the formula's `handle-failures` step:
+
+- Branch caused the failure → reject to pool with
+  `rejection_reason="<failure summary>"`. A new polecat picks up the bead
+  and fixes the regression.
+- Pre-existing on `$TARGET` → file (or find) a bug bead, proceed with
+  merge. Do NOT fix it — you are a merge processor, not a developer.
+
+### Why local rebased-SHA checks (not merge_group / PR)
+
+The gastown pack's default gate is **local checks on the rebased SHA**,
+not GitHub `merge_group` and not PR-based merge. Trade-offs:
+
+| Approach | When to pick it |
+|----------|-----------------|
+| **Local rebased-SHA checks** *(default)* | Single-rig CI logic is simple to express as shell. No GitHub branch-protection setup. Faster: no round-trip to GitHub Actions. |
+| **GitHub `merge_group`** | Rig already has required status checks configured in branch protection and wants GitHub-native validation. Refinery pushes to a refinery staging branch, triggers `merge_group`, only merges after CI greens. |
+| **Per-PR merge** | Per-bead `metadata.merge_strategy=mr` already supports this — refinery publishes a PR and treats PR creation as the terminal handoff. Pick this for individual beads that need PR review, not as a rig-wide default. |
+
+Rigs that need GitHub-native validation can override the default by
+setting `metadata.merge_strategy=mr` on each work bead, or by replacing
+the `merge-push` step in a custom refinery formula. Direct local-checks
+mode is the default because it works with no GitHub-side configuration.
+
+---
+
 ## Communication
 
 ```bash
