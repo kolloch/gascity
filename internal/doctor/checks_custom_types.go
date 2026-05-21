@@ -7,6 +7,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/gastownhall/gascity/internal/beads"
 )
 
 // RequiredCustomTypes lists the bead types that Gas City requires
@@ -155,7 +157,8 @@ func mergeCustomTypes(current, required []string) []string {
 // the human-readable "types.custom (not set)" sentinel (which would
 // otherwise be persisted as a fake custom type when Fix() merges).
 func getCustomTypes(dir string) ([]string, error) {
-	cmd := exec.Command("bd", "config", "get", "--json", "types.custom")
+	args := beads.PrependBdReadOnlyFlagsIfApplicable("bd", []string{"config", "get", "--json", "types.custom"})
+	cmd := exec.Command("bd", args...)
 	cmd.Dir = dir
 	out, err := cmd.Output()
 	if err != nil {

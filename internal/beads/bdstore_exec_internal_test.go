@@ -85,12 +85,121 @@ printf '[]\n'
 
 	rec := exp.waitForBody(t, "bd.slow", time.Second)
 	attrs := beadsRecordAttrs(*rec)
-	if got := beadsLogValueStringSlice(attrs["args"]); strings.Join(got, " ") != "list --token <redacted>" {
-		t.Fatalf("bd.slow args = %#v, want token redacted", got)
+	// list is a known read so ga-sc9's auto-injection prepends bd's
+	// --readonly / --dolt-auto-commit=off ahead of the subcommand. The
+	// secret token still needs to be redacted afterward.
+	if got := beadsLogValueStringSlice(attrs["args"]); strings.Join(got, " ") != "--readonly --dolt-auto-commit=off list --token <redacted>" {
+		t.Fatalf("bd.slow args = %#v, want token redacted with read-only flags", got)
 	}
 	if got := attrs["agent_id"].AsString(); got != "test-agent-1" {
 		t.Fatalf("bd.slow agent_id = %q, want test-agent-1", got)
 	}
+}
+
+// TestExecCommandRunnerInjectsReadOnlyForReadCommand verifies that the
+// runner prepends bd's --readonly / --dolt-auto-commit=off global flags
+// when the bd subcommand is a known read (ga-sc9). The fake bd script
+// records its argv to a file we can inspect afterward.
+func TestExecCommandRunnerInjectsReadOnlyForReadCommand(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("sh unavailable")
+	}
+	binDir := t.TempDir()
+	argvFile := filepath.Join(t.TempDir(), "argv")
+	writeExecutable(t, filepath.Join(binDir, "bd"), `#!/bin/sh
+printf "%s\n" "$@" > `+argvFile+`
+printf '[]\n'
+`)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv(disableAutoReadOnlyEnv, "")
+
+	if _, err := ExecCommandRunner()(t.TempDir(), "bd", "list", "--json"); err != nil {
+		t.Fatalf("ExecCommandRunner bd list: %v", err)
+	}
+
+	argvBytes, err := os.ReadFile(argvFile)
+	if err != nil {
+		t.Fatalf("read argv: %v", err)
+	}
+	gotArgv := strings.Split(strings.TrimRight(string(argvBytes), "\n"), "\n")
+	wantArgv := []string{"--readonly", "--dolt-auto-commit=off", "list", "--json"}
+	if !equalStringSlice(gotArgv, wantArgv) {
+		t.Fatalf("bd argv = %v, want %v", gotArgv, wantArgv)
+	}
+}
+
+// TestExecCommandRunnerDoesNotInjectForWriteCommand verifies the runner
+// leaves mutating bd subcommands alone — injecting --readonly there would
+// cause bd to reject a legitimate write (ga-sc9).
+func TestExecCommandRunnerDoesNotInjectForWriteCommand(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("sh unavailable")
+	}
+	binDir := t.TempDir()
+	argvFile := filepath.Join(t.TempDir(), "argv")
+	writeExecutable(t, filepath.Join(binDir, "bd"), `#!/bin/sh
+printf "%s\n" "$@" > `+argvFile+`
+printf '{}\n'
+`)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv(disableAutoReadOnlyEnv, "")
+
+	if _, err := ExecCommandRunner()(t.TempDir(), "bd", "update", "ga-1", "--status", "open"); err != nil {
+		t.Fatalf("ExecCommandRunner bd update: %v", err)
+	}
+
+	argvBytes, err := os.ReadFile(argvFile)
+	if err != nil {
+		t.Fatalf("read argv: %v", err)
+	}
+	gotArgv := strings.Split(strings.TrimRight(string(argvBytes), "\n"), "\n")
+	wantArgv := []string{"update", "ga-1", "--status", "open"}
+	if !equalStringSlice(gotArgv, wantArgv) {
+		t.Fatalf("bd argv = %v, want %v", gotArgv, wantArgv)
+	}
+}
+
+// TestExecCommandRunnerHonorsAutoReadOnlyOptOut verifies the
+// GC_BD_NO_AUTO_READONLY env var disables the injection so operators can
+// fall back to pre-ga-sc9 behavior.
+func TestExecCommandRunnerHonorsAutoReadOnlyOptOut(t *testing.T) {
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("sh unavailable")
+	}
+	binDir := t.TempDir()
+	argvFile := filepath.Join(t.TempDir(), "argv")
+	writeExecutable(t, filepath.Join(binDir, "bd"), `#!/bin/sh
+printf "%s\n" "$@" > `+argvFile+`
+printf '[]\n'
+`)
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv(disableAutoReadOnlyEnv, "1")
+
+	if _, err := ExecCommandRunner()(t.TempDir(), "bd", "list"); err != nil {
+		t.Fatalf("ExecCommandRunner bd list: %v", err)
+	}
+
+	argvBytes, err := os.ReadFile(argvFile)
+	if err != nil {
+		t.Fatalf("read argv: %v", err)
+	}
+	gotArgv := strings.Split(strings.TrimRight(string(argvBytes), "\n"), "\n")
+	wantArgv := []string{"list"}
+	if !equalStringSlice(gotArgv, wantArgv) {
+		t.Fatalf("bd argv = %v, want %v", gotArgv, wantArgv)
+	}
+}
+
+func equalStringSlice(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func TestExecCommandRunnerStopsBDSlowTimerForFastBDCommand(t *testing.T) {

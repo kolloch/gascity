@@ -54,6 +54,14 @@ func ExecCommandRunner() CommandRunner {
 func ExecCommandRunnerWithEnv(env map[string]string) CommandRunner {
 	return func(dir, name string, args ...string) ([]byte, error) {
 		start := time.Now()
+		// Classify and choose timeout based on the original (un-injected)
+		// subcommand so the read/write classification stays stable.
+		timeout := bdCommandTimeoutFor(name, args)
+		// Inject bd's --readonly / --dolt-auto-commit=off ahead of known
+		// read-only subcommands so dolt avoids the implicit COMMIT cycle
+		// (and the "nothing to commit" log spam) that drives per-command
+		// connection churn under ambient agent polling (ga-sc9).
+		args = PrependBdReadOnlyFlagsIfApplicable(name, args)
 		trace := func(status string, err error) {
 			path := strings.TrimSpace(os.Getenv("GC_BD_TRACE"))
 			if path == "" {
@@ -72,7 +80,6 @@ func ExecCommandRunnerWithEnv(env map[string]string) CommandRunner {
 				time.Now().UTC().Format(time.RFC3339Nano), status, time.Since(start), dir, name, args, msg)
 		}
 		trace("start", nil)
-		timeout := bdCommandTimeoutFor(name, args)
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
 		defer cancel()
 		var slowTimer *time.Timer

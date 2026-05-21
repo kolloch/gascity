@@ -4160,9 +4160,18 @@ func TestGcBeadsBdInitRetriesRootStoreVerification(t *testing.T) {
 
 	listCountFile := filepath.Join(t.TempDir(), "bd-list-count")
 	fakeBd := filepath.Join(binDir, "bd")
+	// Skip leading global flags (gc auto-injects --readonly /
+	// --dolt-auto-commit=off ahead of read subcommands per ga-sc9) so
+	// the dispatcher sees the actual subcommand in $1.
 	fakeBdScript := `#!/bin/sh
 set -eu
 count_file="` + listCountFile + `"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -*) shift ;;
+    *) break ;;
+  esac
+done
 cmd="${1:-}"
 case "$cmd" in
   list)
@@ -5263,9 +5272,18 @@ func TestGcBeadsBdInitPinsManagedDoltEnvForBdSubcommands(t *testing.T) {
 
 	captureDir := t.TempDir()
 	fakeBd := filepath.Join(binDir, "bd")
+	// Skip leading global flags (gc auto-injects --readonly /
+	// --dolt-auto-commit=off ahead of read subcommands per ga-sc9) so
+	// the dispatcher sees the actual subcommand in $1.
 	fakeBdScript := `#!/bin/sh
 set -eu
 capture_dir="` + captureDir + `"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -*) shift ;;
+    *) break ;;
+  esac
+done
 cmd="${1:-}"
 record() {
   name="$1"

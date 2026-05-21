@@ -56,6 +56,15 @@ BD_EXPORT_AUTO=%s
   "${BD_EXPORT_AUTO:-}" > "` + envFile + `"
 printf '%s
 ' "$*" > "` + argsFile + `"
+# Skip leading global flags (gc auto-injects --readonly /
+# --dolt-auto-commit=off ahead of read subcommands per ga-sc9) so the
+# case statement dispatches on the actual subcommand.
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -*) shift ;;
+    *) break ;;
+  esac
+done
 case "${1:-}" in
   create)
     cat <<'JSON'

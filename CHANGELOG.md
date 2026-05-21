@@ -51,6 +51,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `gc bd` and the internal `bd` shell-out path now auto-inject bd's
+  `--readonly` and `--dolt-auto-commit=off` global flags ahead of known
+  read-only subcommands (`list`, `ready`, `show`, `count`, `stats`,
+  `status`, `search`, `state`, `statuses`, `types`, `lint`, `history`,
+  `diff`, `children`, `comments`, `graph`, `find-duplicates`, `dep list`,
+  `config get`, `label list/ls/show`). This eliminates the implicit
+  commit cycle that drove per-command dolt connection churn under
+  ambient agent polling. Operators can opt out by setting
+  `GC_BD_NO_AUTO_READONLY=1`. Mutating subcommands and invocations that
+  already specify `--readonly` or `--dolt-auto-commit` are left
+  untouched.
 - Pack import cache validation now requires commit abbreviations in
   `packs.lock` to be at least seven characters long. Shorter abbreviations
   should be refreshed with `gc import install`.

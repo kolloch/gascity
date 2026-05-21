@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
 	"github.com/spf13/cobra"
 )
@@ -174,6 +175,13 @@ func doBd(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "gc bd: bd not found in PATH") //nolint:errcheck // best-effort stderr
 		return 1
 	}
+
+	// Inject bd's --readonly / --dolt-auto-commit=off ahead of known
+	// read-only subcommands so dolt skips the implicit commit cycle and
+	// per-command connection churn drops (ga-sc9). Pass-through writes
+	// and any invocation that already specifies these flags are left as
+	// the operator typed them.
+	bdArgs = beads.PrependBdReadOnlyFlagsIfApplicable("bd", bdArgs)
 
 	cmd := exec.Command(bdPath, bdArgs...)
 	cmd.Dir = target.ScopeRoot

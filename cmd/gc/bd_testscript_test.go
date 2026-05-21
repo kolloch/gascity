@@ -25,6 +25,16 @@ func bdTestCmd() {
 		os.Exit(1)
 	}
 
+	// Skip leading global flags (gc auto-injects --readonly and
+	// --dolt-auto-commit=off ahead of read subcommands per ga-sc9) so
+	// the dispatcher lands on the actual subcommand.
+	for len(args) > 0 && strings.HasPrefix(args[0], "-") {
+		args = args[1:]
+	}
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "bd: missing subcommand")
+		os.Exit(1)
+	}
 	subcmd := args[0]
 	rest := args[1:]
 

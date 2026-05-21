@@ -558,8 +558,11 @@ set -eu
 	if !samePath(got["pwd"], rigDir) {
 		t.Fatalf("pwd = %q, want %q", got["pwd"], rigDir)
 	}
-	if got["args"] != "show repo-abc" {
-		t.Fatalf("args = %q, want %q", got["args"], "show repo-abc")
+	// gc auto-injects bd's --readonly / --dolt-auto-commit=off ahead of
+	// known read-only subcommands (ga-sc9). show is a read.
+	wantArgs := "--readonly --dolt-auto-commit=off show repo-abc"
+	if got["args"] != wantArgs {
+		t.Fatalf("args = %q, want %q", got["args"], wantArgs)
 	}
 	if !samePath(got["GC_STORE_ROOT"], rigDir) {
 		t.Fatalf("GC_STORE_ROOT = %q, want %q", got["GC_STORE_ROOT"], rigDir)
@@ -617,12 +620,21 @@ name = "demo"
 
 	binDir := t.TempDir()
 	script := filepath.Join(binDir, "bd")
+	// Skip leading global flags (gc auto-injects --readonly /
+	// --dolt-auto-commit=off ahead of read subcommands per ga-sc9) so the
+	// case statement dispatches on the actual subcommand.
 	if err := os.WriteFile(script, []byte(`#!/bin/sh
 set -eu
 if [ "${BD_EXPORT_AUTO:-}" != "false" ]; then
   echo "BD_EXPORT_AUTO=${BD_EXPORT_AUTO:-}" >&2
   exit 73
 fi
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -*) shift ;;
+    *) break ;;
+  esac
+done
 case "${1:-}" in
   show)
     printf '[{"id":"gc-1","title":"ok"}]\n'
@@ -781,8 +793,11 @@ set -eu
 	if !samePath(got["pwd"], cityDir) {
 		t.Fatalf("pwd = %q, want %q", got["pwd"], cityDir)
 	}
-	if got["args"] != "list --label repo-open" {
-		t.Fatalf("args = %q, want %q", got["args"], "list --label repo-open")
+	// gc auto-injects bd's --readonly / --dolt-auto-commit=off ahead of
+	// known read-only subcommands (ga-sc9). list is a read.
+	wantArgs := "--readonly --dolt-auto-commit=off list --label repo-open"
+	if got["args"] != wantArgs {
+		t.Fatalf("args = %q, want %q", got["args"], wantArgs)
 	}
 	if !samePath(got["GC_STORE_ROOT"], cityDir) {
 		t.Fatalf("GC_STORE_ROOT = %q, want %q", got["GC_STORE_ROOT"], cityDir)
@@ -994,8 +1009,11 @@ set -eu
 	if !samePath(got["pwd"], rigDir) {
 		t.Fatalf("pwd = %q, want %q", got["pwd"], rigDir)
 	}
-	if got["args"] != "list" {
-		t.Fatalf("args = %q, want %q", got["args"], "list")
+	// gc auto-injects bd's --readonly / --dolt-auto-commit=off ahead of
+	// known read-only subcommands (ga-sc9). list is a read.
+	wantArgs := "--readonly --dolt-auto-commit=off list"
+	if got["args"] != wantArgs {
+		t.Fatalf("args = %q, want %q", got["args"], wantArgs)
 	}
 	if !samePath(got["BEADS_DIR"], filepath.Join(rigDir, ".beads")) {
 		t.Fatalf("BEADS_DIR = %q, want %q", got["BEADS_DIR"], filepath.Join(rigDir, ".beads"))
