@@ -233,6 +233,84 @@ func TestResolveFormulas_StaleCleanup(t *testing.T) {
 	}
 }
 
+// TestResolveFormulas_PreservesSymlinksToExternalLayer verifies that
+// ResolveFormulas does not strip pre-existing symlinks whose target file
+// still exists on disk but resides in a layer that the current call does
+// not know about. Regression for ga-9y9 / pe-mcpb: the supervisor and
+// cmd_init.go city-level paths pass only city formula layers, while
+// per-rig packs (e.g. gastown imported via [rigs.imports.X]) mirror their
+// formulas into the same city .beads/formulas/ directory through other
+// mechanisms. The earlier cleanup logic removed every symlink that wasn't
+// in the city-level winners set, repeatedly wiping those per-rig symlinks
+// on every supervisor reload / gc init re-run.
+func TestResolveFormulas_PreservesSymlinksToExternalLayer(t *testing.T) {
+	dir := t.TempDir()
+	cityLayer := filepath.Join(dir, "city-formulas")
+	externalLayer := filepath.Join(dir, "external-formulas")
+
+	writeFormulaFile(t, cityLayer, "mol-city.toml", "city formula")
+	writeFormulaFile(t, externalLayer, "mol-external.toml", "external formula")
+
+	target := filepath.Join(dir, "rig")
+	symlinkDir := filepath.Join(target, ".beads", "formulas")
+	if err := os.MkdirAll(symlinkDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Pre-create a symlink for the external formula — as if some other code
+	// path (per-rig pack import, hand-edited guard, prior wider-layers run)
+	// had already materialized it.
+	externalSrc := filepath.Join(externalLayer, "mol-external.toml")
+	for _, linkName := range []string{"mol-external.toml", "mol-external.formula.toml"} {
+		if err := os.Symlink(externalSrc, filepath.Join(symlinkDir, linkName)); err != nil {
+			t.Fatalf("create external symlink %q: %v", linkName, err)
+		}
+	}
+
+	// Call ResolveFormulas with ONLY the city layer — externalLayer is not
+	// in the layers list and mol-external isn't a winner.
+	if err := ResolveFormulas(target, []string{cityLayer}); err != nil {
+		t.Fatalf("ResolveFormulas: %v", err)
+	}
+
+	// City formula must be created.
+	for _, linkName := range []string{"mol-city.toml", "mol-city.formula.toml"} {
+		dest, err := os.Readlink(filepath.Join(symlinkDir, linkName))
+		if err != nil {
+			t.Fatalf("%s readlink: %v", linkName, err)
+		}
+		if dest != filepath.Join(cityLayer, "mol-city.toml") {
+			t.Errorf("%s target = %q, want %q", linkName, dest, filepath.Join(cityLayer, "mol-city.toml"))
+		}
+	}
+
+	// External formula symlinks must survive even though externalLayer was
+	// not in the layers list and mol-external is not among the winners.
+	for _, linkName := range []string{"mol-external.toml", "mol-external.formula.toml"} {
+		dest, err := os.Readlink(filepath.Join(symlinkDir, linkName))
+		if err != nil {
+			t.Fatalf("external symlink %s should survive narrow-layers call: %v", linkName, err)
+		}
+		if dest != externalSrc {
+			t.Errorf("%s target = %q, want %q", linkName, dest, externalSrc)
+		}
+	}
+
+	// And once the underlying file disappears, broken-link cleanup still
+	// fires: the symlink should be removed on the next call.
+	if err := os.Remove(externalSrc); err != nil {
+		t.Fatalf("remove external src: %v", err)
+	}
+	if err := ResolveFormulas(target, []string{cityLayer}); err != nil {
+		t.Fatalf("second ResolveFormulas: %v", err)
+	}
+	for _, linkName := range []string{"mol-external.toml", "mol-external.formula.toml"} {
+		if _, err := os.Lstat(filepath.Join(symlinkDir, linkName)); !os.IsNotExist(err) {
+			t.Errorf("%s should have been removed after target deletion (got err=%v)", linkName, err)
+		}
+	}
+}
+
 // TestResolveFormulas_LegacySymlinkCompatibility verifies that the legacy
 // compatibility alias is created and refreshed alongside the canonical link.
 func TestResolveFormulas_LegacySymlinkCompatibility(t *testing.T) {

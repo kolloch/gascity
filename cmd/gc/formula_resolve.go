@@ -19,9 +19,15 @@ import (
 // filename; the legacy alias keeps older external bd binaries working while
 // they still probe only the infixed TOML form.
 //
-// Idempotent: correct symlinks are left alone, stale ones are updated,
-// and symlinks for formulas no longer in any layer are removed. Real files
-// (non-symlinks) in the target directory are never overwritten.
+// Idempotent: correct symlinks are left alone, stale ones are updated.
+// Symlinks whose target file no longer exists on disk are removed (broken-
+// link cleanup). Symlinks pointing to a still-existing file that is NOT
+// among the current winners are preserved — they may have been materialized
+// by another caller with a wider layer set (e.g. a per-rig pack mirrored
+// into the city .beads/formulas/ by a different code path). Callers that
+// pass a narrow layers list are therefore safe; they won't strip symlinks
+// they didn't know about. Real files (non-symlinks) in the target
+// directory are never overwritten.
 //
 // Per-name precedence (last-wins across layers, canonical-beats-legacy
 // within a layer) is delegated to formula.ResolveAll — the same source of
@@ -45,7 +51,7 @@ func ResolveFormulas(targetDir string, layers []string) error {
 	symlinkDir := filepath.Join(targetDir, ".beads", "formulas")
 
 	if len(winners) == 0 {
-		return cleanStaleFormulaSymlinks(symlinkDir, linkTargets)
+		return cleanStaleFormulaSymlinks(symlinkDir)
 	}
 
 	// Ensure target symlink directory exists.
@@ -80,14 +86,18 @@ func ResolveFormulas(targetDir string, layers []string) error {
 		}
 	}
 
-	return cleanStaleFormulaSymlinks(symlinkDir, linkTargets)
+	return cleanStaleFormulaSymlinks(symlinkDir)
 }
 
-// cleanStaleFormulaSymlinks removes symlinks in symlinkDir that are not in
-// winners or whose targets no longer exist (broken symlinks from pack updates
-// that removed formula files). Skips non-symlinks and non-formula files.
-// No-op if symlinkDir doesn't exist.
-func cleanStaleFormulaSymlinks(symlinkDir string, winners map[string]string) error {
+// cleanStaleFormulaSymlinks removes formula symlinks in symlinkDir whose
+// target file no longer exists on disk (broken links from pack updates that
+// removed formula files). Symlinks pointing to a still-existing file are
+// preserved even when they aren't among the current winners — they may have
+// been materialized by a caller with a wider layer set (e.g. a per-rig pack
+// imported into city .beads/formulas/ by another path). This makes the
+// cleanup safe for callers that intentionally pass a narrow layers list.
+// Skips non-symlinks and non-formula files. No-op if symlinkDir doesn't exist.
+func cleanStaleFormulaSymlinks(symlinkDir string) error {
 	entries, err := os.ReadDir(symlinkDir)
 	if err != nil {
 		return nil // Can't read — nothing to clean up.
@@ -105,14 +115,9 @@ func cleanStaleFormulaSymlinks(symlinkDir string, winners map[string]string) err
 		if fi.Mode()&os.ModeSymlink == 0 {
 			continue
 		}
-		// Remove if not a winner.
-		if _, isWinner := winners[e.Name()]; !isWinner {
-			os.Remove(linkPath) //nolint:errcheck // best-effort cleanup
-			continue
-		}
-		// Winner but target may have been deleted (pack removed the file
-		// after initial fetch). os.Stat follows the symlink — if the
-		// target is gone, remove the dangling link.
+		// os.Stat follows the symlink — if the target is gone, remove
+		// the dangling link. Otherwise leave it alone, even when the
+		// symlink isn't among the current winners.
 		if _, statErr := os.Stat(linkPath); statErr != nil {
 			os.Remove(linkPath) //nolint:errcheck // best-effort cleanup
 		}
