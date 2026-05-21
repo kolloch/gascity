@@ -1767,6 +1767,17 @@ type DaemonConfig struct {
 	// false as a global kill switch (e.g., for production cities where a
 	// rebuild on the host should not auto-restart the supervisor).
 	AutoRestartOnDrift *bool `toml:"auto_restart_on_drift,omitempty" jsonschema:"default=true"`
+	// StartReadyTimeout is how long `gc start` and `gc register` wait for
+	// the supervisor to report the city as Running. Cities with many
+	// registered or adopted sessions take longer to start because the
+	// per-tick wake budget (max_wakes_per_tick) throttles startup: wall
+	// time to wake N sessions is roughly ceil(N / max_wakes_per_tick) *
+	// patrol_interval. At the defaults (5 wakes / 30s), ~40 sessions
+	// need ~4 minutes. Duration string (e.g., "5m", "10m"). Defaults to
+	// DefaultStartReadyTimeout (5m). When set, this value replaces the
+	// default start/register budget; [session].startup_timeout may still
+	// extend the effective wait for a slow single session.
+	StartReadyTimeout string `toml:"start_ready_timeout,omitempty" jsonschema:"default=5m"`
 }
 
 // AutoRestartOnDriftEnabled reports whether the supervisor should be
@@ -1939,6 +1950,27 @@ func (d *DaemonConfig) DriftDrainTimeoutDuration() time.Duration {
 	dur, err := time.ParseDuration(d.DriftDrainTimeout)
 	if err != nil {
 		return 2 * time.Minute
+	}
+	return dur
+}
+
+// DefaultStartReadyTimeout is the default wall-clock budget `gc start` and
+// `gc register` allow for the supervisor to report a city as Running.
+// Sized to cover cities with up to ~40 sessions at the default per-tick
+// wake budget; operators with larger cities override via
+// [daemon].start_ready_timeout.
+const DefaultStartReadyTimeout = 5 * time.Minute
+
+// StartReadyTimeoutDuration returns the start-ready wait budget as a
+// time.Duration. Defaults to DefaultStartReadyTimeout when empty or
+// unparseable.
+func (d *DaemonConfig) StartReadyTimeoutDuration() time.Duration {
+	if d.StartReadyTimeout == "" {
+		return DefaultStartReadyTimeout
+	}
+	dur, err := time.ParseDuration(d.StartReadyTimeout)
+	if err != nil {
+		return DefaultStartReadyTimeout
 	}
 	return dur
 }

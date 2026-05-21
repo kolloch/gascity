@@ -3055,6 +3055,56 @@ name = "mayor"
 	}
 }
 
+// --- StartReadyTimeout tests ---
+
+func TestDaemonStartReadyTimeoutDefault(t *testing.T) {
+	d := DaemonConfig{}
+	got := d.StartReadyTimeoutDuration()
+	if got != DefaultStartReadyTimeout {
+		t.Errorf("StartReadyTimeoutDuration() = %v, want %v", got, DefaultStartReadyTimeout)
+	}
+}
+
+func TestDaemonStartReadyTimeoutCustom(t *testing.T) {
+	d := DaemonConfig{StartReadyTimeout: "10m"}
+	got := d.StartReadyTimeoutDuration()
+	if got != 10*time.Minute {
+		t.Errorf("StartReadyTimeoutDuration() = %v, want 10m", got)
+	}
+}
+
+func TestDaemonStartReadyTimeoutInvalid(t *testing.T) {
+	d := DaemonConfig{StartReadyTimeout: "not-a-duration"}
+	got := d.StartReadyTimeoutDuration()
+	if got != DefaultStartReadyTimeout {
+		t.Errorf("StartReadyTimeoutDuration() = %v, want %v (default for invalid)", got, DefaultStartReadyTimeout)
+	}
+}
+
+func TestParseStartReadyTimeout(t *testing.T) {
+	data := []byte(`
+[workspace]
+name = "test"
+
+[daemon]
+start_ready_timeout = "7m"
+
+[[agent]]
+name = "mayor"
+`)
+	cfg, err := Parse(data)
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if cfg.Daemon.StartReadyTimeout != "7m" {
+		t.Errorf("Daemon.StartReadyTimeout = %q, want %q", cfg.Daemon.StartReadyTimeout, "7m")
+	}
+	got := cfg.Daemon.StartReadyTimeoutDuration()
+	if got != 7*time.Minute {
+		t.Errorf("StartReadyTimeoutDuration() = %v, want 7m", got)
+	}
+}
+
 // --- ProbeConcurrency tests ---
 
 func TestDaemonProbeConcurrencyDefault(t *testing.T) {
