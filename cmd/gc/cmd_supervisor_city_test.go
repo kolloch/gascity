@@ -518,6 +518,37 @@ func TestLoadStartCityConfigMaterializesBuiltinPackImportsBeforeLoad(t *testing.
 	}
 }
 
+func TestLoadStartCityConfigBuiltinGastownMayorHasNoStartupNudge(t *testing.T) {
+	cityPath := writeCityWithUnmaterializedGastownImport(t)
+
+	cfg, _, err := loadStartCityConfig(cityPath)
+	if err != nil {
+		t.Fatalf("loadStartCityConfig returned error: %v", err)
+	}
+
+	var mayor *config.Agent
+	for i := range cfg.Agents {
+		if cfg.Agents[i].Name == "mayor" {
+			mayor = &cfg.Agents[i]
+			break
+		}
+	}
+	if mayor == nil {
+		t.Fatal("expected builtin gastown mayor agent to be present")
+	}
+	if mayor.Nudge != "" {
+		t.Fatalf("builtin gastown mayor nudge = %q, want empty for always-on resident coordinator", mayor.Nudge)
+	}
+
+	data, err := os.ReadFile(filepath.Join(cityPath, citylayout.SystemPacksRoot, "gastown", "agents", "mayor", "agent.toml"))
+	if err != nil {
+		t.Fatalf("read materialized mayor agent.toml: %v", err)
+	}
+	if strings.Contains(string(data), "nudge =") {
+		t.Fatalf("materialized builtin mayor agent.toml should not contain a startup nudge:\n%s", string(data))
+	}
+}
+
 func TestLoadSlingCityConfigMaterializesBuiltinPackImportsBeforeLoad(t *testing.T) {
 	cityPath := writeCityWithUnmaterializedGastownImport(t)
 
