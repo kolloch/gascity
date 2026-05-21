@@ -223,6 +223,24 @@ MERGE_FAILED notifications are routine signals — the rejection metadata on
 the bead (`rejection_reason`) is the durable record. Use `gc session nudge` to
 alert the witness, not `gc mail send`.
 
+### `needs:human` is Mayor-Gated
+
+When you encounter ambiguity you can't resolve (merge-decision doubts,
+unresolvable PR validation failures, contradictory bead metadata),
+**escalate to mayor — do NOT add the `needs:human` label yourself**.
+Only the mayor decides when a bead genuinely needs operator review, so
+the operator's `/human-todo` queue stays a signal channel rather than
+a noise channel.
+
+The existing `block_existing_pr` path that mails mayor is the canonical
+shape — the refinery routes to mayor, the mayor adds `needs:human` if
+the mayor agrees an operator decision is needed.
+
+**Emergency exception:** if mayor is unreachable AND the situation is
+time-critical, the refinery may add `needs:human` directly with the
+emergency reason documented in the bead notes. Outside emergencies,
+route through mayor.
+
 ---
 
 ## Command Quick-Reference

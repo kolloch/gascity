@@ -214,6 +214,29 @@ gc mail send mayor/ -s "BLOCKED: <topic>" -m "Context"
 
 After escalating: continue if possible, otherwise `gc bd update <bead> --status=escalated && gc runtime drain-ack && exit`.
 
+### Decomposition and Ambiguity → Mayor (never `needs:human`)
+
+For **decomposition questions, ambiguous scope, or scope-decision
+doubts** — escalate to the **mayor**, not the witness — and **never add
+the `needs:human` label yourself**.
+
+```bash
+gc mail send mayor/ \
+  -s "AMBIGUITY: <bead-id> — <one-line summary>" \
+  -m "Question: <what needs deciding>
+Options I see:
+  1. <option A>
+  2. <option B>
+Recommendation: <your best guess + why>"
+```
+
+The `needs:human` label is **mayor-gated**: only the mayor decides when
+a bead genuinely needs operator review. If you think a bead warrants
+`needs:human`, route to mayor and recommend it — mayor applies the label
+if mayor agrees. This keeps the operator's `/human-todo` queue
+signal-rich. Polecats never label and never escalate decomposition
+decisions to the witness.
+
 ---
 
 ## Communication

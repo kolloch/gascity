@@ -534,6 +534,78 @@ func TestPolecatPromptOpensWithImperativeFirstAction(t *testing.T) {
 	}
 }
 
+// TestEscalationToMayorFirstForAmbiguity pins the policy tightened in
+// ga-2ak: when polecats / witness / refinery encounter decomposition or
+// ambiguity questions they can't resolve, they MUST escalate to mayor
+// first, and they MUST NOT add the `needs:human` label themselves. Only
+// the mayor decides whether a bead warrants operator review and applies
+// the label — that keeps the operator's `/human-todo` queue signal-rich.
+//
+// The earlier precursor (di-68q, merged at 659eb31) allowed
+// witness/refinery to "approve unambiguous decompositions" and only
+// escalate to `needs:human` on ambiguity, leaving the question of WHO
+// classifies "ambiguous" wide open. The operator (pe-wisp-fo75np) then
+// tightened the chain: polecats escalate to mayor, witness/refinery
+// escalate to mayor (not the operator), and only mayor adds the label.
+// Emergencies (mayor unreachable + time-critical) still let
+// witness/refinery short-circuit to `needs:human` with the reason
+// documented in the bead.
+//
+// The test pins the wording in each of the four touch-points so a
+// future drift back to "any agent can label" is caught at CI time.
+func TestEscalationToMayorFirstForAmbiguity(t *testing.T) {
+	dir := exampleDir()
+
+	polecatPrompt, err := os.ReadFile(filepath.Join(dir, "packs", "gastown", "agents", "polecat", "prompt.template.md"))
+	if err != nil {
+		t.Fatalf("reading polecat prompt: %v", err)
+	}
+	assertContainsInOrder(t, string(polecatPrompt),
+		"### Decomposition and Ambiguity → Mayor (never `needs:human`)",
+		"escalate to the **mayor**, not the witness",
+		"**never add\nthe `needs:human` label yourself**",
+		`gc mail send mayor/`,
+		"The `needs:human` label is **mayor-gated**",
+		"Polecats never label and never escalate decomposition\ndecisions to the witness.",
+	)
+
+	witnessPrompt, err := os.ReadFile(filepath.Join(dir, "packs", "gastown", "agents", "witness", "prompt.template.md"))
+	if err != nil {
+		t.Fatalf("reading witness prompt: %v", err)
+	}
+	assertContainsInOrder(t, string(witnessPrompt),
+		"- Decomposition / ambiguity questions you can't resolve on your own",
+		"### `needs:human` is Mayor-Gated",
+		"**escalate to mayor — do NOT add the `needs:human` label yourself**",
+		"**Emergency exception:**",
+		"mayor is unreachable",
+		"document the emergency reason in",
+	)
+
+	refineryPrompt, err := os.ReadFile(filepath.Join(dir, "packs", "gastown", "agents", "refinery", "prompt.template.md"))
+	if err != nil {
+		t.Fatalf("reading refinery prompt: %v", err)
+	}
+	assertContainsInOrder(t, string(refineryPrompt),
+		"### `needs:human` is Mayor-Gated",
+		"**escalate to mayor — do NOT add the `needs:human` label yourself**",
+		"`block_existing_pr` path that mails mayor is the canonical",
+		"**Emergency exception:**",
+		"mayor is unreachable",
+	)
+
+	formula, err := os.ReadFile(filepath.Join(dir, "packs", "gastown", "formulas", "mol-polecat-work.toml"))
+	if err != nil {
+		t.Fatalf("reading polecat formula: %v", err)
+	}
+	assertContainsInOrder(t, string(formula),
+		"| Decomposition / ambiguity / scope-decision doubt |",
+		"Mail Mayor",
+		"NEVER add the `needs:human` label yourself",
+		"that label is mayor-gated",
+	)
+}
+
 func TestRefineryFormulaRespectsExistingPRMetadata(t *testing.T) {
 	dir := exampleDir()
 	path := filepath.Join(dir, "packs", "gastown", "formulas", "mol-refinery-patrol.toml")

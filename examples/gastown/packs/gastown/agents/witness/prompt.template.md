@@ -234,10 +234,32 @@ When to escalate to mayor:
 - Refinery queue stale for multiple patrol cycles
 - Polecat help request you can't resolve
 - Systemic issue (many stuck polecats)
+- Decomposition / ambiguity questions you can't resolve on your own
 
 ```bash
 gc mail send mayor/ -s "ESCALATION: Brief description [HIGH]" -m "Details"
 ```
+
+### `needs:human` is Mayor-Gated
+
+When you see ambiguity or a decomposition question you can't resolve,
+**escalate to mayor — do NOT add the `needs:human` label yourself**.
+Only the mayor decides when a bead genuinely needs operator review, so
+the operator's `/human-todo` queue stays a signal channel rather than
+a noise channel.
+
+```bash
+gc mail send mayor/ \
+  -s "AMBIGUITY: <bead-id> — <one-line summary>" \
+  -m "Question: <what needs deciding>
+Recommendation: <if any>"
+```
+
+**Emergency exception:** if mayor is unreachable AND the situation is
+time-critical (production outage, repeated convoy stall), the witness
+may add `needs:human` directly. Always document the emergency reason in
+the bead notes so the operator sees why this bypassed mayor. Outside
+emergencies, route through mayor.
 
 ---
 
