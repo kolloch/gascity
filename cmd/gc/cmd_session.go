@@ -1613,31 +1613,42 @@ func cmdSessionRename(args []string, stdout, stderr io.Writer, jsonOutput ...boo
 // newSessionPruneCmd creates the "gc session prune" command.
 func newSessionPruneCmd(stdout, stderr io.Writer) *cobra.Command {
 	var beforeStr string
+	var statesStr string
 	var jsonOutput bool
 	cmd := &cobra.Command{
 		Use:   "prune",
-		Short: "Close old suspended sessions",
-		Long: `Close suspended sessions older than a given age. Only suspended
-sessions are affected — active sessions are never pruned.`,
+		Short: "Close old dormant sessions",
+		Long: `Close dormant sessions older than a given age. By default only
+suspended sessions are affected — active sessions are never pruned. Pass
+--state to opt asleep or drained sessions into the same cleanup pass; multiple
+states may be comma-separated.`,
 		Example: `  gc session prune --before 7d
-  gc session prune --before 24h`,
+  gc session prune --before 24h
+  gc session prune --state asleep,suspended,drained --before 1h`,
 		Args: cobra.NoArgs,
 		RunE: func(_ *cobra.Command, _ []string) error {
-			if cmdSessionPrune(beforeStr, stdout, stderr, jsonOutput) != 0 {
+			if cmdSessionPrune(beforeStr, statesStr, stdout, stderr, jsonOutput) != 0 {
 				return errExit
 			}
 			return nil
 		},
 	}
 	cmd.Flags().StringVar(&beforeStr, "before", "7d", "prune sessions older than this duration (e.g., 7d, 24h)")
+	cmd.Flags().StringVar(&statesStr, "state", "suspended", "comma-separated states to prune (suspended, asleep, drained)")
 	cmd.Flags().BoolVar(&jsonOutput, "json", false, "emit JSONL")
 	return cmd
 }
 
 // cmdSessionPrune is the CLI entry point for "gc session prune".
-func cmdSessionPrune(beforeStr string, stdout, stderr io.Writer, jsonOutput ...bool) int {
+func cmdSessionPrune(beforeStr, statesStr string, stdout, stderr io.Writer, jsonOutput ...bool) int {
 	asJSON := sessionJSONRequested(jsonOutput)
 	dur, err := parsePruneDuration(beforeStr)
+	if err != nil {
+		fmt.Fprintf(stderr, "gc session prune: %v\n", err) //nolint:errcheck // best-effort stderr
+		return 1
+	}
+
+	states, err := parsePruneStates(statesStr)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc session prune: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
@@ -1656,7 +1667,7 @@ func cmdSessionPrune(beforeStr string, stdout, stderr io.Writer, jsonOutput ...b
 	}
 
 	cutoff := time.Now().Add(-dur)
-	result, err := catalog.PruneBefore(cutoff)
+	result, err := catalog.PruneBefore(cutoff, states...)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc session prune: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
@@ -1673,6 +1684,7 @@ func cmdSessionPrune(beforeStr string, stdout, stderr io.Writer, jsonOutput ...b
 			Count:  &result.Count,
 			Before: beforeStr,
 			Cutoff: cutoff.UTC().Format(time.RFC3339),
+			State:  formatPruneStates(states),
 		}); err != nil {
 			fmt.Fprintf(stderr, "gc session prune: %v\n", err) //nolint:errcheck // best-effort stderr
 			return 1
@@ -1685,6 +1697,52 @@ func cmdSessionPrune(beforeStr string, stdout, stderr io.Writer, jsonOutput ...b
 		fmt.Fprintf(stdout, "Pruned %d session(s).\n", result.Count) //nolint:errcheck // best-effort stdout
 	}
 	return 0
+}
+
+// parsePruneStates parses a comma-separated list of session state names
+// for `gc session prune --state`. Only terminal-dormant states are accepted
+// (suspended, asleep, drained) — active or in-flight states are rejected to
+// keep the prune pass safe.
+func parsePruneStates(s string) ([]worker.SessionState, error) {
+	if strings.TrimSpace(s) == "" {
+		return nil, fmt.Errorf("--state must not be empty")
+	}
+	seen := map[worker.SessionState]struct{}{}
+	var out []worker.SessionState
+	for _, raw := range strings.Split(s, ",") {
+		name := strings.ToLower(strings.TrimSpace(raw))
+		if name == "" {
+			continue
+		}
+		var st worker.SessionState
+		switch name {
+		case string(worker.SessionStateSuspended):
+			st = worker.SessionStateSuspended
+		case string(worker.SessionStateAsleep):
+			st = worker.SessionStateAsleep
+		case string(worker.SessionStateDrained):
+			st = worker.SessionStateDrained
+		default:
+			return nil, fmt.Errorf("unsupported state %q (allowed: suspended, asleep, drained)", name)
+		}
+		if _, dup := seen[st]; dup {
+			continue
+		}
+		seen[st] = struct{}{}
+		out = append(out, st)
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("--state must list at least one state")
+	}
+	return out, nil
+}
+
+func formatPruneStates(states []worker.SessionState) string {
+	names := make([]string, 0, len(states))
+	for _, state := range states {
+		names = append(names, string(state))
+	}
+	return strings.Join(names, ",")
 }
 
 // parsePruneDuration parses a duration string like "7d", "24h", "30m".

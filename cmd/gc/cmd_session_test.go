@@ -169,6 +169,133 @@ func TestSessionNewJSONRequiresNoAttach(t *testing.T) {
 	}
 }
 
+func TestParsePruneStates(t *testing.T) {
+	tests := []struct {
+		input   string
+		want    []worker.SessionState
+		wantErr bool
+	}{
+		{"suspended", []worker.SessionState{worker.SessionStateSuspended}, false},
+		{"asleep", []worker.SessionState{worker.SessionStateAsleep}, false},
+		{"drained", []worker.SessionState{worker.SessionStateDrained}, false},
+		{"asleep,suspended", []worker.SessionState{worker.SessionStateAsleep, worker.SessionStateSuspended}, false},
+		{"asleep,suspended,drained", []worker.SessionState{worker.SessionStateAsleep, worker.SessionStateSuspended, worker.SessionStateDrained}, false},
+		{" suspended , asleep ", []worker.SessionState{worker.SessionStateSuspended, worker.SessionStateAsleep}, false},
+		{"ASLEEP", []worker.SessionState{worker.SessionStateAsleep}, false},
+		{"suspended,suspended", []worker.SessionState{worker.SessionStateSuspended}, false},
+		{"", nil, true},
+		{",", nil, true},
+		{"active", nil, true},
+		{"draining", nil, true},
+		{"suspended,bogus", nil, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			got, err := parsePruneStates(tt.input)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("parsePruneStates(%q) error = %v, wantErr %v", tt.input, err, tt.wantErr)
+			}
+			if tt.wantErr {
+				return
+			}
+			if len(got) != len(tt.want) {
+				t.Fatalf("parsePruneStates(%q) = %v, want %v", tt.input, got, tt.want)
+			}
+			for i, st := range got {
+				if st != tt.want[i] {
+					t.Errorf("parsePruneStates(%q)[%d] = %q, want %q", tt.input, i, st, tt.want[i])
+				}
+			}
+		})
+	}
+}
+
+func TestCmdSessionPruneStateFilterClosesSelectedDormantSessions(t *testing.T) {
+	clearGCEnv(t)
+	clearInheritedCityRoutingEnv(t)
+	t.Setenv("GC_BEADS", "file")
+	t.Setenv("GC_SESSION", "fake")
+
+	cityDir := t.TempDir()
+	t.Setenv("GC_CITY", cityDir)
+	t.Setenv("GC_CITY_PATH", cityDir)
+	writeNamedSessionCityTOML(t, cityDir)
+
+	store, err := openCityStoreAt(cityDir)
+	if err != nil {
+		t.Fatalf("openCityStoreAt(%q): %v", cityDir, err)
+	}
+	old := time.Now().Add(-10 * 24 * time.Hour).UTC().Format(time.RFC3339)
+	createSession := func(name string, metadata map[string]string) beads.Bead {
+		t.Helper()
+		metadata["session_name"] = name
+		metadata["template"] = "test"
+		created, err := store.Create(beads.Bead{
+			Title:    name,
+			Type:     session.BeadType,
+			Labels:   []string{session.LabelSession},
+			Metadata: metadata,
+		})
+		if err != nil {
+			t.Fatalf("create %s: %v", name, err)
+		}
+		return created
+	}
+	asleep := createSession("asleep-old", map[string]string{
+		"state":    string(session.StateAsleep),
+		"slept_at": old,
+	})
+	suspended := createSession("suspended-old", map[string]string{
+		"state":        string(session.StateSuspended),
+		"suspended_at": old,
+	})
+	drained := createSession("drained-old", map[string]string{
+		"state":    string(session.StateDrained),
+		"drain_at": old,
+	})
+	active := createSession("active", map[string]string{
+		"state": string(session.StateActive),
+	})
+
+	var stdout, stderr bytes.Buffer
+	if code := cmdSessionPrune("7d", "asleep,suspended,drained", &stdout, &stderr, true); code != 0 {
+		t.Fatalf("cmdSessionPrune = %d, want 0; stderr=%s", code, stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	var got sessionActionResult
+	if err := json.Unmarshal(bytes.TrimSpace(stdout.Bytes()), &got); err != nil {
+		t.Fatalf("stdout is not JSON: %v; stdout=%q", err, stdout.String())
+	}
+	if got.Action != "prune" {
+		t.Fatalf("action = %q, want prune; stdout=%q", got.Action, stdout.String())
+	}
+	if got.State != "asleep,suspended,drained" {
+		t.Fatalf("state = %q, want asleep,suspended,drained; stdout=%q", got.State, stdout.String())
+	}
+	if got.Count == nil || *got.Count != 3 {
+		t.Fatalf("count = %v, want 3; stdout=%q", got.Count, stdout.String())
+	}
+
+	for _, id := range []string{asleep.ID, suspended.ID, drained.ID} {
+		b, err := store.Get(id)
+		if err != nil {
+			t.Fatalf("Get(%s): %v", id, err)
+		}
+		if b.Status != "closed" {
+			t.Fatalf("session %s status = %q, want closed", id, b.Status)
+		}
+	}
+	b, err := store.Get(active.ID)
+	if err != nil {
+		t.Fatalf("Get(active): %v", err)
+	}
+	if b.Status != "open" {
+		t.Fatalf("active status = %q, want open", b.Status)
+	}
+}
+
 func TestResolveWorkDir(t *testing.T) {
 	cityPath := t.TempDir()
 	rigRoot := filepath.Join(t.TempDir(), "my-rig")

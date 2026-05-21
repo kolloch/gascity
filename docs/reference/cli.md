@@ -2573,7 +2573,7 @@ gc session
 | [gc session nudge](#gc-session-nudge) | Send a text message to a running session |
 | [gc session peek](#gc-session-peek) | View session output without attaching |
 | [gc session pin](#gc-session-pin) | Keep a session awake |
-| [gc session prune](#gc-session-prune) | Close old suspended sessions |
+| [gc session prune](#gc-session-prune) | Close old dormant sessions |
 | [gc session rename](#gc-session-rename) | Rename a session |
 | [gc session reset](#gc-session-reset) | Restart a session fresh while preserving the bead |
 | [gc session submit](#gc-session-submit) | Submit a message with semantic delivery intent |
@@ -2764,8 +2764,10 @@ gc session pin <session-id-or-alias> [flags]
 
 ## gc session prune
 
-Close suspended sessions older than a given age. Only suspended
-sessions are affected — active sessions are never pruned.
+Close dormant sessions older than a given age. By default only
+suspended sessions are affected — active sessions are never pruned. Pass
+--state to opt asleep or drained sessions into the same cleanup pass; multiple
+states may be comma-separated.
 
 ```
 gc session prune [flags]
@@ -2776,12 +2778,14 @@ gc session prune [flags]
 ```
 gc session prune --before 7d
   gc session prune --before 24h
+  gc session prune --state asleep,suspended,drained --before 1h
 ```
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--before` | string | `7d` | prune sessions older than this duration (e.g., 7d, 24h) |
 | `--json` | bool |  | emit JSONL |
+| `--state` | string | `suspended` | comma-separated states to prune (suspended, asleep, drained) |
 
 ## gc session rename
 
