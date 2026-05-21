@@ -7578,8 +7578,9 @@ func TestStrandedBeadSweepCustomSurfaceLabel(t *testing.T) {
 	}
 	// The candidate-query exclude-label filter must include the configured
 	// surface label so already-labeled beads stay exempt across runs.
-	if !strings.Contains(gcCalls, "--exclude-label=needs:operator,skip:auto-route") {
-		t.Fatalf("expected exclude-label to lead with needs:operator; gc calls:\n%s", gcCalls)
+	// gc:nudge is always exempt (system-internal transit beads).
+	if !strings.Contains(gcCalls, "--exclude-label=needs:operator,gc:nudge,skip:auto-route") {
+		t.Fatalf("expected exclude-label to lead with needs:operator and include gc:nudge; gc calls:\n%s", gcCalls)
 	}
 }
 
@@ -7592,8 +7593,36 @@ func TestStrandedBeadSweepCustomExemptLabels(t *testing.T) {
 		map[string]string{"GC_STRANDED_EXEMPT_LABELS": "foo,bar"},
 		candidates, "[]")
 
-	if !strings.Contains(gcCalls, "--exclude-label=needs:human,foo,bar") {
-		t.Fatalf("expected configured exempt labels appended after surface; gc calls:\n%s", gcCalls)
+	// gc:nudge is always exempt (system label) even when the operator
+	// overrides GC_STRANDED_EXEMPT_LABELS, so nudge beads can't be
+	// labeled needs:human regardless of config.
+	if !strings.Contains(gcCalls, "--exclude-label=needs:human,gc:nudge,foo,bar") {
+		t.Fatalf("expected configured exempt labels appended after surface and system labels; gc calls:\n%s", gcCalls)
+	}
+}
+
+// TestStrandedBeadSweepAlwaysExemptsNudgeLabel guards the regression
+// behind ga-2kn: nudge beads carry `gc:nudge` and must never be
+// surfaced as needs:human even if their `gc.routed_to` stamp is
+// missing (e.g. legacy nudges created before ga-0qf landed).
+func TestStrandedBeadSweepAlwaysExemptsNudgeLabel(t *testing.T) {
+	candidates := `[
+		{"id":"ga-stranded","issue_type":"task","status":"open","title":"unrouted","updated_at":"2026-05-01T00:00:00Z","metadata":{}}
+	]`
+
+	// Default config: should include gc:nudge after the surface label.
+	_, gcCalls, _ := runStrandedBeadSweep(t, nil, candidates, "[]")
+	if !strings.Contains(gcCalls, "--exclude-label=needs:human,gc:nudge,skip:auto-route") {
+		t.Fatalf("expected gc:nudge to always be in default exclude-label; gc calls:\n%s", gcCalls)
+	}
+
+	// Even when the operator clears GC_STRANDED_EXEMPT_LABELS, gc:nudge
+	// must remain exempt — system labels are not user-overridable.
+	_, gcCalls, _ = runStrandedBeadSweep(t,
+		map[string]string{"GC_STRANDED_EXEMPT_LABELS": ""},
+		candidates, "[]")
+	if !strings.Contains(gcCalls, "--exclude-label=needs:human,gc:nudge") {
+		t.Fatalf("expected gc:nudge to remain exempt with empty GC_STRANDED_EXEMPT_LABELS; gc calls:\n%s", gcCalls)
 	}
 }
 

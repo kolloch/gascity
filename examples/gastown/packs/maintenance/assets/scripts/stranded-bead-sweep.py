@@ -57,6 +57,10 @@ WORK_TYPES = {"task", "bug", "feature", "chore", "epic", "decision"}
 
 DEFAULT_SURFACE_LABEL = "needs:human"
 DEFAULT_EXTRA_EXEMPT_LABELS = ("skip:auto-route",)
+# System-internal labels that mark beads as agent-internal transit (nudges,
+# etc.). Always exempt regardless of GC_STRANDED_EXEMPT_LABELS so an operator
+# override can't accidentally re-enable labeling system beads as needs:human.
+SYSTEM_EXEMPT_LABELS = ("gc:nudge",)
 DEFAULT_AGE_HOURS = 4
 DEFAULT_DIGEST_DAYS = 7
 DEFAULT_DIGEST_TO = "mayor"
@@ -99,7 +103,9 @@ def exempt_labels(surface: str) -> tuple[str, ...]:
     """Set of labels that disqualify a bead from being labeled.
 
     Always includes the configured surface label (idempotency: beads
-    already labeled are skipped). Additional labels are configurable via
+    already labeled are skipped) and SYSTEM_EXEMPT_LABELS (agent-internal
+    transit beads must never be surfaced as needs:human even if they
+    somehow lack `gc.routed_to`). Additional labels are configurable via
     GC_STRANDED_EXEMPT_LABELS as a comma-separated list.
     """
     raw = os.environ.get("GC_STRANDED_EXEMPT_LABELS")
@@ -108,6 +114,9 @@ def exempt_labels(surface: str) -> tuple[str, ...]:
     else:
         extras = tuple(s.strip() for s in raw.split(",") if s.strip())
     out: list[str] = [surface]
+    for lbl in SYSTEM_EXEMPT_LABELS:
+        if lbl and lbl not in out:
+            out.append(lbl)
     for lbl in extras:
         if lbl and lbl not in out:
             out.append(lbl)
