@@ -3797,7 +3797,7 @@ func TestBuildDesiredState_GH1654PoolReadyWorkGrowsPastMinActiveSessions(t *test
 	var stderr strings.Builder
 	dsResult := buildDesiredStateWithSessionBeads(
 		"test-city", cityPath, time.Now().UTC(), cfg, runtime.NewFake(),
-		store, nil, sessionSnapshot, nil, &stderr,
+		store, nil, sessionSnapshot, nil, nil, &stderr,
 	)
 
 	if got := dsResult.ScaleCheckCounts[template]; got != 6 {
@@ -3858,7 +3858,7 @@ func TestBuildDesiredState_MinZeroDefaultScaleCheckNoWorkDropsPendingPoolCreate(
 	var stderr strings.Builder
 	dsResult := buildDesiredStateWithSessionBeads(
 		"test-city", cityPath, time.Now().UTC(), cfg, runtime.NewFake(),
-		store, nil, newSessionBeadSnapshot([]beads.Bead{session}), nil, &stderr,
+		store, nil, newSessionBeadSnapshot([]beads.Bead{session}), nil, nil, &stderr,
 	)
 
 	if got := dsResult.ScaleCheckCounts[template]; got != 0 {
@@ -3925,7 +3925,7 @@ func TestBuildDesiredState_PoolInFlightSessionsPreservePartialScaleDemand(t *tes
 	var stderr strings.Builder
 	dsResult := buildDesiredStateWithSessionBeads(
 		"test-city", cityPath, time.Now().UTC(), cfg, runtime.NewFake(),
-		store, nil, sessionSnapshot, nil, &stderr,
+		store, nil, sessionSnapshot, nil, nil, &stderr,
 	)
 
 	if got := dsResult.ScaleCheckCounts[template]; got != 5 {
@@ -4208,7 +4208,7 @@ func TestBuildDesiredState_OnDemandNamedSession_IgnoresUnreachableAssignedWork(t
 
 	dsResult := buildDesiredStateWithSessionBeads(
 		"test-city", cityPath, time.Now().UTC(), cfg, runtime.NewFake(),
-		cityStore, map[string]beads.Store{"riga": rigStore}, nil, nil, io.Discard,
+		cityStore, map[string]beads.Store{"riga": rigStore}, nil, nil, nil, io.Discard,
 	)
 	for _, tp := range dsResult.State {
 		if tp.TemplateName == "riga/mayor" || tp.ConfiguredNamedIdentity == "riga/mayor" {
@@ -4268,7 +4268,7 @@ func TestBuildDesiredState_OnDemandNamedSession_ReachabilityUsesPerBeadSourceNot
 
 	dsResult := buildDesiredStateWithSessionBeads(
 		"test-city", cityPath, time.Now().UTC(), cfg, runtime.NewFake(),
-		cityStore, map[string]beads.Store{"riga": rigStore}, nil, nil, io.Discard,
+		cityStore, map[string]beads.Store{"riga": rigStore}, nil, nil, nil, io.Discard,
 	)
 	if dsResult.NamedSessionDemand["riga/mayor"] {
 		t.Fatal("same-ID rig bead should not make the city-store assignment reachable")
@@ -4327,7 +4327,7 @@ func TestBuildDesiredState_RigPoolIgnoresAssignedWorkInUnreachableStore(t *testi
 
 	dsResult := buildDesiredStateWithSessionBeads(
 		"test-city", cityPath, time.Now().UTC(), cfg, runtime.NewFake(),
-		cityStore, map[string]beads.Store{"riga": rigStore}, sessionSnapshot, nil, io.Discard,
+		cityStore, map[string]beads.Store{"riga": rigStore}, sessionSnapshot, nil, nil, io.Discard,
 	)
 	for _, tp := range dsResult.State {
 		if tp.TemplateName == "riga/worker" {
@@ -5185,7 +5185,7 @@ func TestRefreshDesiredStateWithSessionBeadsIncludesManualCreatedDuringBuild(t *
 		}},
 	}
 
-	result := buildDesiredStateWithSessionBeads("test-city", cityPath, time.Now().UTC(), cfg, runtime.NewFake(), store, nil, staleSnapshot, nil, io.Discard)
+	result := buildDesiredStateWithSessionBeads("test-city", cityPath, time.Now().UTC(), cfg, runtime.NewFake(), store, nil, staleSnapshot, nil, nil, io.Discard)
 	if _, ok := result.State["s-gc-late"]; ok {
 		t.Fatalf("stale session snapshot unexpectedly included late manual session")
 	}
@@ -5350,6 +5350,7 @@ func TestBuildDesiredState_ScaleCheckErrorRetainsOnlyAffectedPoolSessions(t *tes
 		nil,
 		newSessionBeadSnapshot([]beads.Bead{workerSession, helperSession}),
 		nil,
+		nil,
 		&stderr,
 	)
 
@@ -5440,6 +5441,7 @@ func TestBuildDesiredState_ScaleCheckErrorPreservesDormantAffectedPoolSessionWit
 		nil,
 		snapshot,
 		nil,
+		nil,
 		&stderr,
 	)
 
@@ -5506,6 +5508,7 @@ func TestBuildDesiredState_NamedScaleCheckPartialDoesNotRetainGenericPoolSession
 		store,
 		nil,
 		newSessionBeadSnapshot([]beads.Bead{poolSession}),
+		nil,
 		nil,
 		&stderr,
 	)
@@ -6117,7 +6120,7 @@ func TestBuildDesiredState_PendingCreatePoolSessionCountsTowardScaleDemand(t *te
 	var stderr strings.Builder
 	dsResult := buildDesiredStateWithSessionBeads(
 		"test-city", cityPath, time.Now().UTC(), cfg, runtime.NewFake(),
-		store, nil, sessionSnapshot, trace, &stderr,
+		store, nil, sessionSnapshot, trace, nil, &stderr,
 	)
 	if got := dsResult.ScaleCheckCounts[template]; got != 2 {
 		t.Fatalf("ScaleCheckCounts[%s] = %d, want 2", template, got)
@@ -8545,5 +8548,206 @@ func TestBuildDesiredState_NamedSessionWorkQueryDoesNotDriveControllerDemand(t *
 
 	if dsResult.NamedSessionDemand["alpha/dog"] {
 		t.Fatal("NamedSessionDemand[alpha/dog] came from controller-side work_query")
+	}
+}
+
+// withPoolBackoffNow swaps the package-level poolBackoffNow clock for a
+// controlled value during a test, restoring the original on cleanup. Tests
+// use the returned setter to advance time across simulated ticks (ga-bps).
+func withPoolBackoffNow(t *testing.T, initial time.Time) func(time.Time) {
+	t.Helper()
+	orig := poolBackoffNow
+	cur := initial
+	poolBackoffNow = func() time.Time { return cur }
+	t.Cleanup(func() { poolBackoffNow = orig })
+	return func(next time.Time) { cur = next }
+}
+
+// TestBuildDesiredStateBackoffCapsCustomScaleCheckOvercount verifies that
+// when a custom scale_check overstates demand relative to the truly-claimable
+// routed work and the underfull condition persists past the cooldown, the
+// back-off layer caps the demand at the claimable count (ga-bps).
+//
+// Before the cooldown elapses the original scale_check value is preserved so
+// transient races (sibling polecat about to claim, just-routed bead) are
+// allowed to resolve on their own; only sustained overcounting triggers the
+// suppression.
+func TestBuildDesiredStateBackoffCapsCustomScaleCheckOvercount(t *testing.T) {
+	cityPath := t.TempDir()
+	store := beads.NewMemStore()
+	template := "worker"
+
+	// Two truly-claimable routed beads.
+	for i := 1; i <= 2; i++ {
+		if _, err := store.Create(beads.Bead{
+			ID:       fmt.Sprintf("work-%d", i),
+			Title:    fmt.Sprintf("work %d", i),
+			Status:   "open",
+			Metadata: map[string]string{"gc.routed_to": template},
+		}); err != nil {
+			t.Fatalf("create work bead %d: %v", i, err)
+		}
+	}
+
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents: []config.Agent{{
+			Name:              template,
+			StartCommand:      "true",
+			MaxActiveSessions: intPtr(10),
+			ScaleCheck:        "printf 5", // overcounts: claims 5 spawnable, but only 2 are claimable
+		}},
+	}
+
+	backoff := NewPoolBackoffState(10 * time.Minute)
+	beacon := time.Now().UTC()
+	setNow := withPoolBackoffNow(t, beacon)
+
+	// Tick 1: scale_check=5 but claimable=2. First underfull observation; no
+	// suppression yet.
+	res := buildDesiredStateWithSessionBeads(
+		"test-city", cityPath, beacon, cfg, runtime.NewFake(),
+		store, nil, newSessionBeadSnapshot(nil), nil, backoff, io.Discard,
+	)
+	if got := res.ScaleCheckCounts[template]; got != 5 {
+		t.Fatalf("Tick 1: ScaleCheckCounts[%s] = %d, want 5 (first underfull, not yet suppressed)", template, got)
+	}
+
+	// Tick 2 (within cooldown): still 5.
+	setNow(beacon.Add(5 * time.Minute))
+	res = buildDesiredStateWithSessionBeads(
+		"test-city", cityPath, beacon, cfg, runtime.NewFake(),
+		store, nil, newSessionBeadSnapshot(nil), nil, backoff, io.Discard,
+	)
+	if got := res.ScaleCheckCounts[template]; got != 5 {
+		t.Fatalf("Tick 2 (within cooldown): ScaleCheckCounts[%s] = %d, want 5", template, got)
+	}
+
+	// Tick 3 (after cooldown): capped at claimable=2.
+	setNow(beacon.Add(11 * time.Minute))
+	res = buildDesiredStateWithSessionBeads(
+		"test-city", cityPath, beacon, cfg, runtime.NewFake(),
+		store, nil, newSessionBeadSnapshot(nil), nil, backoff, io.Discard,
+	)
+	if got := res.ScaleCheckCounts[template]; got != 2 {
+		t.Fatalf("Tick 3 (after cooldown): ScaleCheckCounts[%s] = %d, want 2 (capped at claimable)", template, got)
+	}
+
+	// Adding more claimable beads lets the scaler resume at 5 — back-off
+	// clears once claimable matches or exceeds scale_check.
+	for i := 3; i <= 5; i++ {
+		if _, err := store.Create(beads.Bead{
+			ID:       fmt.Sprintf("work-%d", i),
+			Title:    fmt.Sprintf("work %d", i),
+			Status:   "open",
+			Metadata: map[string]string{"gc.routed_to": template},
+		}); err != nil {
+			t.Fatalf("create work bead %d: %v", i, err)
+		}
+	}
+	setNow(beacon.Add(12 * time.Minute))
+	res = buildDesiredStateWithSessionBeads(
+		"test-city", cityPath, beacon, cfg, runtime.NewFake(),
+		store, nil, newSessionBeadSnapshot(nil), nil, backoff, io.Discard,
+	)
+	if got := res.ScaleCheckCounts[template]; got != 5 {
+		t.Fatalf("Recovery: ScaleCheckCounts[%s] = %d, want 5 (claimable now satisfies demand)", template, got)
+	}
+}
+
+// TestBuildDesiredStateBackoffNoOpWhenScaleCheckMatchesClaimable verifies
+// that pools using the default (bead-backed) scale_check are unaffected by
+// the back-off layer: scale_check_count and claimable_count are computed
+// from the same query, so they always agree and back-off never engages.
+func TestBuildDesiredStateBackoffNoOpWhenScaleCheckMatchesClaimable(t *testing.T) {
+	cityPath := t.TempDir()
+	store := beads.NewMemStore()
+	template := "worker"
+
+	for i := 1; i <= 3; i++ {
+		if _, err := store.Create(beads.Bead{
+			ID:       fmt.Sprintf("work-%d", i),
+			Title:    fmt.Sprintf("work %d", i),
+			Status:   "open",
+			Metadata: map[string]string{"gc.routed_to": template},
+		}); err != nil {
+			t.Fatalf("create work bead %d: %v", i, err)
+		}
+	}
+
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents: []config.Agent{{
+			Name:              template,
+			StartCommand:      "true",
+			MaxActiveSessions: intPtr(10),
+			// No ScaleCheck → defaultScaleCheckCounts path.
+		}},
+	}
+
+	backoff := NewPoolBackoffState(10 * time.Minute)
+	beacon := time.Now().UTC()
+	setNow := withPoolBackoffNow(t, beacon)
+
+	// Even far past the cooldown, scale_check == claimable so no suppression.
+	for _, offset := range []time.Duration{0, 5 * time.Minute, 11 * time.Minute, 60 * time.Minute} {
+		setNow(beacon.Add(offset))
+		res := buildDesiredStateWithSessionBeads(
+			"test-city", cityPath, beacon, cfg, runtime.NewFake(),
+			store, nil, newSessionBeadSnapshot(nil), nil, backoff, io.Discard,
+		)
+		if got := res.ScaleCheckCounts[template]; got != 3 {
+			t.Fatalf("offset=%v: ScaleCheckCounts[%s] = %d, want 3 (no back-off when scale==claimable)", offset, template, got)
+		}
+	}
+}
+
+// TestBuildDesiredStateBackoffMinSessionsAlwaysHonored verifies that the
+// back-off layer never caps below the configured min_active_sessions. Min
+// is restored by the downstream min-fill pass in applyNestedCaps; this test
+// just confirms the back-off doesn't fight that path.
+func TestBuildDesiredStateBackoffMinSessionsAlwaysHonored(t *testing.T) {
+	cityPath := t.TempDir()
+	store := beads.NewMemStore()
+	template := "worker"
+
+	// Zero claimable, custom scale_check overcounts.
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents: []config.Agent{{
+			Name:              template,
+			StartCommand:      "true",
+			MinActiveSessions: intPtr(1),
+			MaxActiveSessions: intPtr(5),
+			ScaleCheck:        "printf 3",
+		}},
+	}
+
+	backoff := NewPoolBackoffState(10 * time.Minute)
+	beacon := time.Now().UTC()
+	setNow := withPoolBackoffNow(t, beacon)
+
+	// Trigger underfull and let cooldown elapse.
+	_ = buildDesiredStateWithSessionBeads(
+		"test-city", cityPath, beacon, cfg, runtime.NewFake(),
+		store, nil, newSessionBeadSnapshot(nil), nil, backoff, io.Discard,
+	)
+	setNow(beacon.Add(11 * time.Minute))
+	res := buildDesiredStateWithSessionBeads(
+		"test-city", cityPath, beacon, cfg, runtime.NewFake(),
+		store, nil, newSessionBeadSnapshot(nil), nil, backoff, io.Discard,
+	)
+	if got := res.ScaleCheckCounts[template]; got != 0 {
+		t.Fatalf("after cooldown ScaleCheckCounts[%s] = %d, want 0 (capped to claimable=0)", template, got)
+	}
+	// Min should still produce 1 desired session via applyNestedCaps min-fill.
+	desired := 0
+	for _, tp := range res.State {
+		if tp.TemplateName == template {
+			desired++
+		}
+	}
+	if desired != 1 {
+		t.Fatalf("with min=1 and zero claimable after cooldown, desired sessions = %d, want 1 (min-fill)", desired)
 	}
 }

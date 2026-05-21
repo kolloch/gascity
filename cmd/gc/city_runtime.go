@@ -2199,6 +2199,7 @@ func (cr *CityRuntime) controlDispatcherTick(ctx context.Context) {
 		cr.rigBeadStores(),
 		sessionBeads,
 		nil,
+		nil,
 		cr.stderr,
 	)
 	desiredState := wfcResult.State

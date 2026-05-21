@@ -39,6 +39,9 @@ func standaloneBuildAgentsFnWithSessionBeads(
 	beaconTime time.Time,
 	stderr io.Writer,
 ) func(*config.City, runtime.Provider, beads.Store, map[string]beads.Store, *sessionBeadSnapshot, *sessionReconcilerTraceCycle) DesiredStateResult {
+	// One pool back-off state per closure: each controller invocation gets its
+	// own per-template underfull timers (ga-bps).
+	poolBackoff := NewPoolBackoffState(defaultPoolBackoffCooldown)
 	return func(
 		c *config.City,
 		currentSP runtime.Provider,
@@ -47,7 +50,7 @@ func standaloneBuildAgentsFnWithSessionBeads(
 		sessionBeads *sessionBeadSnapshot,
 		trace *sessionReconcilerTraceCycle,
 	) DesiredStateResult {
-		return buildDesiredStateWithSessionBeads(cityName, cityPath, beaconTime, c, currentSP, store, rigStores, sessionBeads, trace, stderr)
+		return buildDesiredStateWithSessionBeads(cityName, cityPath, beaconTime, c, currentSP, store, rigStores, sessionBeads, trace, poolBackoff, stderr)
 	}
 }
 
@@ -743,7 +746,7 @@ func doStartStandalone(args []string, controllerMode bool, stdout, stderr io.Wri
 		sessionBeads = nil
 		sessionQueryPartial = true
 	}
-	dsResult := buildDesiredStateWithSessionBeads(cityName, cityPath, beaconTime, cfg, sp, oneShotStore, rigStores, sessionBeads, nil, stderr)
+	dsResult := buildDesiredStateWithSessionBeads(cityName, cityPath, beaconTime, cfg, sp, oneShotStore, rigStores, sessionBeads, nil, nil, stderr)
 	dsResult.SessionQueryPartial = dsResult.SessionQueryPartial || sessionQueryPartial
 	ds := dsResult.State
 	cfgNames := configuredSessionNamesWithSnapshot(cfg, cityName, sessionBeads)
@@ -759,7 +762,7 @@ func doStartStandalone(args []string, controllerMode bool, stdout, stderr io.Wri
 		// Standalone start has no follow-up patrol tick, so after reopening
 		// orphaned pool work we must immediately rebuild demand and sync once
 		// more so replacement session beads can be materialized in this run.
-		dsResult = buildDesiredStateWithSessionBeads(cityName, cityPath, beaconTime, cfg, sp, oneShotStore, rigStores, sessionBeads, nil, stderr)
+		dsResult = buildDesiredStateWithSessionBeads(cityName, cityPath, beaconTime, cfg, sp, oneShotStore, rigStores, sessionBeads, nil, nil, stderr)
 		ds = dsResult.State
 		cfgNames = configuredSessionNamesWithSnapshot(cfg, cityName, sessionBeads)
 		_, sessionBeads = syncSessionBeadsWithSnapshotAndRigStores(
@@ -797,7 +800,7 @@ func doStartStandalone(args []string, controllerMode bool, stdout, stderr io.Wri
 		fmt.Fprintf(stderr, "gc start: loading session beads: %v\n", err) //nolint:errcheck
 		sessionBeads = nil
 	}
-	dsResult = buildDesiredStateWithSessionBeads(cityName, cityPath, beaconTime, cfg, sp, oneShotStore, rigStores, sessionBeads, nil, stderr)
+	dsResult = buildDesiredStateWithSessionBeads(cityName, cityPath, beaconTime, cfg, sp, oneShotStore, rigStores, sessionBeads, nil, nil, stderr)
 	ds = dsResult.State
 	cfgNames = configuredSessionNamesWithSnapshot(cfg, cityName, sessionBeads)
 	syncSessionBeadsWithSnapshotAndRigStores(

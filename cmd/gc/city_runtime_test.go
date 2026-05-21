@@ -2250,7 +2250,7 @@ func TestCityRuntimeBeadReconcileTick_ScaleCheckPartialKeepsOnlyAffectedPoolSess
 
 	snapshot := newSessionBeadSnapshot([]beads.Bead{worker, helper})
 	var stderr strings.Builder
-	result := buildDesiredStateWithSessionBeads("maintainer-city", cityPath, time.Now().UTC(), cfg, sp, store, nil, snapshot, nil, &stderr)
+	result := buildDesiredStateWithSessionBeads("maintainer-city", cityPath, time.Now().UTC(), cfg, sp, store, nil, snapshot, nil, nil, &stderr)
 	if result.StoreQueryPartial {
 		t.Fatalf("StoreQueryPartial = true, want false for scoped scale_check failure; stderr=%s", stderr.String())
 	}
@@ -2318,7 +2318,7 @@ func TestCityRuntimeBeadReconcileTick_ScaleCheckPartialPreservesDormantAffectedP
 
 	snapshot := newSessionBeadSnapshot([]beads.Bead{worker})
 	var stderr strings.Builder
-	result := buildDesiredStateWithSessionBeads("maintainer-city", cityPath, time.Now().UTC(), cfg, sp, store, nil, snapshot, nil, &stderr)
+	result := buildDesiredStateWithSessionBeads("maintainer-city", cityPath, time.Now().UTC(), cfg, sp, store, nil, snapshot, nil, nil, &stderr)
 	if _, ok := result.State["worker-bd-123"]; !ok {
 		t.Fatalf("affected dormant worker session not preserved in desired state: keys=%v stderr=%s", mapKeys(result.State), stderr.String())
 	}
@@ -2729,7 +2729,7 @@ func TestCityRuntimeTick_RefreshesManualSessionOverlayAfterSync(t *testing.T) {
 		sessionBeads *sessionBeadSnapshot,
 		trace *sessionReconcilerTraceCycle,
 	) DesiredStateResult {
-		result := buildDesiredStateWithSessionBeads("my-city", cityPath, time.Now(), c, currentSP, store, rigStores, sessionBeads, trace, &stderr)
+		result := buildDesiredStateWithSessionBeads("my-city", cityPath, time.Now(), c, currentSP, store, rigStores, sessionBeads, trace, nil, &stderr)
 		if !mutated {
 			if err := store.SetMetadata(manual.ID, "session_name", sessionNameFromBeadID(manual.ID)); err != nil {
 				t.Fatalf("SetMetadata(session_name): %v", err)

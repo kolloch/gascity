@@ -59,6 +59,7 @@ type TraceSiteCode string
 const (
 	TraceSiteUnknown                 TraceSiteCode = "unknown"
 	TraceSiteScaleCheckExec          TraceSiteCode = "trace.scale_check_exec"
+	TraceSitePoolBackoff             TraceSiteCode = "trace.pool_backoff"
 	TraceSiteCycleStart              TraceSiteCode = "cycle.start"
 	TraceSiteCycleFinish             TraceSiteCode = "cycle.finish"
 	TraceSiteConfigReload            TraceSiteCode = "config.reload"
@@ -122,6 +123,7 @@ const (
 	TraceReasonCap                    TraceReasonCode = "cap"
 	TraceReasonMinFill                TraceReasonCode = "min_fill"
 	TraceReasonInFlightReuse          TraceReasonCode = "inflight_reuse"
+	TraceReasonPoolBackoff            TraceReasonCode = "pool_backoff"
 	TraceReasonWake                   TraceReasonCode = "wake"
 	TraceReasonIdleTimeout            TraceReasonCode = "idle_timeout"
 	TraceReasonStaleGeneration        TraceReasonCode = "stale_generation"
@@ -536,6 +538,7 @@ func normalizeTraceSiteCode(raw string) (TraceSiteCode, string) {
 	switch TraceSiteCode(raw) {
 	case TraceSiteUnknown,
 		TraceSiteScaleCheckExec,
+		TraceSitePoolBackoff,
 		TraceSiteCycleStart,
 		TraceSiteCycleFinish,
 		TraceSiteConfigReload,
@@ -611,6 +614,7 @@ func normalizeTraceReasonCode(raw string) (TraceReasonCode, string) {
 		TraceReasonCap,
 		TraceReasonMinFill,
 		TraceReasonInFlightReuse,
+		TraceReasonPoolBackoff,
 		TraceReasonWake,
 		TraceReasonIdleTimeout,
 		TraceReasonStaleGeneration,

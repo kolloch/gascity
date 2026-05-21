@@ -2065,8 +2065,11 @@ func supervisorBuildAgentsFn(cityPath, cityName string, stderr io.Writer) func(*
 
 func supervisorBuildAgentsFnWithSessionBeads(cityPath, cityName string, stderr io.Writer) func(*config.City, runtime.Provider, beads.Store, map[string]beads.Store, *sessionBeadSnapshot, *sessionReconcilerTraceCycle) DesiredStateResult {
 	beaconTime := time.Now()
+	// Per-city pool back-off state — supervisor manages one closure per city
+	// so each rig's polecat pool gets its own underfull timers (ga-bps).
+	poolBackoff := NewPoolBackoffState(defaultPoolBackoffCooldown)
 	return func(c *config.City, sp runtime.Provider, store beads.Store, rigStores map[string]beads.Store, sessionBeads *sessionBeadSnapshot, trace *sessionReconcilerTraceCycle) DesiredStateResult {
-		return buildDesiredStateWithSessionBeads(cityName, cityPath, beaconTime, c, sp, store, rigStores, sessionBeads, trace, stderr)
+		return buildDesiredStateWithSessionBeads(cityName, cityPath, beaconTime, c, sp, store, rigStores, sessionBeads, trace, poolBackoff, stderr)
 	}
 }
 

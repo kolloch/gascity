@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -18,6 +19,7 @@ import (
 	"github.com/gastownhall/gascity/internal/runtime"
 	sessionauto "github.com/gastownhall/gascity/internal/runtime/auto"
 	"github.com/gastownhall/gascity/internal/session"
+	"github.com/gastownhall/gascity/internal/telemetry"
 	workdirutil "github.com/gastownhall/gascity/internal/workdir"
 )
 
@@ -215,7 +217,7 @@ func buildDesiredState(
 			sessionQueryPartial = true
 		}
 	}
-	result := buildDesiredStateWithSessionBeads(cityName, cityPath, beaconTime, cfg, sp, store, nil, sessionBeads, nil, stderr)
+	result := buildDesiredStateWithSessionBeads(cityName, cityPath, beaconTime, cfg, sp, store, nil, sessionBeads, nil, nil, stderr)
 	result.SessionQueryPartial = result.SessionQueryPartial || sessionQueryPartial
 	return result
 }
@@ -229,6 +231,7 @@ func buildDesiredStateWithSessionBeads(
 	rigStores map[string]beads.Store,
 	sessionBeads *sessionBeadSnapshot,
 	trace *sessionReconcilerTraceCycle,
+	poolBackoff *PoolBackoffState,
 	stderr io.Writer,
 ) DesiredStateResult {
 	if cfg.Workspace.Suspended {
@@ -245,6 +248,12 @@ func buildDesiredStateWithSessionBeads(
 	var pendingPools []poolEvalWork
 	var defaultScaleTargets []defaultScaleCheckTarget
 	var defaultNamedScaleTargets []defaultScaleCheckTarget
+	// claimableTargets is populated for every pool agent (regardless of whether
+	// the agent has a custom scale_check). It feeds the back-off layer's
+	// independent claimable count so a buggy or stale custom scale_check that
+	// outpaces the truly-claimable routed work can be detected and capped
+	// (ga-bps).
+	var claimableTargets []defaultScaleCheckTarget
 
 	for i := range cfg.Agents {
 		if cfg.Agents[i].Suspended {
@@ -293,6 +302,12 @@ func buildDesiredStateWithSessionBeads(
 		// them as desired counts; bead-backed mode uses them as authoritative
 		// new unassigned demand while assigned work drives resume requests.
 		poolDir := agentCommandDir(cityPath, &cfg.Agents[i], cfg.Rigs)
+		// Always record claimable-count targets when a store is available, even
+		// for agents with a custom scale_check. The back-off layer uses these
+		// for an independent claimable-count signal (ga-bps).
+		if store != nil {
+			claimableTargets = append(claimableTargets, defaultScaleCheckTargetsForAgent(cityPath, cfg, &cfg.Agents[i], store, rigStores, suspendedRigPaths)...)
+		}
 		if store != nil && strings.TrimSpace(cfg.Agents[i].ScaleCheck) == "" {
 			defaultScaleTargets = append(defaultScaleTargets, defaultScaleCheckTargetsForAgent(cityPath, cfg, &cfg.Agents[i], store, rigStores, suspendedRigPaths)...)
 			continue
@@ -355,6 +370,7 @@ func buildDesiredStateWithSessionBeads(
 		if len(scaleCheckPartialTemplates) > 0 {
 			fmt.Fprintf(stderr, "scaleCheck: PARTIAL — scale_check failed for %s, retaining affected sessions\n", strings.Join(sortedBoolMapKeys(scaleCheckPartialTemplates), ",")) //nolint:errcheck
 		}
+		scaleCheckCounts = applyPoolBackoff(poolBackoff, scaleCheckCounts, claimableTargets, poolScaleCheckPartialTemplates, poolBackoffNow(), trace, stderr)
 		poolWorkBeads := filterAssignedWorkBeadsForPoolDemand(cfg, cityPath, sessionBeads.Open(), assignedWorkBeads, assignedWorkStoreRefs)
 		bp.assignedWorkBeads = poolWorkBeads
 		poolDesiredStates := ComputePoolDesiredStatesTraced(cfg, poolWorkBeads, sessionBeads.Open(), scaleCheckCounts, trace)
@@ -963,6 +979,86 @@ func defaultScaleCheckCounts(targets []defaultScaleCheckTarget) (map[string]int,
 		}
 	}
 	return counts, partialTemplates, errs
+}
+
+// applyPoolBackoff compares the scale_check signal against an independently
+// computed claimable count and asks poolBackoff to cap demand when the
+// underfull condition has persisted past its cooldown. Templates with a
+// scale_check partial result are excluded — back-off needs a reliable demand
+// signal to make a defensible decision. Decisions are recorded both as
+// telemetry events (gc.pool.backoff) and, when a trace cycle is active, as
+// reconciler trace operations so per-tick reasoning is visible.
+//
+// When poolBackoff is nil or claimableTargets is empty, scaleCheckCounts is
+// returned unchanged. The map identity may differ from the input even in
+// the no-op case; callers must use the return value.
+func applyPoolBackoff(
+	poolBackoff *PoolBackoffState,
+	scaleCheckCounts map[string]int,
+	claimableTargets []defaultScaleCheckTarget,
+	scaleCheckPartialTemplates map[string]bool,
+	now time.Time,
+	trace *sessionReconcilerTraceCycle,
+	stderr io.Writer,
+) map[string]int {
+	if poolBackoff == nil || len(claimableTargets) == 0 {
+		return scaleCheckCounts
+	}
+	claimableCounts, claimablePartials, errs := defaultScaleCheckCounts(claimableTargets)
+	for _, err := range errs {
+		fmt.Fprintf(stderr, "buildDesiredState: pool back-off claimable probe: %v\n", err) //nolint:errcheck
+	}
+	// Exclude templates whose scale_check or claimable signal is partial: a
+	// dropped signal could fabricate an underfull condition that does not
+	// reflect reality.
+	filteredScale := scaleCheckCounts
+	filteredClaim := claimableCounts
+	if len(scaleCheckPartialTemplates) > 0 || len(claimablePartials) > 0 {
+		filteredScale = make(map[string]int, len(scaleCheckCounts))
+		filteredClaim = make(map[string]int, len(claimableCounts))
+		for template, count := range scaleCheckCounts {
+			if scaleCheckPartialTemplates[template] || claimablePartials[template] {
+				continue
+			}
+			filteredScale[template] = count
+		}
+		for template, count := range claimableCounts {
+			if scaleCheckPartialTemplates[template] || claimablePartials[template] {
+				continue
+			}
+			filteredClaim[template] = count
+		}
+	}
+	adjusted, decisions := poolBackoff.Apply(filteredScale, filteredClaim, now)
+	if adjusted == nil {
+		adjusted = make(map[string]int)
+	}
+	// Stitch partial-template counts back so callers see the same shape we
+	// were handed.
+	for template, count := range scaleCheckCounts {
+		if _, ok := adjusted[template]; ok {
+			continue
+		}
+		adjusted[template] = count
+	}
+	for _, d := range decisions {
+		telemetry.RecordPoolBackoff(context.Background(), d.Template, d.ScaleCheck, d.Claimable, d.AdjustedDemand, d.UnderfullSince.Milliseconds(), d.Suppressed)
+		if trace == nil {
+			continue
+		}
+		outcome := "observed"
+		if d.Suppressed {
+			outcome = "suppressed"
+		}
+		trace.recordOperation(string(TraceSitePoolBackoff), d.Template, "", "", string(TraceReasonPoolBackoff), outcome, traceRecordPayload{
+			"scale_check":        d.ScaleCheck,
+			"claimable":          d.Claimable,
+			"adjusted_demand":    d.AdjustedDemand,
+			"suppressed":         d.Suppressed,
+			"underfull_since_ms": d.UnderfullSince.Milliseconds(),
+		}, "")
+	}
+	return adjusted
 }
 
 func defaultNamedSessionDemand(targets []defaultScaleCheckTarget, cfg *config.City, cityName string) (map[string]bool, map[string]bool, []error) {

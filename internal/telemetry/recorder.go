@@ -61,6 +61,10 @@ type recorderInstruments struct {
 	mailOpsTotal    metric.Int64Counter
 	drainTotal      metric.Int64Counter
 
+	// Pool scaler back-off (ga-bps) — counts how often the back-off layer
+	// observed underfull demand or actively suppressed pool spawns.
+	poolBackoffTotal metric.Int64Counter
+
 	// Gauges (1)
 	beadStoreHealthy metric.Int64Gauge
 
@@ -137,6 +141,9 @@ func initInstruments() {
 		)
 		inst.drainTotal, _ = m.Int64Counter("gc.drain.transitions.total",
 			metric.WithDescription("Total agent drain lifecycle transitions"),
+		)
+		inst.poolBackoffTotal, _ = m.Int64Counter("gc.pool.backoff.total",
+			metric.WithDescription("Total pool scaler back-off observations (suppressed vs observed)"),
 		)
 
 		// Gauges
@@ -551,6 +558,36 @@ func RecordPoolCheck(ctx context.Context, agent string, durationMs float64, desi
 		otellog.Int("desired", desired),
 		otellog.String("status", status),
 		errKV(err),
+	)
+}
+
+// RecordPoolBackoff records a pool scaler back-off observation (ga-bps).
+// suppressed=true means the back-off layer capped scale_check demand at the
+// claimable count this tick; suppressed=false means the underfull condition
+// was observed but cooldown has not yet elapsed.
+func RecordPoolBackoff(ctx context.Context, agent string, scaleCheck, claimable, adjustedDemand int, underfullMs int64, suppressed bool) {
+	initInstruments()
+	outcome := "observed"
+	if suppressed {
+		outcome = "suppressed"
+	}
+	inst.poolBackoffTotal.Add(ctx, 1,
+		metric.WithAttributes(
+			attribute.String("agent", agent),
+			attribute.String("outcome", outcome),
+		),
+	)
+	severity := otellog.SeverityInfo
+	if suppressed {
+		severity = otellog.SeverityWarn
+	}
+	emit(ctx, "pool.backoff", severity,
+		otellog.String("agent", agent),
+		otellog.String("outcome", outcome),
+		otellog.Int("scale_check", scaleCheck),
+		otellog.Int("claimable", claimable),
+		otellog.Int("adjusted_demand", adjustedDemand),
+		otellog.Int64("underfull_since_ms", underfullMs),
 	)
 }
 
