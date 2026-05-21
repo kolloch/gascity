@@ -1488,6 +1488,13 @@ func discoverSessionBeadsWithRoots(
 			if controllerManagedPool && isDrainedSessionBead(b) {
 				continue
 			}
+			// Same rule as for the drained sweep: half-closed beads
+			// (state=gc_swept etc., status="open") are dead capacity. Pulling
+			// them back in here re-inflates the pool count with a session
+			// that will never actually start, masking real demand (ga-u3q).
+			if controllerManagedPool && session.TerminalStateReleased(b) {
+				continue
+			}
 			if controllerManagedPool && !manualSession && !isNamedSessionBead(b) &&
 				!sessionAlreadyDesired && cfgAgent.UsesCanonicalSingletonPoolIdentity() &&
 				desiredHasCanonicalNonExpandingPoolSession(desired, template, cfgAgent) {
@@ -2570,6 +2577,15 @@ func reusablePoolSessionBead(bp *agentBuildParams, cfgAgent *config.Agent, templ
 	if bead.Status == "closed" {
 		return false
 	}
+	// Terminal-state beads (gc_swept, orphaned, stale-session, …) have been
+	// retired by the sweep / orphan pipeline. A partial close can leave one
+	// with status="open" but state="gc_swept" — picking it up here strands
+	// the pool at zero live workers because the dead bead never actually
+	// starts, and the anonymous-new tier was already satisfied by the
+	// (dead) reuse. Matches the alias-availability check on the close path.
+	if session.TerminalStateReleased(bead) {
+		return false
+	}
 	if isDrainedSessionBead(bead) {
 		return false
 	}
@@ -2819,6 +2835,13 @@ func reusableDependencyPoolSessionBead(bp *agentBuildParams, template string, be
 		return false
 	}
 	if bead.Status == "closed" || isManualSessionBead(bead) {
+		return false
+	}
+	// Terminal-state beads (gc_swept, orphaned, …) have released their
+	// identifier claims and never actually start; reusing one here strands
+	// the dependency at zero. Matches reusablePoolSessionBead and the
+	// alias-availability check on the close path.
+	if session.TerminalStateReleased(bead) {
 		return false
 	}
 	if isDrainedSessionBead(bead) {

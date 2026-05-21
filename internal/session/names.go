@@ -371,7 +371,7 @@ func ensureSessionNameAvailableForSelfAndOwner(store beads.Store, name, selfID, 
 		// permanence check above intentionally runs first so the legacy
 		// "names are permanent" semantic is unaffected; only secondary
 		// alias / identifier collisions below are released.
-		if sessionTerminalStateReleased(b) {
+		if TerminalStateReleased(b) {
 			continue
 		}
 		if strings.TrimSpace(b.Metadata["alias"]) == name {
@@ -405,7 +405,7 @@ func failedCreateIdentityReleased(b beads.Bead) bool {
 	return strings.TrimSpace(b.Metadata["state"]) == string(StateFailedCreate)
 }
 
-// sessionTerminalStateReleased reports whether a bead carries terminal close
+// TerminalStateReleased reports whether a bead carries terminal close
 // metadata (state or close_reason set to gc_swept, orphaned, drained,
 // stale-session, duplicate, duplicate-repair, reconfigured, or failed-create).
 //
@@ -420,7 +420,13 @@ func failedCreateIdentityReleased(b beads.Bead) bool {
 // held alias="zack/gastown.furiosa" with state=gc_swept and recurring
 // "alias already belongs to pe-r7c1" warnings across reconciler ticks and
 // process restarts.
-func sessionTerminalStateReleased(b beads.Bead) bool {
+//
+// Exported so the pool scaler (cmd/gc) can recognize the same half-closed
+// beads and skip them when picking reusable candidates. Without that check
+// a swept bead with status=open looks like a fresh-enough pool slot to
+// reuse, stranding routed work because the dead session never actually
+// starts (ga-u3q).
+func TerminalStateReleased(b beads.Bead) bool {
 	state := strings.TrimSpace(b.Metadata["state"])
 	switch state {
 	case "gc_swept", "orphaned", "drained", "stale-session",
@@ -596,7 +602,7 @@ func noLiveSessionNameCollisions(store beads.Store, name, selfID, selfOwner stri
 		}
 		// Terminal-state beads (gc_swept, orphaned, …) have released their
 		// identifier claims even if a partial close left status="open".
-		if sessionTerminalStateReleased(b) {
+		if TerminalStateReleased(b) {
 			continue
 		}
 		// A live bead holding the name as session_name blocks.
@@ -662,7 +668,7 @@ func ensureSessionAliasAvailable(store beads.Store, cfg *config.City, alias, sel
 		// left status="open". Without this guard, half-closed beads
 		// strand their alias across reconciler ticks and restarts —
 		// see pe-r7c1 / zack-gastown.furiosa (2026-05-19).
-		if sessionTerminalStateReleased(b) {
+		if TerminalStateReleased(b) {
 			continue
 		}
 		if strings.TrimSpace(b.Metadata["session_name"]) == alias {
