@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime/debug"
 	"sort"
@@ -2269,7 +2270,8 @@ func sweepUndesiredPoolSessionBeads(
 		if agentCfg == nil || !isEphemeralSessionBead(bead) {
 			continue
 		}
-		if running, err := poolSessionBeadRuntimeRunning(bead, sp); err == nil && running {
+		processNames := config.AgentProcessNames(cfg, *agentCfg, exec.LookPath)
+		if running, err := poolSessionBeadRuntimeRunning(bead, sp, processNames); err == nil && running {
 			continue
 		}
 		candidates = append(candidates, bead)
@@ -2277,7 +2279,7 @@ func sweepUndesiredPoolSessionBeads(
 	return len(GCSweepSessionBeads(store, rigStores, candidates))
 }
 
-func poolSessionBeadRuntimeRunning(bead beads.Bead, sp runtime.Provider) (bool, error) {
+func poolSessionBeadRuntimeRunning(bead beads.Bead, sp runtime.Provider, processNames []string) (bool, error) {
 	if sp == nil {
 		return false, fmt.Errorf("pool session runtime check: %w", runtime.ErrSessionNotFound)
 	}
@@ -2285,10 +2287,10 @@ func poolSessionBeadRuntimeRunning(bead beads.Bead, sp runtime.Provider) (bool, 
 	if name == "" {
 		return false, fmt.Errorf("pool session runtime check missing session name: %w", runtime.ErrSessionNotFound)
 	}
-	// The sweep only needs provider-runtime presence, not process aliveness or
-	// attachment/activity details. ObserveLiveness preserves provider-native
-	// running semantics without the heavier worker observation path.
-	return runtime.ObserveLiveness(sp, name, nil).Running, nil
+	// The sweep only needs provider-runtime/process presence, not attachment or
+	// activity details. Process-name hints preserve the same false-negative
+	// recovery used by worker observation without the heavier handle path.
+	return runtime.ObserveLiveness(sp, name, processNames).Running, nil
 }
 
 // pendingCreateClaimStillLeasedForSweep keeps pending_create_claim protection
