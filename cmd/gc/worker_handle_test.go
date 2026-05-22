@@ -1497,6 +1497,113 @@ ready_delay_ms = 250
 	}
 }
 
+// TestResolvedWorkerRuntimeWithConfigPopulatesSessionLiveOnResume guards the
+// ga-vtkhi fix: the `gc session attach` resume path must carry the agent's
+// session_live commands (with templates expanded) into Hints.SessionLive so
+// the recreated tmux runtime re-applies the status-bar/keybinding theme the
+// same way reconciler-started sessions do.
+func TestResolvedWorkerRuntimeWithConfigPopulatesSessionLiveOnResume(t *testing.T) {
+	cityDir := t.TempDir()
+	rigDir := t.TempDir()
+	writePhase0InterfaceCity(t, cityDir, fmt.Sprintf(`[workspace]
+name = "test-city"
+
+[beads]
+provider = "file"
+
+[[rigs]]
+name = "myrig"
+path = %q
+
+[[agent]]
+name = "worker"
+provider = "stub"
+session_live = ["theme apply {{.Session}}"]
+
+[[agent]]
+name = "rig-worker"
+dir = "myrig"
+provider = "stub"
+session_live = ["theme rig={{.Rig}} root={{.RigRoot}} base={{.AgentBase}} city={{.CityName}} work={{.WorkDir}} config={{.ConfigDir}}"]
+
+[[agent]]
+name = "polecat"
+dir = "myrig"
+provider = "stub"
+session_live = ["theme agent={{.Agent}} base={{.AgentBase}} rig={{.Rig}} root={{.RigRoot}}"]
+
+[[agent]]
+name = "plain"
+provider = "stub"
+
+[providers.stub]
+command = "/bin/echo"
+`, rigDir))
+
+	cfg, err := loadCityConfig(cityDir)
+	if err != nil {
+		t.Fatalf("loadCityConfig: %v", err)
+	}
+
+	tests := []struct {
+		name string
+		info session.Info
+		want []string
+	}{
+		{
+			name: "session name template",
+			info: session.Info{
+				Template:    "worker",
+				AgentName:   "worker",
+				SessionName: "test-city__worker",
+			},
+			want: []string{"theme apply test-city__worker"},
+		},
+		{
+			name: "rig template context",
+			info: session.Info{
+				Template:    "myrig/rig-worker",
+				AgentName:   "myrig/rig-worker",
+				SessionName: "test-city__myrig__rig-worker",
+				WorkDir:     filepath.Join(rigDir, "agents", "rig-worker"),
+			},
+			want: []string{"theme rig=myrig root=" + rigDir + " base=rig-worker city=test-city work=" + filepath.Join(rigDir, "agents", "rig-worker") + " config=" + cityDir},
+		},
+		{
+			name: "pool instance uses concrete agent name",
+			info: session.Info{
+				Template:    "myrig/polecat",
+				AgentName:   "myrig/polecat__furiosa-1",
+				SessionName: "test-city__myrig__polecat__furiosa-1",
+			},
+			want: []string{"theme agent=myrig/polecat__furiosa-1 base=polecat__furiosa-1 rig=myrig root=" + rigDir},
+		},
+		{
+			name: "missing session live stays empty",
+			info: session.Info{
+				Template:    "plain",
+				AgentName:   "plain",
+				SessionName: "test-city__plain",
+			},
+			want: nil,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			runtimeCfg, err := resolvedWorkerRuntimeWithConfig(cityDir, cfg, tt.info, "")
+			if err != nil {
+				t.Fatalf("resolvedWorkerRuntimeWithConfig: %v", err)
+			}
+			if runtimeCfg == nil {
+				t.Fatal("resolvedWorkerRuntimeWithConfig() = nil")
+			}
+			if got, want := runtimeCfg.Hints.SessionLive, tt.want; !slicesEqual(got, want) {
+				t.Fatalf("Hints.SessionLive = %v, want %v", got, want)
+			}
+		})
+	}
+}
+
 func TestResolvedWorkerRuntimeWithConfigIgnoresMCPResolutionErrorForACPResume(t *testing.T) {
 	cityDir := t.TempDir()
 	writePhase0InterfaceCity(t, cityDir, `[workspace]
