@@ -830,6 +830,15 @@ while IFS= read -r DB; do
     STAGE_PATHS+=("$DB" "$DB.jsonl")
 
     # Step 3: Spike detection — compare record counts against previous commit.
+    # GROWTH-only: a sudden jump in exported records means pollution is leaking
+    # into the durable archive, which warrants a HALT + HIGH escalation. A
+    # shrinkage is NOT an anomaly — legitimate operations (closed-bead
+    # compaction, gc_sweep, scrub-filter changes after a binary deploy, the
+    # post-restart re-export window) shrink this derived export without any
+    # data loss, and the source-of-truth Dolt DB (not this backup) is where
+    # genuine data loss is detected. Treating shrinkage as a spike fired a
+    # false HIGH escalation once per rig on every city restart (ga-1oy), so a
+    # drop now flows through the normal commit + push path after a NOTICE.
     PREV_COUNT=0
     if git -C "$ARCHIVE_REPO" cat-file -e "HEAD:$DB/issues.jsonl" 2>/dev/null; then
         PREV_COUNT=$(git -C "$ARCHIVE_REPO" show "HEAD:$DB/issues.jsonl" 2>/dev/null | count_jsonl_rows || echo "0")
@@ -842,18 +851,21 @@ while IFS= read -r DB; do
     # disable the small-N skip.
     if [ "$PREV_COUNT" -gt 0 ] && [ "$PREV_COUNT" -ge "$MIN_PREV_FOR_SPIKE_CHECK" ]; then
         FILTERED_COUNT=$(count_jsonl_rows < "$DB_DIR/issues.jsonl")
+        # Signed delta: positive is growth (records added), negative is shrinkage.
         DELTA=$(( (FILTERED_COUNT - PREV_COUNT) * 100 / PREV_COUNT ))
-        if [ "$DELTA" -lt 0 ]; then
-            DELTA=$(( -DELTA ))
-        fi
         if [ "$DELTA" -gt "$SPIKE_THRESHOLD" ]; then
             HALTED=1
             HALT_DB="$DB"
             HALT_PREV_COUNT="$PREV_COUNT"
             HALT_CURRENT_COUNT="$FILTERED_COUNT"
             HALT_DELTA="$DELTA"
-            echo "jsonl-export: HALTED — spike in $DB (${DELTA}% > ${SPIKE_THRESHOLD}%)"
+            echo "jsonl-export: HALTED — growth spike in $DB (+${DELTA}% > ${SPIKE_THRESHOLD}%)"
             break
+        elif [ "$DELTA" -lt 0 ]; then
+            SHRINK=$(( -DELTA ))
+            if [ "$SHRINK" -gt "$SPIKE_THRESHOLD" ]; then
+                echo "jsonl-export: NOTICE — $DB export shrank ${SHRINK}% (${PREV_COUNT} -> ${FILTERED_COUNT}); not an anomaly (compaction/sweep), advancing baseline" >&2
+            fi
         fi
     fi
 done <<EOF

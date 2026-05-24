@@ -4704,7 +4704,7 @@ func TestJsonlExportCountsRecordsViaJq(t *testing.T) {
 
 func TestJsonlExportSkipsSpikeCheckBelowMinPrev(t *testing.T) {
 	// Bug 2 (#1547): percent-delta with no absolute floor escalates on tiny
-	// counts. prev=2, current=1 → 50% delta would cross the 20% threshold.
+	// counts. prev=2, current=4 → 100% growth would cross the 20% threshold.
 	// With the fix, no escalation when prev < GC_JSONL_MIN_PREV_FOR_SPIKE
 	// (default 10).
 	cityDir := t.TempDir()
@@ -4715,7 +4715,7 @@ func TestJsonlExportSkipsSpikeCheckBelowMinPrev(t *testing.T) {
 	archiveRepo := filepath.Join(cityDir, "archive")
 
 	initSeedArchive(t, archiveRepo, 2)
-	writeMultiRecordDoltStub(t, binDir, 1)
+	writeMultiRecordDoltStub(t, binDir, 4)
 	writeJsonlExportGCStub(t, binDir)
 
 	env := jsonlExportEnv(t, cityDir, binDir, stateDir, archiveRepo, gcLog, mailLog)
@@ -4744,14 +4744,14 @@ func TestJsonlExportCommitsOnHaltToAdvanceBaseline(t *testing.T) {
 	archiveRepo := filepath.Join(cityDir, "archive")
 
 	prevHead := initSeedArchive(t, archiveRepo, 100)
-	writeMultiRecordDoltStub(t, binDir, 10)
+	writeMultiRecordDoltStub(t, binDir, 200)
 	writeJsonlExportGCStub(t, binDir)
 
 	env := jsonlExportEnv(t, cityDir, binDir, stateDir, archiveRepo, gcLog, mailLog)
 
 	runScript(t, filepath.Join(exampleDir(), "packs", "maintenance", "assets", "scripts", "jsonl-export.sh"), env)
 
-	// Sanity: the spike (90% drop, prev=100, current=10) was escalated.
+	// Sanity: the growth spike (+100%, prev=100, current=200) was escalated.
 	mailData, err := os.ReadFile(mailLog)
 	if err != nil && !os.IsNotExist(err) {
 		t.Fatalf("ReadFile(mail log): %v", err)
@@ -4792,6 +4792,71 @@ func TestJsonlExportCommitsOnHaltToAdvanceBaseline(t *testing.T) {
 	}
 	if strings.Contains(string(gcData), "DOG_DONE: jsonl — exported") {
 		t.Fatalf("HALT path must not emit the success summary nudge; gc log:\n%s", gcData)
+	}
+}
+
+func TestJsonlExportShrinkageDoesNotHaltOrEscalate(t *testing.T) {
+	// ga-1oy: spike detection is GROWTH-only. A large drop in the exported
+	// record count is NOT an anomaly — legitimate operations (closed-bead
+	// compaction, gc_sweep, scrub-filter changes after a binary deploy, the
+	// post-restart re-export window) shrink the derived export without any
+	// data loss. The source-of-truth Dolt DB, not this backup, is where real
+	// data loss is detected. Before the fix, a 50% shrinkage (e.g. a city
+	// restart dropping a rig export 125 → 62) escalated HIGH to the mayor and
+	// HALTed; that fired once per rig on every restart. After the fix a
+	// shrinkage flows through the normal commit + (local-only) push path:
+	// no escalation, no HALT, baseline advances via a plain (non-HALT) commit.
+	cityDir := t.TempDir()
+	binDir := t.TempDir()
+	stateDir := t.TempDir()
+	gcLog := filepath.Join(t.TempDir(), "gc.log")
+	mailLog := filepath.Join(t.TempDir(), "gc-mail.log")
+	archiveRepo := filepath.Join(cityDir, "archive")
+
+	prevHead := initSeedArchive(t, archiveRepo, 100)
+	writeMultiRecordDoltStub(t, binDir, 50) // 50% drop, well past the 20% threshold
+	writeJsonlExportGCStub(t, binDir)
+
+	env := jsonlExportEnv(t, cityDir, binDir, stateDir, archiveRepo, gcLog, mailLog)
+
+	runScript(t, filepath.Join(exampleDir(), "packs", "maintenance", "assets", "scripts", "jsonl-export.sh"), env)
+
+	// No spike escalation mail: a shrinkage must never page the mayor.
+	mailData, err := os.ReadFile(mailLog)
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatalf("ReadFile(mail log): %v", err)
+	}
+	if strings.Contains(string(mailData), "ESCALATION: JSONL spike") {
+		t.Fatalf("shrinkage must not escalate a spike; mail log:\n%s", mailData)
+	}
+
+	// The run took the normal success path, not the HALT path.
+	gcData, err := os.ReadFile(gcLog)
+	if err != nil {
+		t.Fatalf("ReadFile(gc log): %v", err)
+	}
+	if strings.Contains(string(gcData), "HALTED on spike detection") {
+		t.Fatalf("shrinkage must not HALT; gc log:\n%s", gcData)
+	}
+	if !strings.Contains(string(gcData), "DOG_DONE: jsonl — exported") {
+		t.Fatalf("expected the normal export summary nudge after a benign shrinkage; gc log:\n%s", gcData)
+	}
+
+	// Baseline advances through a plain commit (no [HALT] marker) so the
+	// smaller export is recorded as the new normal.
+	revOut, err := exec.Command("git", "-C", archiveRepo, "rev-parse", "HEAD").CombinedOutput()
+	if err != nil {
+		t.Fatalf("git rev-parse: %v\n%s", err, revOut)
+	}
+	if strings.TrimSpace(string(revOut)) == prevHead {
+		t.Fatalf("HEAD did not advance after a benign shrinkage; baseline frozen at %s", prevHead)
+	}
+	logOut, err := exec.Command("git", "-C", archiveRepo, "log", "-1", "--format=%s").CombinedOutput()
+	if err != nil {
+		t.Fatalf("git log: %v\n%s", err, logOut)
+	}
+	if headMsg := strings.TrimSpace(string(logOut)); strings.Contains(headMsg, "HALT") {
+		t.Fatalf("shrinkage commit must not be tagged [HALT]; got: %q", headMsg)
 	}
 }
 
@@ -4975,7 +5040,7 @@ func TestJsonlExportHaltCommitAdvancesBaselineWithoutLocalGitIdentity(t *testing
 	archiveRepo := filepath.Join(cityDir, "archive")
 
 	prevHead := initSeedArchiveWithoutLocalIdentity(t, archiveRepo, 100)
-	writeMultiRecordDoltStub(t, binDir, 10)
+	writeMultiRecordDoltStub(t, binDir, 200)
 	writeJsonlExportGCStub(t, binDir)
 
 	env := jsonlExportEnv(t, cityDir, binDir, stateDir, archiveRepo, gcLog, mailLog)
@@ -5131,7 +5196,7 @@ func TestJsonlExportHaltStagingFailureExitsWithoutAdvancingBaseline(t *testing.T
 	archiveRepo := filepath.Join(cityDir, "archive")
 
 	prevHead := initSeedArchive(t, archiveRepo, 100)
-	writeMultiRecordDoltStub(t, binDir, 10)
+	writeMultiRecordDoltStub(t, binDir, 200)
 	writeJsonlExportGCStub(t, binDir)
 
 	realGit, err := exec.LookPath("git")
@@ -5176,7 +5241,7 @@ func TestJsonlExportHaltCommitFailureLeavesArchiveClean(t *testing.T) {
 	archiveRepo := filepath.Join(cityDir, "archive")
 
 	prevHead := initSeedArchive(t, archiveRepo, 100)
-	writeMultiRecordDoltStub(t, binDir, 10)
+	writeMultiRecordDoltStub(t, binDir, 200)
 	writeJsonlExportGCStub(t, binDir)
 
 	realGit, err := exec.LookPath("git")
@@ -5222,7 +5287,7 @@ func TestJsonlExportHaltMailFailurePersistsPendingAlertAndRetriesNextRun(t *test
 	stateFile := filepath.Join(stateDir, "jsonl-export-state.json")
 
 	initSeedArchive(t, archiveRepo, 100)
-	writeMultiRecordDoltStub(t, binDir, 10)
+	writeMultiRecordDoltStub(t, binDir, 200)
 	writeJsonlExportGCStubWithMailExitCode(t, binDir, 1)
 
 	env := jsonlExportEnv(t, cityDir, binDir, stateDir, archiveRepo, gcLog, mailLog)
@@ -5253,7 +5318,7 @@ func TestJsonlExportHaltMailFailurePersistsPendingAlertAndRetriesNextRun(t *test
 		t.Fatalf("expected initial failed mail attempt to be logged, got:\n%s", mailData)
 	}
 
-	writeMultiRecordDoltStub(t, binDir, 10)
+	writeMultiRecordDoltStub(t, binDir, 200)
 	writeJsonlExportGCStub(t, binDir)
 
 	runScript(t, filepath.Join(exampleDir(), "packs", "maintenance", "assets", "scripts", "jsonl-export.sh"), env)
@@ -5285,7 +5350,7 @@ func TestJsonlExportNoChangePushesPendingArchiveCommitAfterHalt(t *testing.T) {
 	stateFile := filepath.Join(stateDir, "jsonl-export-state.json")
 
 	remoteRepo, remoteHead := initSeedArchiveWithRemote(t, archiveRepo)
-	writeMultiRecordDoltStub(t, binDir, 10)
+	writeMultiRecordDoltStub(t, binDir, 200)
 	writeJsonlExportGCStub(t, binDir)
 
 	env := jsonlExportEnv(t, cityDir, binDir, stateDir, archiveRepo, gcLog, mailLog)
@@ -5346,7 +5411,7 @@ func TestJsonlExportNoChangePushesPendingArchiveCommitWithoutPendingState(t *tes
 	stateFile := filepath.Join(stateDir, "jsonl-export-state.json")
 
 	remoteRepo, remoteHead := initSeedArchiveWithRemote(t, archiveRepo)
-	writeMultiRecordDoltStub(t, binDir, 10)
+	writeMultiRecordDoltStub(t, binDir, 200)
 	writeJsonlExportGCStub(t, binDir)
 
 	env := jsonlExportEnv(t, cityDir, binDir, stateDir, archiveRepo, gcLog, mailLog)
@@ -5387,7 +5452,7 @@ func TestJsonlExportNoUserDatabasesPushesPendingArchiveCommit(t *testing.T) {
 	stateFile := filepath.Join(stateDir, "jsonl-export-state.json")
 
 	remoteRepo, remoteHead := initSeedArchiveWithRemote(t, archiveRepo)
-	writeMultiRecordDoltStub(t, binDir, 10)
+	writeMultiRecordDoltStub(t, binDir, 200)
 	writeJsonlExportGCStub(t, binDir)
 
 	env := jsonlExportEnv(t, cityDir, binDir, stateDir, archiveRepo, gcLog, mailLog)
@@ -5433,7 +5498,7 @@ func TestJsonlExportNoChangeRebasesPendingArchiveCommitOntoAdvancedRemote(t *tes
 	archiveRepo := filepath.Join(cityDir, "archive")
 
 	remoteRepo, _ := initSeedArchiveWithRemote(t, archiveRepo)
-	writeMultiRecordDoltStub(t, binDir, 10)
+	writeMultiRecordDoltStub(t, binDir, 200)
 	writeJsonlExportGCStub(t, binDir)
 
 	env := jsonlExportEnv(t, cityDir, binDir, stateDir, archiveRepo, gcLog, mailLog)
@@ -5490,7 +5555,7 @@ func TestJsonlExportNoChangePushFailureWithMalformedStateUsesTrackingRef(t *test
 	stateFile := filepath.Join(stateDir, "jsonl-export-state.json")
 
 	remoteRepo, remoteHead := initSeedArchiveWithRemote(t, archiveRepo)
-	writeMultiRecordDoltStub(t, binDir, 10)
+	writeMultiRecordDoltStub(t, binDir, 200)
 	writeJsonlExportGCStub(t, binDir)
 
 	env := jsonlExportEnv(t, cityDir, binDir, stateDir, archiveRepo, gcLog, mailLog)
@@ -5560,7 +5625,7 @@ func TestJsonlExportExportFailureDoesNotBlockPendingArchiveReplay(t *testing.T) 
 	stateFile := filepath.Join(stateDir, "jsonl-export-state.json")
 
 	remoteRepo, remoteHead := initSeedArchiveWithRemote(t, archiveRepo)
-	writeMultiRecordDoltStub(t, binDir, 10)
+	writeMultiRecordDoltStub(t, binDir, 200)
 	writeJsonlExportGCStub(t, binDir)
 
 	env := jsonlExportEnv(t, cityDir, binDir, stateDir, archiveRepo, gcLog, mailLog)
@@ -5669,7 +5734,7 @@ func TestJsonlExportLegacyStateBackupRecoversPendingArchiveReplay(t *testing.T) 
 	legacyStateFile := filepath.Join(cityDir, ".gc", "jsonl-export-state.json")
 
 	remoteRepo, remoteHead := initSeedArchiveWithRemote(t, archiveRepo)
-	writeMultiRecordDoltStub(t, binDir, 10)
+	writeMultiRecordDoltStub(t, binDir, 200)
 	writeJsonlExportGCStub(t, binDir)
 
 	if err := os.MkdirAll(filepath.Dir(legacyStateFile), 0o755); err != nil {
@@ -6007,7 +6072,7 @@ func TestJsonlExportHaltMailFailureRecoversFromMalformedState(t *testing.T) {
 	stateFile := filepath.Join(stateDir, "jsonl-export-state.json")
 
 	initSeedArchive(t, archiveRepo, 100)
-	writeMultiRecordDoltStub(t, binDir, 10)
+	writeMultiRecordDoltStub(t, binDir, 200)
 	writeJsonlExportGCStubWithMailExitCode(t, binDir, 1)
 
 	if err := os.WriteFile(stateFile, []byte("not-json\n"), 0o644); err != nil {
@@ -6049,7 +6114,7 @@ func TestJsonlExportRetriesPendingAlertFromBackupAfterPrimaryCorruption(t *testi
 	stateFile := filepath.Join(stateDir, "jsonl-export-state.json")
 
 	initSeedArchiveWithRemote(t, archiveRepo)
-	writeMultiRecordDoltStub(t, binDir, 10)
+	writeMultiRecordDoltStub(t, binDir, 200)
 	writeJsonlExportGCStubWithMailExitCode(t, binDir, 1)
 
 	env := jsonlExportEnv(t, cityDir, binDir, stateDir, archiveRepo, gcLog, mailLog)
@@ -6176,7 +6241,7 @@ func TestJsonlExportHaltMailFailurePreservesExistingPendingAlerts(t *testing.T) 
 	stateFile := filepath.Join(stateDir, "jsonl-export-state.json")
 
 	initSeedArchive(t, archiveRepo, 100)
-	writeMultiRecordDoltStub(t, binDir, 10)
+	writeMultiRecordDoltStub(t, binDir, 200)
 	writeJsonlExportGCStubWithMailExitCode(t, binDir, 1)
 
 	if err := os.WriteFile(stateFile, []byte(`{"pending_spike_alert":{"database":"oldbeads","prev_count":90,"current_count":45,"delta":50,"threshold":20}}`+"\n"), 0o644); err != nil {
@@ -6280,11 +6345,10 @@ func TestJsonlExportPushModeAttemptsPushWhenOriginConfigured(t *testing.T) {
 
 	env := jsonlExportEnv(t, cityDir, binDir, stateDir, archiveRepo, gcLog, mailLog)
 	// initSeedArchiveWithRemote seeds 100 prev rows; the multi-record stub
-	// returns 5. The default 20% spike threshold would flag this 95% drop and
-	// route the run through the HALT path, which suppresses the push. This
-	// test is scoped to push behavior, not spike detection — raise MIN_PREV
-	// above 100 so the percent check is skipped here.
-	env["GC_JSONL_MIN_PREV_FOR_SPIKE"] = "1000"
+	// returns 5. Spike detection is growth-only (ga-1oy), so this 95% drop is
+	// a benign shrinkage that flows straight through the normal commit + push
+	// path — no HALT to suppress the push — which is exactly what this
+	// push-focused test needs.
 
 	out, err := runScriptResult(t, filepath.Join(exampleDir(), "packs", "maintenance", "assets", "scripts", "jsonl-export.sh"), env)
 	if err != nil {
