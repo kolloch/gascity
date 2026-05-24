@@ -7582,17 +7582,33 @@ export type GetV0CityByCityNameMailData = {
          */
         limit?: number;
         /**
-         * Filter by agent name.
+         * Filter by recipient (mailbox).
          */
         agent?: string;
         /**
-         * Filter by status (unread, all).
+         * Read-state filter: 'unread' (default) or 'all'. This is independent of the bead status; pass include_closed=true to surface legacy archived (status=closed) beads.
          */
         status?: string;
         /**
          * Filter by rig name.
          */
         rig?: string;
+        /**
+         * Filter by sender (metadata.from / Bead.From). Empty = no sender constraint.
+         */
+        from?: string;
+        /**
+         * Filter by exact label match (e.g. 'archived:viewer/me'). Empty = no label constraint.
+         */
+        label?: string;
+        /**
+         * Convenience filter for the per-viewer archive model: equivalent to label='archived:<viewer>' with read messages included. Conflicts with 'label'.
+         */
+        archived_for?: string;
+        /**
+         * Include status=closed message beads (legacy archived). Default false matches Inbox/All semantics.
+         */
+        include_closed?: boolean;
     };
     url: '/v0/city/{cityName}/mail';
 };
