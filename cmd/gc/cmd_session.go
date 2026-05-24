@@ -1919,11 +1919,17 @@ func cmdSessionKill(args []string, stdout, stderr io.Writer, jsonOutput ...bool)
 		return 1
 	}
 
+	bead, err := store.Get(sessionID)
+	if err != nil {
+		fmt.Fprintf(stderr, "gc session kill: loading session %s: %v\n", sessionID, err) //nolint:errcheck // best-effort stderr
+		return 1
+	}
+	identity := namedSessionIdentity(bead)
+
 	if err := handle.Kill(context.Background()); err != nil {
 		fmt.Fprintf(stderr, "gc session kill: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
-
 	// Use the resolved session ID as the canonical Subject for event
 	// consumers. This ensures a stable key regardless of how the user
 	// specified the target (session ID or alias).
@@ -1935,6 +1941,11 @@ func cmdSessionKill(args []string, stdout, stderr io.Writer, jsonOutput ...bool)
 		Message: "killed",
 		Payload: api.SessionLifecyclePayloadJSON(sessionID, "", "killed"),
 	})
+	if identity != "" {
+		if err := resetSessionCircuitBreakerAfterExplicitKill(cityPath, store, sessionID, identity); err != nil {
+			fmt.Fprintf(stderr, "gc session kill: warning: clearing session circuit breaker for %q: %v\n", identity, err) //nolint:errcheck // best-effort stderr
+		}
+	}
 
 	if asJSON {
 		if err := writeSessionActionJSON(stdout, sessionActionResult{
