@@ -923,11 +923,11 @@ jobs:
       - name: Install SPA dependencies
         run: npm ci --silent
         working-directory: cmd/gc/dashboard/web
-      - name: Verify generated TS schema is in sync
+      - name: Verify generated TS client is in sync
         run: |
           npm run gen --silent
-          if ! git diff --exit-code src/generated/schema.d.ts; then
-            echo "::error::Generated TS schema drifted. Regenerate via 'npm run gen' in cmd/gc/dashboard/web."
+          if ! git diff --exit-code src/generated; then
+            echo "::error::Generated TS client drifted. Regenerate via 'npm run gen' in cmd/gc/dashboard/web."
             exit 1
           fi
         working-directory: cmd/gc/dashboard/web
