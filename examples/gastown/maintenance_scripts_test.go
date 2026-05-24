@@ -3593,8 +3593,11 @@ exit 0
 }
 
 // TestReaperAlertNonThresholdAnomalyBypassesDedup verifies that anomalies other
-// than the wisp-count threshold (e.g. Dolt commit failures) are escalated
-// without dedup, even when the threshold alert state is fresh.
+// than the wisp-count threshold (e.g. Dolt commit failures) are not gated by
+// the threshold dedup state: a non-threshold anomaly still escalates even when
+// a fresh threshold alert is on file. (Error anomalies have their own
+// signature-based dedup, exercised by the TestReaperErrorAnomaly* tests below;
+// here no error state exists, so this first occurrence escalates.)
 func TestReaperAlertNonThresholdAnomalyBypassesDedup(t *testing.T) {
 	cityDir := t.TempDir()
 	binDir := t.TempDir()
@@ -3662,6 +3665,205 @@ exit 0
 	}
 	if !strings.Contains(gcLogText, "Dolt commit failed") {
 		t.Fatalf("reaper non-threshold escalation lost commit-failure context:\n%s", gcLogText)
+	}
+}
+
+// reaperErrorDoltStub returns a dolt-mock script body that reproduces a
+// sustained per-database query failure: SHOW DATABASES and the wisps-table
+// probe succeed, the stale-wisp candidate count (COUNT(DISTINCT w.id)) fails
+// with a stable error, and the open-wisp count stays below threshold so the
+// only anomaly recorded is the error (non-threshold) one. The error text is
+// taken from REAPER_TEST_ERROR so tests can vary the signature across runs.
+func reaperErrorDoltStub() string {
+	return `#!/bin/sh
+printf '%s\n' "$*" >> "$DOLT_ARGS_LOG"
+case "$*" in
+  *"SHOW TABLES FROM"*"LIKE 'wisps'"*)
+    printf 'Tables_in_db\nwisps\n'
+    ;;
+  *"SHOW DATABASES"*)
+    printf 'Database\nbeads\n'
+    ;;
+  *"COUNT(DISTINCT w.id)"*)
+    printf '%s\n' "${REAPER_TEST_ERROR:-column depends_on_id could not be found}" >&2
+    exit 1
+    ;;
+  *"SELECT COUNT(*) FROM "*"wisps"*"status IN ('open', 'hooked', 'in_progress')"*"created_at <"*)
+    printf 'COUNT(*)\n1\n'
+    ;;
+  *"COUNT("*)
+    printf 'COUNT(*)\n0\n'
+    ;;
+  *"SELECT id"*)
+    printf 'id\n'
+    ;;
+esac
+exit 0
+`
+}
+
+// reaperReadFile reads a captured log or state file, failing the test on error.
+func reaperReadFile(t *testing.T, path string) string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile(%s): %v", path, err)
+	}
+	return string(data)
+}
+
+// TestReaperErrorAnomalyEmitsOnFirstFailureAndRecordsSignature verifies that
+// the first occurrence of an error (non-threshold) anomaly escalates and
+// persists a signature for later dedup. Pin against ga-947: a sustained DB
+// failure must still be surfaced promptly on its first cycle.
+func TestReaperErrorAnomalyEmitsOnFirstFailureAndRecordsSignature(t *testing.T) {
+	cityDir := t.TempDir()
+	binDir := t.TempDir()
+	stateDir := t.TempDir()
+	doltLog := filepath.Join(t.TempDir(), "dolt-args.log")
+	gcLog := filepath.Join(t.TempDir(), "gc.log")
+
+	writeExecutable(t, filepath.Join(binDir, "dolt"), reaperErrorDoltStub())
+	writeExecutable(t, filepath.Join(binDir, "gc"), `#!/bin/sh
+printf '%s\n' "$*" >> "$GC_CALL_LOG"
+exit 0
+`)
+
+	scriptPath := filepath.Join(exampleDir(), "packs", "maintenance", "assets", "scripts", "reaper.sh")
+	env := reaperAlertBaseEnv(cityDir, binDir, doltLog, gcLog, stateDir)
+	runScript(t, scriptPath, env)
+
+	gcLogText := reaperReadFile(t, gcLog)
+	if !strings.Contains(gcLogText, "mail send mayor/ -s ESCALATION: Reaper anomalies detected [MEDIUM]") {
+		t.Fatalf("reaper did not escalate the first error anomaly:\n%s", gcLogText)
+	}
+	if !strings.Contains(gcLogText, "schema-safe stale wisp count failed") {
+		t.Fatalf("escalation body lost the error context:\n%s", gcLogText)
+	}
+
+	statePath := filepath.Join(stateDir, "reaper-error-state.txt")
+	stateText := reaperReadFile(t, statePath)
+	if !strings.Contains(stateText, "sig=") {
+		t.Fatalf("reaper did not persist an error-anomaly signature:\n%s", stateText)
+	}
+}
+
+// TestReaperErrorAnomalyDedupSuppressesIdenticalFailureWithinWindow is the core
+// ga-947 fix: a second cycle that records the byte-identical error within the
+// dedup window must NOT re-mail. Without this, a multi-hour DB outage floods
+// the operator with one identical [MEDIUM] every reaper interval.
+func TestReaperErrorAnomalyDedupSuppressesIdenticalFailureWithinWindow(t *testing.T) {
+	cityDir := t.TempDir()
+	binDir := t.TempDir()
+	stateDir := t.TempDir()
+	doltLog := filepath.Join(t.TempDir(), "dolt-args.log")
+	gcLog1 := filepath.Join(t.TempDir(), "gc1.log")
+	gcLog2 := filepath.Join(t.TempDir(), "gc2.log")
+
+	writeExecutable(t, filepath.Join(binDir, "dolt"), reaperErrorDoltStub())
+	writeExecutable(t, filepath.Join(binDir, "gc"), `#!/bin/sh
+printf '%s\n' "$*" >> "$GC_CALL_LOG"
+exit 0
+`)
+	scriptPath := filepath.Join(exampleDir(), "packs", "maintenance", "assets", "scripts", "reaper.sh")
+
+	env := reaperAlertBaseEnv(cityDir, binDir, doltLog, gcLog1, stateDir)
+	runScript(t, scriptPath, env)
+	if !strings.Contains(reaperReadFile(t, gcLog1), "mail send mayor/ -s ESCALATION") {
+		t.Fatalf("first run did not escalate:\n%s", reaperReadFile(t, gcLog1))
+	}
+
+	// Second run, identical error, within the (default 3600s) window.
+	env["GC_CALL_LOG"] = gcLog2
+	runScript(t, scriptPath, env)
+	if strings.Contains(reaperReadFile(t, gcLog2), "mail send mayor/ -s ESCALATION") {
+		t.Fatalf("reaper re-escalated an identical error within the dedup window:\n%s", reaperReadFile(t, gcLog2))
+	}
+}
+
+// TestReaperErrorAnomalyDedupReEmitsOnChangedSignature verifies that a
+// different error (new signature) re-escalates immediately even inside the
+// dedup window — operators must see a failure that changed shape.
+func TestReaperErrorAnomalyDedupReEmitsOnChangedSignature(t *testing.T) {
+	cityDir := t.TempDir()
+	binDir := t.TempDir()
+	stateDir := t.TempDir()
+	doltLog := filepath.Join(t.TempDir(), "dolt-args.log")
+	gcLog1 := filepath.Join(t.TempDir(), "gc1.log")
+	gcLog2 := filepath.Join(t.TempDir(), "gc2.log")
+
+	writeExecutable(t, filepath.Join(binDir, "dolt"), reaperErrorDoltStub())
+	writeExecutable(t, filepath.Join(binDir, "gc"), `#!/bin/sh
+printf '%s\n' "$*" >> "$GC_CALL_LOG"
+exit 0
+`)
+	scriptPath := filepath.Join(exampleDir(), "packs", "maintenance", "assets", "scripts", "reaper.sh")
+
+	env := reaperAlertBaseEnv(cityDir, binDir, doltLog, gcLog1, stateDir)
+	env["REAPER_TEST_ERROR"] = "column depends_on_id could not be found"
+	runScript(t, scriptPath, env)
+	if !strings.Contains(reaperReadFile(t, gcLog1), "mail send mayor/ -s ESCALATION") {
+		t.Fatalf("first run did not escalate:\n%s", reaperReadFile(t, gcLog1))
+	}
+
+	// Second run, different error text within the window -> signature changed.
+	env["GC_CALL_LOG"] = gcLog2
+	env["REAPER_TEST_ERROR"] = "connection refused by dolt server"
+	runScript(t, scriptPath, env)
+	if !strings.Contains(reaperReadFile(t, gcLog2), "mail send mayor/ -s ESCALATION") {
+		t.Fatalf("reaper suppressed a changed error signature within the window:\n%s", reaperReadFile(t, gcLog2))
+	}
+}
+
+// TestReaperErrorAnomalyDedupReEmitsAfterWindow verifies that the identical
+// error re-escalates once the dedup window has elapsed, providing a periodic
+// "still broken" heartbeat during a long outage rather than going silent
+// forever.
+func TestReaperErrorAnomalyDedupReEmitsAfterWindow(t *testing.T) {
+	cityDir := t.TempDir()
+	binDir := t.TempDir()
+	stateDir := t.TempDir()
+	doltLog := filepath.Join(t.TempDir(), "dolt-args.log")
+	gcLog1 := filepath.Join(t.TempDir(), "gc1.log")
+	gcLog2 := filepath.Join(t.TempDir(), "gc2.log")
+
+	writeExecutable(t, filepath.Join(binDir, "dolt"), reaperErrorDoltStub())
+	writeExecutable(t, filepath.Join(binDir, "gc"), `#!/bin/sh
+printf '%s\n' "$*" >> "$GC_CALL_LOG"
+exit 0
+`)
+	scriptPath := filepath.Join(exampleDir(), "packs", "maintenance", "assets", "scripts", "reaper.sh")
+
+	env := reaperAlertBaseEnv(cityDir, binDir, doltLog, gcLog1, stateDir)
+	env["GC_REAPER_ERROR_DEDUP_WINDOW_SEC"] = "1"
+	runScript(t, scriptPath, env)
+	if !strings.Contains(reaperReadFile(t, gcLog1), "mail send mayor/ -s ESCALATION") {
+		t.Fatalf("first run did not escalate:\n%s", reaperReadFile(t, gcLog1))
+	}
+
+	// Backdate the persisted epoch beyond the 1s window, preserving the
+	// signature, so the second run sees an expired window for the same error.
+	statePath := filepath.Join(stateDir, "reaper-error-state.txt")
+	state := reaperReadFile(t, statePath)
+	var sig string
+	for _, line := range strings.Split(state, "\n") {
+		if strings.HasPrefix(line, "sig=") {
+			sig = strings.TrimPrefix(line, "sig=")
+		}
+	}
+	if sig == "" {
+		t.Fatalf("first run did not record a signature:\n%s", state)
+	}
+	oldEpoch := time.Now().Add(-10 * time.Second).Unix()
+	newState := fmt.Sprintf("epoch=%d\nsig=%s\n", oldEpoch, sig)
+	if err := os.WriteFile(statePath, []byte(newState), 0o644); err != nil {
+		t.Fatalf("WriteFile(state): %v", err)
+	}
+
+	env["GC_CALL_LOG"] = gcLog2
+	runScript(t, scriptPath, env)
+	if !strings.Contains(reaperReadFile(t, gcLog2), "mail send mayor/ -s ESCALATION") {
+		t.Fatalf("reaper did not re-escalate the identical error after the window expired:\n%s", reaperReadFile(t, gcLog2))
 	}
 }
 

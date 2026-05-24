@@ -28,6 +28,14 @@ ALERT_DEDUP_WINDOW_SEC="${GC_REAPER_ALERT_DEDUP_WINDOW_SEC:-3600}"
 ALERT_DEDUP_DELTA="${GC_REAPER_ALERT_DEDUP_DELTA:-10}"
 PACK_STATE_DIR="${GC_PACK_STATE_DIR:-${GC_CITY_RUNTIME_DIR:-$CITY/.gc/runtime}/packs/maintenance}"
 ALERT_STATE_FILE="$PACK_STATE_DIR/reaper-alert-state.txt"
+# Error dedup: a sustained DB failure (e.g. a broken rig DB) re-records the
+# same error anomaly every cycle. Without dedup that floods the operator with
+# one identical [MEDIUM] per reaper interval for the whole outage (ga-947).
+# Emit once per ERROR_DEDUP_WINDOW_SEC for a given error signature; a changed
+# or cleared signature re-emits immediately, and the window gives a periodic
+# "still broken" heartbeat so a long outage is not silenced forever.
+ERROR_DEDUP_WINDOW_SEC="${GC_REAPER_ERROR_DEDUP_WINDOW_SEC:-3600}"
+ERROR_STATE_FILE="$PACK_STATE_DIR/reaper-error-state.txt"
 DRY_RUN="${GC_REAPER_DRY_RUN:-}"
 
 # Convert Go durations to SQL INTERVAL hours for Dolt.
@@ -127,12 +135,16 @@ TOTAL_STALE_ISSUES_SKIPPED=0
 TOTAL_SESSIONS_PRUNED=0
 SESSION_PRUNE_ATTEMPTED=0
 ANOMALIES=""
+# ERROR_ANOMALIES accumulates only the non-threshold (error) anomalies — the
+# subset that feeds the error-signature dedup. Threshold lines are appended to
+# ANOMALIES directly and are deduped separately by open-wisp count.
+ERROR_ANOMALIES=""
 
-# Track which kind(s) of anomaly fired this run so the report stage can
-# decide whether dedup applies (threshold-only) or must be bypassed
-# (non-threshold anomalies always escalate). MAX_OPEN_WISPS holds the
+# Track which kind(s) of anomaly fired this run so the report stage can apply
+# the right dedup: threshold anomalies dedup on open-wisp count, error
+# (non-threshold) anomalies dedup on their signature. MAX_OPEN_WISPS holds the
 # largest open-wisp count seen across databases this run; it feeds the
-# dedup delta comparison.
+# threshold dedup delta comparison.
 THRESHOLD_ANOMALY_RECORDED=0
 NONTHRESHOLD_ANOMALY_RECORDED=0
 MAX_OPEN_WISPS=0
@@ -146,16 +158,18 @@ record_anomaly() {
     shift
     ANOMALIES="${ANOMALIES}$db: $*
 "
+    ERROR_ANOMALIES="${ERROR_ANOMALIES}$db: $*
+"
     NONTHRESHOLD_ANOMALY_RECORDED=1
 }
 
-# reaper_alert_should_emit decides whether a threshold-only escalation is
-# allowed to leave the script. It is consulted only when no non-threshold
-# anomaly was recorded; non-threshold paths (commit failures, missing city
-# DB, etc.) bypass dedup unconditionally. Returns success (emit) when there
-# is no prior state, the state is unparseable, the dedup window has expired,
-# or the open-wisp count has moved by at least ALERT_DEDUP_DELTA. Returns
-# failure (skip) only when a fresh prior emit had a close-enough count.
+# reaper_alert_should_emit decides whether the threshold (open-wisp count)
+# component of an escalation is allowed to leave the script. It governs only
+# the threshold class; error (non-threshold) anomalies are deduped separately
+# by reaper_error_should_emit. Returns success (emit) when there is no prior
+# state, the state is unparseable, the dedup window has expired, or the
+# open-wisp count has moved by at least ALERT_DEDUP_DELTA. Returns failure
+# (skip) only when a fresh prior emit had a close-enough count.
 reaper_alert_should_emit() {
     local current_max="$1"
     [ -f "$ALERT_STATE_FILE" ] || return 0
@@ -198,6 +212,72 @@ reaper_alert_save_state() {
     now=$(date +%s 2>/dev/null || echo 0)
     case "$now" in ''|*[!0-9]*) return 0 ;; esac
     printf 'epoch=%d\ncount=%d\n' "$now" "$current_max" > "$ALERT_STATE_FILE" 2>/dev/null || true
+}
+
+# reaper_error_signature derives a stable, single-line fingerprint of the
+# accumulated error-anomaly text so repeated identical failures can be deduped.
+# The exact algorithm is irrelevant — only that identical input yields the same
+# fingerprint and different input differs. Prefer a real hash; fall back to a
+# newline-stripped prefix when no hash tool is on PATH.
+reaper_error_signature() {
+    local text="$1"
+    if command -v sha256sum >/dev/null 2>&1; then
+        printf '%s' "$text" | sha256sum | cut -d' ' -f1
+    elif command -v shasum >/dev/null 2>&1; then
+        printf '%s' "$text" | shasum -a 256 | cut -d' ' -f1
+    elif command -v cksum >/dev/null 2>&1; then
+        printf '%s' "$text" | cksum | tr ' ' '_'
+    else
+        printf '%s' "$text" | tr '\n' ' ' | cut -c1-160
+    fi
+}
+
+# reaper_error_should_emit decides whether the current set of error
+# (non-threshold) anomalies should escalate. Emit when there is no prior
+# state, the state is unparseable, the error signature changed (a new or
+# different failure), or the dedup window has expired. Suppress only when an
+# identical signature was emitted within ERROR_DEDUP_WINDOW_SEC — that is the
+# sustained-outage flood case this dedup exists to silence (ga-947).
+reaper_error_should_emit() {
+    local current_sig="$1"
+    [ -f "$ERROR_STATE_FILE" ] || return 0
+
+    local last_epoch=""
+    local last_sig=""
+    local key value
+    while IFS='=' read -r key value; do
+        case "$key" in
+            epoch) last_epoch="$value" ;;
+            sig) last_sig="$value" ;;
+        esac
+    done < "$ERROR_STATE_FILE"
+
+    case "$last_epoch" in ''|*[!0-9]*) return 0 ;; esac
+    [ -n "$last_sig" ] || return 0
+    [ "$current_sig" = "$last_sig" ] || return 0
+
+    local now age
+    now=$(date +%s 2>/dev/null || echo 0)
+    case "$now" in ''|*[!0-9]*) return 0 ;; esac
+    age=$((now - last_epoch))
+    [ "$age" -lt 0 ] && age=0
+
+    if [ "$age" -lt "$ERROR_DEDUP_WINDOW_SEC" ]; then
+        return 1
+    fi
+    return 0
+}
+
+# reaper_error_save_state persists the most recent error-anomaly signature and
+# timestamp so future runs can dedup. Best-effort, mirroring
+# reaper_alert_save_state: a write failure does not fail the reaper run.
+reaper_error_save_state() {
+    local current_sig="$1"
+    mkdir -p "$PACK_STATE_DIR" 2>/dev/null || return 0
+    local now
+    now=$(date +%s 2>/dev/null || echo 0)
+    case "$now" in ''|*[!0-9]*) return 0 ;; esac
+    printf 'epoch=%d\nsig=%s\n' "$now" "$current_sig" > "$ERROR_STATE_FILE" 2>/dev/null || true
 }
 
 CITY_DB_ANOMALY_RECORDED=0
@@ -600,22 +680,43 @@ if [ "$HAD_DATABASES" -eq 0 ] && [ "$SESSION_PRUNE_ATTEMPTED" -eq 0 ]; then
     exit 0
 fi
 
-# Report.
+# Report. The two anomaly classes dedup independently, then the combined
+# report is mailed if EITHER class wants out. Threshold anomalies dedup on the
+# open-wisp count (reaper_alert_should_emit); error anomalies dedup on a
+# signature of their text (reaper_error_should_emit) so a sustained DB failure
+# that re-records the same error every cycle mails once per window instead of
+# every cycle (ga-947). A changed or cleared error signature re-emits at once.
 if [ -n "$ANOMALIES" ]; then
-    SHOULD_EMIT=1
-    # Threshold-only escalations dedup against the persisted state file.
-    # Any non-threshold anomaly always emits — operators need to see those
-    # promptly even if a recent threshold mail is still on file.
-    if [ "$NONTHRESHOLD_ANOMALY_RECORDED" -eq 0 ] && [ "$THRESHOLD_ANOMALY_RECORDED" -eq 1 ]; then
-        if ! reaper_alert_should_emit "$MAX_OPEN_WISPS"; then
-            SHOULD_EMIT=0
+    EMIT_THRESHOLD=0
+    EMIT_ERROR=0
+    ERROR_SIG=""
+
+    if [ "$THRESHOLD_ANOMALY_RECORDED" -eq 1 ]; then
+        if reaper_alert_should_emit "$MAX_OPEN_WISPS"; then
+            EMIT_THRESHOLD=1
         fi
     fi
-    if [ "$SHOULD_EMIT" -eq 1 ]; then
+
+    if [ "$NONTHRESHOLD_ANOMALY_RECORDED" -eq 1 ]; then
+        ERROR_SIG=$(reaper_error_signature "$ERROR_ANOMALIES")
+        if reaper_error_should_emit "$ERROR_SIG"; then
+            EMIT_ERROR=1
+        fi
+    fi
+
+    if [ "$EMIT_THRESHOLD" -eq 1 ] || [ "$EMIT_ERROR" -eq 1 ]; then
         gc mail send mayor/ -s "ESCALATION: Reaper anomalies detected [MEDIUM]" \
             -m "$ANOMALIES" 2>/dev/null || true
+        # Refresh dedup state for every class present in this emitted report,
+        # not just the class that triggered it: the operator has now seen both,
+        # so restart both windows. Otherwise an error-driven emit would leave
+        # the threshold window stale (and vice versa) and the next cycle would
+        # re-mail the un-refreshed class immediately.
         if [ "$THRESHOLD_ANOMALY_RECORDED" -eq 1 ]; then
             reaper_alert_save_state "$MAX_OPEN_WISPS"
+        fi
+        if [ "$NONTHRESHOLD_ANOMALY_RECORDED" -eq 1 ]; then
+            reaper_error_save_state "$ERROR_SIG"
         fi
     fi
 fi

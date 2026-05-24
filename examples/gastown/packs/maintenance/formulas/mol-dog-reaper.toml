@@ -78,14 +78,18 @@ The Dog should watch for and flag:
 - Dolt commit failures except benign no-op races where another process already
   committed the counted change
 
-Threshold escalations are deduped against a persisted state file:
-`$GC_PACK_STATE_DIR/reaper-alert-state.txt` (or
-`$GC_CITY_RUNTIME_DIR/packs/maintenance/...` when unset). A threshold-only
+Escalations are deduped against persisted state files in
+`$GC_PACK_STATE_DIR` (or `$GC_CITY_RUNTIME_DIR/packs/maintenance/...` when
+unset). Threshold escalations use `reaper-alert-state.txt`: a threshold-only
 mail is suppressed when the previous emit was within
 `GC_REAPER_ALERT_DEDUP_WINDOW_SEC` (default 3600) and the open-wisp count
-has not moved by `GC_REAPER_ALERT_DEDUP_DELTA` (default 10). Non-threshold
-anomalies (commit failures, missing city DB, etc.) always escalate so the
-operator does not lose those signals.
+has not moved by `GC_REAPER_ALERT_DEDUP_DELTA` (default 10). Error anomalies
+(commit failures, query failures, missing city DB, etc.) use
+`reaper-error-state.txt`: they escalate on first occurrence, then a
+byte-identical error is suppressed for `GC_REAPER_ERROR_DEDUP_WINDOW_SEC`
+(default 3600) so a sustained DB outage does not re-mail every cycle — a
+changed or cleared error signature re-escalates immediately, and the window
+provides a periodic "still broken" heartbeat.
 
 Read each step's description before acting — Config values override defaults."""
 formula = "mol-dog-reaper"
