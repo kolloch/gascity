@@ -1711,6 +1711,126 @@ exit 0
 	}
 }
 
+// TestReaperSQLAdaptsToSplitDependencySchema verifies the reaper detects the
+// bd-1.0.4 dependencies schema — where the single depends_on_id column was
+// split into depends_on_issue_id / depends_on_wisp_id / depends_on_external —
+// and builds its parent-child queries with the split columns. Before the
+// gastownhall/gascity ga-hu0 fix the reaper hardcoded depends_on_id, so every
+// dependency query on a bd-1.0.4 rig (the be rig) failed with "column
+// depends_on_id could not be found" and flooded the operator with [MEDIUM]
+// escalations.
+func TestReaperSQLAdaptsToSplitDependencySchema(t *testing.T) {
+	cityDir := t.TempDir()
+	binDir := t.TempDir()
+	doltLog := filepath.Join(t.TempDir(), "dolt-args.log")
+	gcLog := filepath.Join(t.TempDir(), "gc.log")
+
+	writeMaintenanceDoltStub(t, filepath.Join(binDir, "dolt"))
+	writeExecutable(t, filepath.Join(binDir, "gc"), `#!/bin/sh
+printf '%s\n' "$*" >> "$GC_CALL_LOG"
+exit 0
+`)
+
+	env := map[string]string{
+		"DOLT_ARGS_LOG":         doltLog,
+		"GC_CALL_LOG":           gcLog,
+		"DOLT_DBS":              "beads",
+		"DOLT_DBS_SPLIT_SCHEMA": "beads",
+		"GC_CITY":               cityDir,
+		"GC_CITY_PATH":          cityDir,
+		"GC_DOLT_HOST":          "127.0.0.1",
+		"GC_DOLT_PORT":          "3307",
+		"GC_DOLT_USER":          "root",
+		"GC_DOLT_PASSWORD":      "",
+		"DOLT_PURGE_COUNT":      "1",
+		"PATH":                  binDir + string(os.PathListSeparator) + os.Getenv("PATH"),
+	}
+
+	runScript(t, filepath.Join(exampleDir(), "packs", "maintenance", "assets", "scripts", "reaper.sh"), env)
+
+	logData, err := os.ReadFile(doltLog)
+	if err != nil {
+		t.Fatalf("ReadFile(dolt log): %v", err)
+	}
+	log := string(logData)
+
+	// The reaper must probe the dependencies schema before building queries.
+	if !strings.Contains(log, "SHOW COLUMNS FROM `beads`.dependencies") {
+		t.Errorf("reaper did not probe the dependencies column schema:\n%s", log)
+	}
+	// On the split schema, wisp parents are joined via depends_on_wisp_id and
+	// issue parents via depends_on_issue_id.
+	if !strings.Contains(log, "depends_on_wisp_id") {
+		t.Errorf("reaper did not use depends_on_wisp_id on the bd-1.0.4 split schema:\n%s", log)
+	}
+	if !strings.Contains(log, "depends_on_issue_id") {
+		t.Errorf("reaper did not use depends_on_issue_id on the bd-1.0.4 split schema:\n%s", log)
+	}
+	// The bare legacy column must not appear: it does not exist in the bd-1.0.4
+	// schema and querying it is exactly the failure ga-hu0 fixes. Neither
+	// depends_on_issue_id nor depends_on_wisp_id contains the substring
+	// "depends_on_id", so this catches only the legacy column.
+	if strings.Contains(log, "depends_on_id") {
+		t.Errorf("reaper still references the legacy depends_on_id column on the split schema:\n%s", log)
+	}
+}
+
+// TestReaperHandlesMixedDependencySchemasAcrossDatabases verifies per-database
+// schema detection. In one sweep the reaper may meet legacy-schema rigs (single
+// depends_on_id) and bd-1.0.4 rigs (split columns) on the same Dolt server;
+// each database's queries must use that database's own column set, so the
+// detection cannot leak one database's schema into the next.
+func TestReaperHandlesMixedDependencySchemasAcrossDatabases(t *testing.T) {
+	cityDir := t.TempDir()
+	binDir := t.TempDir()
+	doltLog := filepath.Join(t.TempDir(), "dolt-args.log")
+	gcLog := filepath.Join(t.TempDir(), "gc.log")
+
+	writeMaintenanceDoltStub(t, filepath.Join(binDir, "dolt"))
+	writeExecutable(t, filepath.Join(binDir, "gc"), `#!/bin/sh
+printf '%s\n' "$*" >> "$GC_CALL_LOG"
+exit 0
+`)
+
+	env := map[string]string{
+		"DOLT_ARGS_LOG":         doltLog,
+		"GC_CALL_LOG":           gcLog,
+		"DOLT_DBS":              "oldrig newrig",
+		"DOLT_DBS_SPLIT_SCHEMA": "newrig",
+		"GC_CITY":               cityDir,
+		"GC_CITY_PATH":          cityDir,
+		"GC_DOLT_HOST":          "127.0.0.1",
+		"GC_DOLT_PORT":          "3307",
+		"GC_DOLT_USER":          "root",
+		"GC_DOLT_PASSWORD":      "",
+		"DOLT_PURGE_COUNT":      "1",
+		"PATH":                  binDir + string(os.PathListSeparator) + os.Getenv("PATH"),
+	}
+
+	runScript(t, filepath.Join(exampleDir(), "packs", "maintenance", "assets", "scripts", "reaper.sh"), env)
+
+	logData, err := os.ReadFile(doltLog)
+	if err != nil {
+		t.Fatalf("ReadFile(dolt log): %v", err)
+	}
+	log := string(logData)
+
+	// The split-schema rig (newrig) contributes the bd-1.0.4 columns.
+	if !strings.Contains(log, "depends_on_wisp_id") {
+		t.Errorf("reaper did not use depends_on_wisp_id for the split-schema database:\n%s", log)
+	}
+	if !strings.Contains(log, "depends_on_issue_id") {
+		t.Errorf("reaper did not use depends_on_issue_id for the split-schema database:\n%s", log)
+	}
+	// The legacy rig (oldrig) still uses the single depends_on_id column. Since
+	// the split columns never contain the substring "depends_on_id", its
+	// presence proves the legacy database retained the legacy column rather
+	// than the detection leaking newrig's schema across databases.
+	if !strings.Contains(log, "depends_on_id") {
+		t.Errorf("reaper did not use legacy depends_on_id for the legacy-schema database:\n%s", log)
+	}
+}
+
 func TestReaperPrunesClosedSessionBeadsWithBdPrune(t *testing.T) {
 	cityDir := t.TempDir()
 	if resolved, err := filepath.EvalSymlinks(cityDir); err == nil {
@@ -4462,6 +4582,28 @@ case "$*" in
     esac
   done
   printf 'wisps\n'
+  ;;
+*"SHOW COLUMNS FROM"*"dependencies"*)
+  # Dependency-target column schema (gastownhall/gascity ga-hu0). bd <1.0.4
+  # used a single depends_on_id column; bd 1.0.4 split it into
+  # depends_on_issue_id / depends_on_wisp_id / depends_on_external. Default to
+  # the legacy single-column schema so existing tests are unaffected; tests set
+  # DOLT_DBS_SPLIT_SCHEMA to a space-separated list of DB names whose
+  # dependencies table reports the bd-1.0.4 split columns.
+  printf 'Field,Type,Null,Key,Default,Extra\n'
+  printf 'issue_id,varchar(255),NO,MUL,,\n'
+  printf 'type,varchar(32),NO,MUL,blocks,\n'
+  for split in ${DOLT_DBS_SPLIT_SCHEMA:-}; do
+    case "$*" in
+    *"FROM"*"$split"*"dependencies"*)
+      printf 'depends_on_issue_id,varchar(255),YES,MUL,,\n'
+      printf 'depends_on_wisp_id,varchar(255),YES,MUL,,\n'
+      printf 'depends_on_external,varchar(255),YES,MUL,,\n'
+      exit 0
+      ;;
+    esac
+  done
+  printf 'depends_on_id,varchar(255),NO,PRI,,\n'
   ;;
 *"SELECT *"*)
   printf '{"id":"ga-1","title":"sample"}\n'

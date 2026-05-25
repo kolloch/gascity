@@ -448,6 +448,32 @@ SELECT ROW_COUNT();
     return 0
 }
 
+# detect_dependency_columns inspects $1's `dependencies` table and sets
+# DEP_WISP_COL / DEP_ISSUE_COL to the columns that hold, respectively, a
+# wisp-typed and an issue-typed parent-child dependency target. bd <1.0.4
+# stored every dependency target in one `depends_on_id` column; bd 1.0.4 split
+# it into `depends_on_issue_id` / `depends_on_wisp_id` / `depends_on_external`.
+# The reaper sweeps every bead store on one Dolt server and those stores may
+# sit on different bd schema versions, so the column set is resolved per
+# database. Defaults to the legacy single column; a probe failure leaves that
+# default so the queries below fail loudly through the normal error path
+# instead of silently skipping cleanup.
+DEP_WISP_COL="depends_on_id"
+DEP_ISSUE_COL="depends_on_id"
+detect_dependency_columns() {
+    local db="$1"
+    local columns
+    DEP_WISP_COL="depends_on_id"
+    DEP_ISSUE_COL="depends_on_id"
+    if ! columns=$(dolt_sql -r csv -q "SHOW COLUMNS FROM \`$db\`.dependencies" 2>/dev/null); then
+        return 0
+    fi
+    if [[ $'\n'"$columns" == *$'\n'"depends_on_issue_id,"* ]]; then
+        DEP_ISSUE_COL="depends_on_issue_id"
+        DEP_WISP_COL="depends_on_wisp_id"
+    fi
+}
+
 while IFS= read -r DB; do
     [ -z "$DB" ] && continue
     if ! valid_database_identifier "$DB"; then
@@ -460,6 +486,10 @@ while IFS= read -r DB; do
         # server into noise. See gastownhall/gascity#1816.
         continue
     fi
+
+    # Resolve the dependency-target column names for this database's bd schema
+    # before building the parent-child queries below.
+    detect_dependency_columns "$DB"
 
     DB_MUTATIONS=0
 
@@ -486,8 +516,8 @@ while IFS= read -r DB; do
             INNER JOIN \`$DB\`.dependencies d
                 ON d.issue_id = w.id
                 AND d.type = 'parent-child'
-            LEFT JOIN \`$DB\`.wisps parent_wisp ON d.depends_on_id = parent_wisp.id
-            LEFT JOIN \`$DB\`.issues parent_issue ON d.depends_on_id = parent_issue.id
+            LEFT JOIN \`$DB\`.wisps parent_wisp ON d.$DEP_WISP_COL = parent_wisp.id
+            LEFT JOIN \`$DB\`.issues parent_issue ON d.$DEP_ISSUE_COL = parent_issue.id
             WHERE w.status IN ('open', 'hooked', 'in_progress')
             AND w.created_at < DATE_SUB(NOW(), INTERVAL $MAX_AGE_H HOUR)
             AND (
@@ -510,8 +540,8 @@ while IFS= read -r DB; do
                     INNER JOIN \`$DB\`.dependencies d
                         ON d.issue_id = w.id
                         AND d.type = 'parent-child'
-                    LEFT JOIN \`$DB\`.wisps parent_wisp ON d.depends_on_id = parent_wisp.id
-                    LEFT JOIN \`$DB\`.issues parent_issue ON d.depends_on_id = parent_issue.id
+                    LEFT JOIN \`$DB\`.wisps parent_wisp ON d.$DEP_WISP_COL = parent_wisp.id
+                    LEFT JOIN \`$DB\`.issues parent_issue ON d.$DEP_ISSUE_COL = parent_issue.id
                     WHERE w.status IN ('open', 'hooked', 'in_progress')
                     AND w.created_at < DATE_SUB(NOW(), INTERVAL $MAX_AGE_H HOUR)
                     AND (
@@ -540,10 +570,10 @@ while IFS= read -r DB; do
         WHERE status = 'closed'
         AND closed_at < DATE_SUB(NOW(), INTERVAL $PURGE_AGE_H HOUR)
         AND id NOT IN (
-            SELECT DISTINCT d.depends_on_id FROM \`$DB\`.dependencies d
+            SELECT DISTINCT d.$DEP_WISP_COL FROM \`$DB\`.dependencies d
             INNER JOIN \`$DB\`.wisps child_wisp ON d.issue_id = child_wisp.id
             WHERE d.type = 'parent-child'
-            AND d.depends_on_id IS NOT NULL
+            AND d.$DEP_WISP_COL IS NOT NULL
             AND child_wisp.status IN ('open', 'hooked', 'in_progress')
         )
     "
@@ -555,10 +585,10 @@ while IFS= read -r DB; do
             WHERE status = 'closed'
             AND closed_at < DATE_SUB(NOW(), INTERVAL $PURGE_AGE_H HOUR)
             AND id NOT IN (
-                SELECT DISTINCT d.depends_on_id FROM \`$DB\`.dependencies d
+                SELECT DISTINCT d.$DEP_WISP_COL FROM \`$DB\`.dependencies d
                 INNER JOIN \`$DB\`.wisps child_wisp ON d.issue_id = child_wisp.id
                 WHERE d.type = 'parent-child'
-                AND d.depends_on_id IS NOT NULL
+                AND d.$DEP_WISP_COL IS NOT NULL
                 AND child_wisp.status IN ('open', 'hooked', 'in_progress')
             )
         "; then
@@ -579,10 +609,10 @@ while IFS= read -r DB; do
         AND issue_type != 'epic'
         AND id NOT IN (
             SELECT DISTINCT d.issue_id FROM \`$DB\`.dependencies d
-            INNER JOIN \`$DB\`.issues i ON d.depends_on_id = i.id
+            INNER JOIN \`$DB\`.issues i ON d.$DEP_ISSUE_COL = i.id
             WHERE i.status IN ('open', 'in_progress')
             UNION
-            SELECT DISTINCT d.depends_on_id FROM \`$DB\`.dependencies d
+            SELECT DISTINCT d.$DEP_ISSUE_COL FROM \`$DB\`.dependencies d
             INNER JOIN \`$DB\`.issues i ON d.issue_id = i.id
             WHERE i.status IN ('open', 'in_progress')
         )
