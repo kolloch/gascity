@@ -357,7 +357,7 @@ func doMailCheckTarget(mp mail.Provider, target resolvedMailTarget, inject bool,
 }
 
 func doMailCheckTargetWithFormat(mp mail.Provider, target resolvedMailTarget, inject bool, hookFormat string, stdout, stderr io.Writer) int {
-	messages, err := collectMailMessages(mp.Check, target.recipients)
+	messages, err := collectUnreadMail(mp, mp.Check, target.recipients)
 	if err != nil {
 		if inject {
 			fmt.Fprintf(stderr, "gc mail check: %v\n", err) //nolint:errcheck // best-effort stderr
@@ -989,13 +989,19 @@ func collectMailMessages(fetch func(string) ([]mail.Message, error), recipients 
 	for _, id := range order {
 		result = append(result, seen[id])
 	}
-	sort.Slice(result, func(i, j int) bool {
-		if result[i].CreatedAt.Equal(result[j].CreatedAt) {
-			return result[i].ID < result[j].ID
-		}
-		return result[i].CreatedAt.Before(result[j].CreatedAt)
-	})
+	sortMailMessages(result)
 	return result, nil
+}
+
+// sortMailMessages orders messages oldest-first with an ID tie-break — the
+// stable order shared by every mail listing path.
+func sortMailMessages(messages []mail.Message) {
+	sort.Slice(messages, func(i, j int) bool {
+		if messages[i].CreatedAt.Equal(messages[j].CreatedAt) {
+			return messages[i].ID < messages[j].ID
+		}
+		return messages[i].CreatedAt.Before(messages[j].CreatedAt)
+	})
 }
 
 func collectMailCounts(count func(string) (int, int, error), recipients []string) (int, int, error) {
@@ -1014,6 +1020,31 @@ func collectMailCounts(count func(string) (int, int, error), recipients []string
 
 type multiRecipientMailCounter interface {
 	CountRecipients([]string) (int, int, error)
+}
+
+// multiRecipientMailFetcher is implemented by providers that can return the
+// unread messages for several recipient routes in one batched, deduplicated
+// query. The inbox/check paths prefer it over looping fetch per recipient,
+// which re-derives routes and re-queries the store for every address of what
+// is usually a single session (ga-a60).
+type multiRecipientMailFetcher interface {
+	InboxRecipients([]string) ([]mail.Message, error)
+}
+
+// collectUnreadMail returns the deduplicated, sorted unread messages for the
+// target recipients. Providers implementing multiRecipientMailFetcher serve all
+// recipient routes in a single batched query; others fall back to the
+// per-recipient fetch. Both paths yield the same sorted, deduplicated result.
+func collectUnreadMail(mp mail.Provider, fetch func(string) ([]mail.Message, error), recipients []string) ([]mail.Message, error) {
+	if fetcher, ok := mp.(multiRecipientMailFetcher); ok {
+		messages, err := fetcher.InboxRecipients(recipients)
+		if err != nil {
+			return nil, err
+		}
+		sortMailMessages(messages)
+		return messages, nil
+	}
+	return collectMailMessages(fetch, recipients)
 }
 
 func newMailSendCmd(stdout, stderr io.Writer) *cobra.Command {
@@ -1543,7 +1574,7 @@ func doMailInboxTarget(mp mail.Provider, target resolvedMailTarget, stdout, stde
 }
 
 func doMailInboxTargetWithJSON(mp mail.Provider, target resolvedMailTarget, jsonOut bool, stdout, stderr io.Writer) int {
-	messages, err := collectMailMessages(mp.Inbox, target.recipients)
+	messages, err := collectUnreadMail(mp, mp.Inbox, target.recipients)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc mail inbox: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1

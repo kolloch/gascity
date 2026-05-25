@@ -531,6 +531,51 @@ func (p *Provider) filterMessages(recipient string, includeRead bool) ([]mail.Me
 	return msgs, nil
 }
 
+// InboxRecipients returns the deduplicated set of unread messages addressed to
+// any of the recipient routes represented by recipients. It is the inbox
+// analog of [Provider.CountRecipients]: the union of recipient routes is
+// computed once and the message-candidate scan runs once, instead of
+// re-deriving routes and re-querying per recipient. Because every backing-store
+// query is a bd subprocess round-trip, collapsing the per-recipient repetition
+// is a proportional latency win on the town-wide mail-check path (ga-a60).
+//
+// The result is equivalent to the deduplicated union of Inbox(r) over each
+// recipient r, since a message matches some recipient's routes exactly when its
+// assignee is in the union of those routes.
+func (p *Provider) InboxRecipients(recipients []string) ([]mail.Message, error) {
+	return p.filterMessagesForRecipients(recipients)
+}
+
+// filterMessagesForRecipients returns open, unread message beads assigned to
+// any route in the union of the recipients' routes. It is the multi-recipient
+// analog of [Provider.filterMessages] and shares its open+unread filter. An
+// empty recipient set returns no messages rather than falling through to a
+// global scan, matching CountRecipients.
+func (p *Provider) filterMessagesForRecipients(recipients []string) ([]mail.Message, error) {
+	if len(recipients) == 0 {
+		return nil, nil
+	}
+	routes := p.recipientRoutesForAll(recipients)
+	candidates, err := p.messageCandidatesForRoutes(routes)
+	if err != nil {
+		return nil, fmt.Errorf("beadmail: listing beads: %w", err)
+	}
+	var msgs []mail.Message
+	for _, b := range candidates {
+		if b.Status != "open" {
+			continue
+		}
+		if len(routes) > 0 && !matchesRecipientRoute(routes, b.Assignee) {
+			continue
+		}
+		if hasLabel(b.Labels, "read") {
+			continue
+		}
+		msgs = append(msgs, beadToMessage(b))
+	}
+	return msgs, nil
+}
+
 // Filter implements [mail.Filterer]. The candidate set is chosen by the most
 // selective populated filter (recipient routes > sender > label > global), and
 // every populated [mail.FilterOptions] field is then enforced post-query so the
@@ -842,8 +887,15 @@ func (p *Provider) recipientRoutesByHistoricalAlias(recipient string, routes []s
 func (p *Provider) recipientRoutesForAll(recipients []string) []string {
 	var routes []string
 	for _, recipient := range recipients {
-		recipientRoutes := p.recipientRoutes(recipient)
-		for _, route := range recipientRoutes {
+		// Sibling addresses of one session expand to the same route set, so a
+		// recipient already covered by an earlier expansion needs no fresh
+		// session lookups — skip it. Each lookup is a bd round-trip, and mail
+		// targets are routinely the alias+id+session_name of a single session
+		// (ga-a60).
+		if containsRecipientRoute(routes, recipient) {
+			continue
+		}
+		for _, route := range p.recipientRoutes(recipient) {
 			routes = appendRecipientRoute(routes, route)
 		}
 	}
