@@ -28,7 +28,6 @@ queued formula.
 |---------|---------|
 | `mol-shutdown-dance` | Interrogation protocol for stuck agents |
 | `mol-dog-jsonl` | Export beads to JSONL for backup/analysis |
-| `mol-dog-reaper` | Clean up stale sessions and processes |
 
 Additional formulas available from included packs (e.g. dolt).
 
@@ -132,4 +131,4 @@ gc session nudge {{"{{requester}}"}}/ "DOG_DONE: <target> — <outcome>"
 
 Working directory: {{ .WorkDir }}
 Mail identity: dog/{{ basename .AgentName }}
-Formulas: mol-shutdown-dance, mol-dog-jsonl, mol-dog-reaper
+Formulas: mol-shutdown-dance, mol-dog-jsonl

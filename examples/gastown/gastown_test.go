@@ -2548,9 +2548,9 @@ func TestMaintenanceFormulasExist(t *testing.T) {
 		count++
 	}
 
-	// 3 formulas: mol-shutdown-dance + mol-dog-jsonl + mol-dog-reaper
-	if count != 3 {
-		t.Errorf("found %d formula files, want 3", count)
+	// 2 formulas: mol-shutdown-dance + mol-dog-jsonl
+	if count != 2 {
+		t.Errorf("found %d formula files, want 2", count)
 	}
 }
 

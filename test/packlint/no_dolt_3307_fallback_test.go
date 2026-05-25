@@ -26,8 +26,7 @@ func TestNoDolt3307FallbackInScripts(t *testing.T) {
 	// Formula literals are owned by slice 2 (ga-nptxjv). When slice 2 lands,
 	// this list shrinks to nil and this comment is removed.
 	allowlist := map[string]struct{}{
-		filepath.Join(root, "examples", "gastown", "packs", "maintenance", "formulas", "mol-dog-jsonl.toml"):  {},
-		filepath.Join(root, "examples", "gastown", "packs", "maintenance", "formulas", "mol-dog-reaper.toml"): {},
+		filepath.Join(root, "examples", "gastown", "packs", "maintenance", "formulas", "mol-dog-jsonl.toml"): {},
 	}
 
 	// Matches GC_DOLT_PORT.*3307 on a single line in source files. The

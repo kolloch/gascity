@@ -19,12 +19,6 @@ import (
 
 var rawDoltSQLCallRe = regexp.MustCompile(`(?m)(^|[^A-Za-z0-9_-])dolt(?:[ \t]+|[ \t]*\\[ \t]*\r?\n[ \t]*)+sql([ \t]|$)`)
 
-var (
-	sqlFenceRe            = regexp.MustCompile("(?s)```sql\\s*\\n(.*?)```")
-	mailTableRe           = regexp.MustCompile(`(?i)(?:FROM|UPDATE|INTO|JOIN|DELETE\s+FROM)\s+(?:\x60?[\w-]+\x60?\.)?\x60?mail\x60?\b`)
-	rawDurationIntervalRe = regexp.MustCompile(`(?i)\bINTERVAL\s+\{\{(?:max_age|purge_age|stale_issue_age)\}\}`)
-)
-
 func TestMaintenanceCheckBinariesTreatsGhAsOptional(t *testing.T) {
 	binDir := t.TempDir()
 	bashPath, err := exec.LookPath("bash")
@@ -1545,38 +1539,6 @@ exit 0
 				}
 			}
 		})
-	}
-}
-
-func TestReaperFormulaSQLReflectsCurrentSchema(t *testing.T) {
-	path := filepath.Join(exampleDir(), "packs", "maintenance", "formulas", "mol-dog-reaper.toml")
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("ReadFile(%s): %v", path, err)
-	}
-
-	// Extract every ```sql ... ``` fence body and scan only those — prose
-	// warnings about the deprecated patterns are intentional and must not
-	// trip this guard.
-	matches := sqlFenceRe.FindAllSubmatch(data, -1)
-	if len(matches) == 0 {
-		t.Fatalf("no ```sql fences found in %s; test is no-op", filepath.Base(path))
-	}
-
-	for i, m := range matches {
-		fence := string(m[1])
-		if strings.Contains(fence, "parent_id") {
-			t.Errorf("formula sql fence %d references parent_id (column does not exist in wisps):\n%s", i, fence)
-		}
-		if strings.Contains(fence, "LEFT JOIN wisps parent ON") {
-			t.Errorf("formula sql fence %d still has the broken parent self-join:\n%s", i, fence)
-		}
-		if mailTableRe.MatchString(fence) {
-			t.Errorf("formula sql fence %d treats `mail` as a SQL table; mail messages are beads with Type=message:\n%s", i, fence)
-		}
-		if rawDurationIntervalRe.MatchString(fence) {
-			t.Errorf("formula sql fence %d uses raw Go duration values in SQL INTERVAL; reaper.sh normalizes durations to integer hours:\n%s", i, fence)
-		}
 	}
 }
 
@@ -3985,56 +3947,6 @@ exit 0
 	if !strings.Contains(reaperReadFile(t, gcLog2), "mail send mayor/ -s ESCALATION") {
 		t.Fatalf("reaper did not re-escalate the identical error after the window expired:\n%s", reaperReadFile(t, gcLog2))
 	}
-}
-
-func TestReaperFormulaMatchesScriptDefaults(t *testing.T) {
-	scriptPath := filepath.Join(exampleDir(), "packs", "maintenance", "assets", "scripts", "reaper.sh")
-	scriptData, err := os.ReadFile(scriptPath)
-	if err != nil {
-		t.Fatalf("ReadFile(%s): %v", scriptPath, err)
-	}
-	formulaPath := filepath.Join(exampleDir(), "packs", "maintenance", "formulas", "mol-dog-reaper.toml")
-	formulaData, err := os.ReadFile(formulaPath)
-	if err != nil {
-		t.Fatalf("ReadFile(%s): %v", formulaPath, err)
-	}
-
-	script := string(scriptData)
-	formula := string(formulaData)
-	for _, check := range []struct {
-		scriptEnv string
-		formVar   string
-	}{
-		{scriptEnv: "GC_REAPER_MAX_AGE", formVar: "max_age"},
-		{scriptEnv: "GC_REAPER_PURGE_AGE", formVar: "purge_age"},
-		{scriptEnv: "GC_REAPER_STALE_ISSUE_AGE", formVar: "stale_issue_age"},
-	} {
-		scriptDefault := extractShellDefault(t, script, check.scriptEnv)
-		formulaDefault := extractFormulaDefault(t, formula, check.formVar)
-		if scriptDefault != formulaDefault {
-			t.Errorf("%s default mismatch: script=%q formula=%q", check.formVar, scriptDefault, formulaDefault)
-		}
-	}
-}
-
-func extractShellDefault(t *testing.T, script, envName string) string {
-	t.Helper()
-	re := regexp.MustCompile(envName + `:-([^}"]+)`)
-	m := re.FindStringSubmatch(script)
-	if len(m) != 2 {
-		t.Fatalf("default for %s not found in script", envName)
-	}
-	return m[1]
-}
-
-func extractFormulaDefault(t *testing.T, formula, varName string) string {
-	t.Helper()
-	re := regexp.MustCompile(`(?s)\[vars\.` + regexp.QuoteMeta(varName) + `\].*?default = "([^"]+)"`)
-	m := re.FindStringSubmatch(formula)
-	if len(m) != 2 {
-		t.Fatalf("default for %s not found in formula", varName)
-	}
-	return m[1]
 }
 
 func listenManagedDoltPort(t *testing.T) net.Listener {
