@@ -19,6 +19,103 @@ func (s *listCountingStore) List(q beads.ListQuery) ([]beads.Bead, error) {
 	return s.Store.List(q)
 }
 
+type getCountingStore struct {
+	beads.Store
+	getCalls int
+}
+
+func (s *getCountingStore) Get(id string) (beads.Bead, error) {
+	s.getCalls++
+	return s.Store.Get(id)
+}
+
+func TestResolveSessionBead_DirectLookupReturnsBeadWithoutExtraGet(t *testing.T) {
+	mem := beads.NewMemStore()
+	created, _ := mem.Create(beads.Bead{
+		Type:     session.BeadType,
+		Labels:   []string{session.LabelSession},
+		Metadata: map[string]string{"alias": "sky"},
+	})
+	store := &getCountingStore{Store: mem}
+
+	bead, id, err := session.ResolveSessionBead(store, created.ID)
+	if err != nil {
+		t.Fatalf("ResolveSessionBead: %v", err)
+	}
+	if id != created.ID {
+		t.Fatalf("id = %q, want %q", id, created.ID)
+	}
+	if bead.ID != created.ID {
+		t.Fatalf("bead.ID = %q, want %q", bead.ID, created.ID)
+	}
+	if bead.Metadata["alias"] != "sky" {
+		t.Fatalf("bead.Metadata[alias] = %q, want sky", bead.Metadata["alias"])
+	}
+	// Exact-ID resolution must load the bead exactly once and thread it out;
+	// callers needing the bead must not have to issue a second Get.
+	if store.getCalls != 1 {
+		t.Fatalf("store.Get called %d times, want 1", store.getCalls)
+	}
+}
+
+func TestResolveSessionBead_AliasReturnsMatchedBeadFromList(t *testing.T) {
+	mem := beads.NewMemStore()
+	created, _ := mem.Create(beads.Bead{
+		Type:     session.BeadType,
+		Labels:   []string{session.LabelSession},
+		Metadata: map[string]string{"alias": "overseer"},
+	})
+	store := &getCountingStore{Store: mem}
+
+	bead, id, err := session.ResolveSessionBead(store, "overseer")
+	if err != nil {
+		t.Fatalf("ResolveSessionBead: %v", err)
+	}
+	if id != created.ID || bead.ID != created.ID {
+		t.Fatalf("got id=%q bead.ID=%q, want %q", id, bead.ID, created.ID)
+	}
+	if bead.Metadata["alias"] != "overseer" {
+		t.Fatalf("bead.Metadata[alias] = %q, want overseer", bead.Metadata["alias"])
+	}
+	// The matched bead is returned from the metadata List; only the initial
+	// exact-ID probe (which misses) issues a Get, and no follow-up Get fires.
+	if store.getCalls != 1 {
+		t.Fatalf("store.Get called %d times, want 1", store.getCalls)
+	}
+}
+
+func TestResolveSessionBead_ReturnsRepairedEmptyTypeBead(t *testing.T) {
+	mem := beads.NewMemStore()
+	created, _ := mem.Create(beads.Bead{
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+	})
+	emptyType := ""
+	if err := mem.Update(created.ID, beads.UpdateOpts{Type: &emptyType}); err != nil {
+		t.Fatal(err)
+	}
+
+	bead, id, err := session.ResolveSessionBead(mem, created.ID)
+	if err != nil {
+		t.Fatalf("ResolveSessionBead: %v", err)
+	}
+	if id != created.ID {
+		t.Fatalf("id = %q, want %q", id, created.ID)
+	}
+	if bead.Type != session.BeadType {
+		t.Fatalf("returned bead.Type = %q, want %q (empty type should be repaired)", bead.Type, session.BeadType)
+	}
+}
+
+func TestResolveSessionBead_NotFoundReturnsSentinel(t *testing.T) {
+	mem := beads.NewMemStore()
+
+	_, _, err := session.ResolveSessionBead(mem, "no-such-session")
+	if !errors.Is(err, session.ErrSessionNotFound) {
+		t.Fatalf("ResolveSessionBead error = %v, want ErrSessionNotFound", err)
+	}
+}
+
 func TestResolveSessionID_DirectLookup(t *testing.T) {
 	store := beads.NewMemStore()
 	b, _ := store.Create(beads.Bead{

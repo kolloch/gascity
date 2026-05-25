@@ -753,6 +753,54 @@ func TestResolveMailTargetsIncludesAliasHistoryAndSessionID(t *testing.T) {
 	}
 }
 
+// getCountingStore counts store.Get calls so tests can pin the number of
+// identity loads on the hot mail-resolution path.
+type getCountingStore struct {
+	beads.Store
+	getCalls int
+}
+
+func (s *getCountingStore) Get(id string) (beads.Bead, error) {
+	s.getCalls++
+	return s.Store.Get(id)
+}
+
+// TestResolveMailTargets_LoadsSessionBeadOnce guards ga-qq8: resolving a mail
+// target by session bead ID must load that bead exactly once. The previous
+// implementation called resolveSessionID (which Gets the bead) and then issued
+// a second store.Get for the same ID to read its mailbox addresses — doubling
+// the bd subprocess cost on every inbox/check/count/send/reply.
+func TestResolveMailTargets_LoadsSessionBeadOnce(t *testing.T) {
+	mem := beads.NewMemStore()
+	created, err := mem.Create(beads.Bead{
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"alias":         "sky",
+			"alias_history": "mayor,witness",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	store := &getCountingStore{Store: mem}
+
+	target, err := resolveMailTargets(store, created.ID)
+	if err != nil {
+		t.Fatalf("resolveMailTargets: %v", err)
+	}
+	if target.display != "sky" {
+		t.Fatalf("display = %q, want sky", target.display)
+	}
+	want := []string{"sky", created.ID, "mayor", "witness"}
+	if strings.Join(target.recipients, ",") != strings.Join(want, ",") {
+		t.Fatalf("recipients = %#v, want %#v", target.recipients, want)
+	}
+	if store.getCalls != 1 {
+		t.Fatalf("store.Get called %d times resolving a mail target by session ID, want 1", store.getCalls)
+	}
+}
+
 func TestResolveMailTargets_BareRigScopedNamedUsesUniqueLiveConfiguredNamedSession(t *testing.T) {
 	store := beads.NewMemStore()
 	b, err := store.Create(beads.Bead{

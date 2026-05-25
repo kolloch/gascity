@@ -813,7 +813,7 @@ func resolveMailTargetsCached(store beads.Store, identifier string, cache *mailI
 	if identifier == "" || identifier == "human" {
 		return resolvedMailTarget{display: "human", recipients: []string{"human"}}, nil
 	}
-	sessionID, err := resolveSessionID(store, identifier)
+	b, _, err := resolveSessionBead(store, identifier)
 	if err != nil {
 		if errors.Is(err, session.ErrSessionNotFound) {
 			if target, matched, targetErr := resolveLiveConfiguredNamedMailTargetCached(store, identifier, cache); targetErr != nil {
@@ -825,10 +825,6 @@ func resolveMailTargetsCached(store beads.Store, identifier string, cache *mailI
 				return resolvedMailTarget{display: address, recipients: []string{address}}, nil
 			}
 		}
-		return resolvedMailTarget{}, err
-	}
-	b, err := store.Get(sessionID)
-	if err != nil {
 		return resolvedMailTarget{}, err
 	}
 	addresses := sessionMailboxAddresses(b)

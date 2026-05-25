@@ -20,6 +20,13 @@ func resolveSessionID(store beads.Store, identifier string) (string, error) {
 	return session.ResolveSessionID(store, identifier)
 }
 
+// resolveSessionBead delegates to session.ResolveSessionBead, returning the
+// resolved session bead alongside its ID so callers that immediately need the
+// bead avoid a second store.Get for the same identifier.
+func resolveSessionBead(store beads.Store, identifier string) (beads.Bead, string, error) {
+	return session.ResolveSessionBead(store, identifier)
+}
+
 func resolveSessionIDAllowClosed(store beads.Store, identifier string) (string, error) {
 	return session.ResolveSessionIDAllowClosed(store, identifier)
 }
