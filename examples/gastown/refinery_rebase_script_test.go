@@ -557,3 +557,160 @@ func TestGastownPackRefineryHasNoUnsafePipesOnFailableCommands(t *testing.T) {
 		}
 	}
 }
+
+// extractRebaseScriptResolution returns the shell the rebase step uses to
+// LOCATE refinery-rebase.sh, sliced out of the formula prose. It spans the
+// opening of the fenced bash block down to (but not including) the
+// `REPORT="$(mktemp ...)"` line — i.e. the path-resolution logic plus its
+// not-found guard, without the actual script invocation. Keying the slice on
+// the stable REPORT marker (unchanged by ga-7o3) keeps the helper valid
+// across future edits to the resolution itself.
+func extractRebaseScriptResolution(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(exampleDir(),
+		"packs", "gastown", "formulas", "mol-refinery-patrol.toml")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading refinery formula: %v", err)
+	}
+	lines := strings.Split(string(data), "\n")
+	reportIdx := -1
+	for i, line := range lines {
+		if strings.HasPrefix(strings.TrimSpace(line), `REPORT="$(mktemp`) {
+			reportIdx = i
+			break
+		}
+	}
+	if reportIdx < 0 {
+		t.Fatal("could not find REPORT marker in formula; rebase resolution block moved")
+	}
+	fenceIdx := -1
+	for i := reportIdx - 1; i >= 0; i-- {
+		if strings.TrimSpace(lines[i]) == "```bash" {
+			fenceIdx = i
+			break
+		}
+	}
+	if fenceIdx < 0 {
+		t.Fatal("could not find opening bash fence before REPORT marker")
+	}
+	return strings.Join(lines[fenceIdx+1:reportIdx], "\n")
+}
+
+// TestRefineryFormulaResolvesRebaseScriptAcrossInstallLayouts executes the
+// rebase step's script-resolution shell against the install layouts a
+// refinery encounters and asserts it locates refinery-rebase.sh in each.
+//
+// The load-bearing case is "system packs only" (ga-7o3): a refinery worktree
+// that carries no nested pack while runtime/packs has not synced gastown. The
+// original resolution probed only $GC_CITY_RUNTIME_DIR/packs/gastown plus a
+// working-tree `find`, so it STOPped the first merge with "refinery-rebase.sh
+// not found". The fix adds a <city>/.gc/system/packs probe — the canonical
+// installed-pack location, always present even when runtime/packs omits
+// gastown and the worktree carries no nested pack.
+func TestRefineryFormulaResolvesRebaseScriptAcrossInstallLayouts(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash not available")
+	}
+	resolution := extractRebaseScriptResolution(t)
+	// Relative to a `packs` root, the helper always lives here.
+	relScript := filepath.Join("gastown", "assets", "scripts", "refinery-rebase.sh")
+
+	// Stub `gc` so the not-found guard's `gc runtime drain-ack` cannot reach
+	// the real CLI on the failure path (pre-fix, and defensively forever).
+	binDir := t.TempDir()
+	writeExecutable(t, filepath.Join(binDir, "gc"), "#!/bin/sh\nexit 0\n")
+
+	writeFakeScript := func(t *testing.T, packsRoot string) string {
+		t.Helper()
+		full := filepath.Join(packsRoot, relScript)
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		writeExecutable(t, full, "#!/bin/sh\nexit 0\n")
+		return full
+	}
+
+	cases := []struct {
+		name string
+		// setup builds the layout under city and returns the working
+		// directory plus the script path the resolution must select. An
+		// empty wantScript means "any path ending in relScript" (the
+		// dev-checkout `find` fallback prints a ./-relative path).
+		setup func(t *testing.T, city string) (workdir, wantScript string)
+	}{
+		{
+			name: "system packs only (worktree without nested pack)",
+			setup: func(t *testing.T, city string) (string, string) {
+				// runtime/packs exists but deliberately lacks gastown.
+				if err := os.MkdirAll(filepath.Join(city, ".gc", "runtime", "packs"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				want := writeFakeScript(t, filepath.Join(city, ".gc", "system", "packs"))
+				work := filepath.Join(city, "work")
+				if err := os.MkdirAll(work, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				return work, want
+			},
+		},
+		{
+			name: "runtime packs takes priority when present",
+			setup: func(t *testing.T, city string) (string, string) {
+				want := writeFakeScript(t, filepath.Join(city, ".gc", "runtime", "packs"))
+				writeFakeScript(t, filepath.Join(city, ".gc", "system", "packs"))
+				work := filepath.Join(city, "work")
+				if err := os.MkdirAll(work, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				return work, want
+			},
+		},
+		{
+			name: "dev-checkout fallback walks the working tree",
+			setup: func(t *testing.T, city string) (string, string) {
+				// Neither runtime/packs nor system/packs carry gastown; the
+				// only copy lives in a nested pack under the working tree.
+				work := filepath.Join(city, "checkout")
+				writeFakeScript(t, filepath.Join(work, "packs"))
+				return work, ""
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			city := t.TempDir()
+			work, want := tc.setup(t, city)
+
+			cmd := exec.Command("bash", "-c", resolution+"\nprintf '%s' \"$SCRIPT\"\n")
+			cmd.Dir = work
+			cmd.Env = mergeTestEnv(map[string]string{
+				"GC_CITY":             city,
+				"GC_CITY_PATH":        city,
+				"GC_CITY_RUNTIME_DIR": filepath.Join(city, ".gc", "runtime"),
+				"BRANCH":              "test-branch",
+				"PATH":                binDir + string(os.PathListSeparator) + os.Getenv("PATH"),
+			})
+
+			out, err := cmd.Output()
+			if err != nil {
+				stderr := ""
+				var ee *exec.ExitError
+				if errors.As(err, &ee) {
+					stderr = string(ee.Stderr)
+				}
+				t.Fatalf("resolution snippet failed to locate refinery-rebase.sh: %v\nstderr:\n%s\nsnippet:\n%s",
+					err, stderr, resolution)
+			}
+			got := strings.TrimSpace(string(out))
+			if want != "" {
+				if got != want {
+					t.Fatalf("resolved SCRIPT = %q, want %q", got, want)
+				}
+			} else if !strings.HasSuffix(got, relScript) {
+				t.Fatalf("resolved SCRIPT = %q, want suffix %q", got, relScript)
+			}
+		})
+	}
+}

@@ -191,14 +191,24 @@ codes (0 success, 3 conflict, 4 pre-rebase failure, 2 usage). If you
 need to write a wrapper for any reason, the wrapper itself MUST start
 with `set -euo pipefail`.
 
-Locate and invoke the helper from the refinery worktree. The pack is
-installed under the city runtime directory; the fallback walks the
-current working tree for the dev-checkout layout used by the gascity
-SDK.
+Locate and invoke the helper from the refinery worktree. The pack ships
+the helper under one of several install roots, so probe them in priority
+order, then fall back to walking the current working tree for the
+dev-checkout layout used by the gascity SDK:
+1. `$GC_CITY_RUNTIME_DIR/packs/gastown` — the synced runtime pack, when present.
+2. `<city>/.gc/system/packs/gastown` — the canonical installed pack. This is
+   always present, including when a refinery worktree carries no nested pack
+   and runtime/packs has not synced gastown (the original `find .`-only
+   fallback failed exactly there — ga-7o3).
 ```bash
-PACK_DIR="${GC_CITY_RUNTIME_DIR:-${GC_CITY:-${GC_CITY_PATH:-.}}/.gc/runtime}/packs/gastown"
-SCRIPT="$PACK_DIR/assets/scripts/refinery-rebase.sh"
-if [ ! -x "$SCRIPT" ]; then
+CITY_DIR="${GC_CITY:-${GC_CITY_PATH:-.}}"
+SCRIPT=""
+for cand in \
+  "${GC_CITY_RUNTIME_DIR:-$CITY_DIR/.gc/runtime}/packs/gastown/assets/scripts/refinery-rebase.sh" \
+  "$CITY_DIR/.gc/system/packs/gastown/assets/scripts/refinery-rebase.sh"; do
+  if [ -x "$cand" ]; then SCRIPT="$cand"; break; fi
+done
+if [ -z "$SCRIPT" ]; then
   SCRIPT="$(find . -path '*/packs/gastown/assets/scripts/refinery-rebase.sh' -type f -perm -u+x -print -quit 2>/dev/null)"
 fi
 if [ -z "$SCRIPT" ] || [ ! -x "$SCRIPT" ]; then
