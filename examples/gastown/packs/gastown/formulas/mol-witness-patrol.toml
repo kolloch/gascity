@@ -58,7 +58,7 @@ the worktree. This makes the work schedulable again.
 
 Read each step's description before acting — Config values override defaults."""
 formula = "mol-witness-patrol"
-version = 12
+version = 13
 
 [vars]
 [vars.binding_prefix]
@@ -70,8 +70,47 @@ description = "Seconds to sleep before re-checking. Replaces former event-watch 
 default = "60"
 
 [[steps]]
+id = "validate-identity"
+title = "Validate canonical agent identity"
+description = """
+**Fail fast if `$GC_AGENT` is not set.**
+
+The witness uses `$GC_AGENT` (not `$GC_ALIAS`) as its canonical mailbox
+identity and as the assignee filter when it pours and claims its patrol
+wisp. The session harness
+(`internal/session/lifecycle.go:RuntimeEnvWithSessionContext`) guarantees
+`$GC_AGENT` is populated for every live session — it falls back to the
+session name when the alias is empty. `$GC_ALIAS` can legitimately be
+empty, which is how a refinery once self-polled for 13h42m with seven
+queued beads while looking healthy-idle (upstream #1833). An empty
+identity here would make the witness's wisp pour/claim resolve to an empty
+filter and silently return no results while looking healthy-idle — the
+exact failure the refinery guard prevents. This guard mirrors the
+refinery's for parity; the harness already guarantees `$GC_AGENT`, so it
+is belt-and-suspenders that should never fire.
+
+Verify at startup:
+```bash
+if [ -z "${GC_AGENT:-}" ]; then
+    echo "GC_AGENT is empty — session harness did not inject the canonical identity."
+    echo "Refusing to self-poll with an empty filter; escalate before proceeding."
+    gc mail send mayor/ -s "ESCALATION: witness started with empty GC_AGENT [HIGH]" \\
+        -m "Session has no canonical agent identity. Investigate session harness."
+    gc runtime drain-ack
+    exit 1
+fi
+```
+
+This fail-fast startup guard is the one exception to the "never exit the
+wisp from an intermediate step" rule below: it runs before any patrol work
+and only triggers on a fatal misconfiguration the harness guarantees will
+not occur. Close this step only when `$GC_AGENT` is confirmed non-empty,
+then continue to `check-inbox`."""
+
+[[steps]]
 id = "check-inbox"
 title = "Context check, then mail"
+needs = ["validate-identity"]
 description = """
 **1. Context check (FIRST — before any work):**
 ```bash

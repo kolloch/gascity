@@ -2669,6 +2669,63 @@ func TestRefineryFormulaValidatesAgentIdentityAtStartup(t *testing.T) {
 	}
 }
 
+// TestDeaconWitnessFormulasValidateAgentIdentityAtStartup verifies the
+// deacon and witness patrol formulas fail fast when $GC_AGENT is unset or
+// empty, mirroring the refinery's startup guard
+// (TestRefineryFormulaValidatesAgentIdentityAtStartup). Without it, an empty
+// canonical identity would make their patrol-wisp pour/claim resolve to an
+// empty filter and silently return no results while looking healthy-idle —
+// the same failure mode that let a refinery self-poll for 13h42m (upstream
+// #1833). The harness guarantees $GC_AGENT (internal/session/lifecycle.go),
+// so this is belt-and-suspenders parity hardening (ga-f26; refs ga-pip, ga-66k).
+func TestDeaconWitnessFormulasValidateAgentIdentityAtStartup(t *testing.T) {
+	dir := exampleDir()
+
+	for _, p := range []struct {
+		role           string
+		formula        string
+		wantEscalation string
+	}{
+		{role: "deacon", formula: "mol-deacon-patrol.toml", wantEscalation: `ESCALATION: deacon started with empty GC_AGENT [HIGH]`},
+		{role: "witness", formula: "mol-witness-patrol.toml", wantEscalation: `ESCALATION: witness started with empty GC_AGENT [HIGH]`},
+	} {
+		t.Run(p.role, func(t *testing.T) {
+			path := filepath.Join(dir, "packs", "gastown", "formulas", p.formula)
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatalf("reading %s formula: %v", p.role, err)
+			}
+			body := string(data)
+
+			// The same fail-fast guard strings asserted for the refinery,
+			// plus the role-specific escalation subject.
+			for _, want := range []string{
+				`if [ -z "${GC_AGENT:-}" ]; then`,
+				`GC_AGENT is empty`,
+				`gc runtime drain-ack`,
+				p.wantEscalation,
+			} {
+				if !strings.Contains(body, want) {
+					t.Errorf("%s formula missing $GC_AGENT startup validation %q", p.role, want)
+				}
+			}
+
+			// The guard lives in a dedicated startup step that check-inbox
+			// depends on, so it runs before any patrol work.
+			if !strings.Contains(body, `id = "validate-identity"`) {
+				t.Errorf("%s formula missing validate-identity startup step", p.role)
+			}
+			if !strings.Contains(body, `needs = ["validate-identity"]`) {
+				t.Errorf("%s formula check-inbox step must depend on validate-identity", p.role)
+			}
+			assertContainsInOrder(t, body,
+				`id = "validate-identity"`,
+				`id = "check-inbox"`,
+			)
+		})
+	}
+}
+
 // TestGastownRefineryPouredWispsClaimInProgress verifies that every wisp
 // pour-then-assign site claims the wisp as in_progress, not merely assigns
 // it. A poured wisp is status=open and type=null; the find-work query
@@ -2755,8 +2812,8 @@ func TestGastownDeaconWitnessPouredWispsClaimInProgress(t *testing.T) {
 		promptDir       string
 		wantVersionLine string
 	}{
-		{role: "deacon", formula: "mol-deacon-patrol.toml", promptDir: "deacon", wantVersionLine: "version = 16\n"},
-		{role: "witness", formula: "mol-witness-patrol.toml", promptDir: "witness", wantVersionLine: "version = 12\n"},
+		{role: "deacon", formula: "mol-deacon-patrol.toml", promptDir: "deacon", wantVersionLine: "version = 17\n"},
+		{role: "witness", formula: "mol-witness-patrol.toml", promptDir: "witness", wantVersionLine: "version = 13\n"},
 	}
 
 	for _, p := range patrols {
