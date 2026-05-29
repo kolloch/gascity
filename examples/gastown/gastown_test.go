@@ -2755,8 +2755,8 @@ func TestGastownDeaconWitnessPouredWispsClaimInProgress(t *testing.T) {
 		promptDir       string
 		wantVersionLine string
 	}{
-		{role: "deacon", formula: "mol-deacon-patrol.toml", promptDir: "deacon", wantVersionLine: "version = 15\n"},
-		{role: "witness", formula: "mol-witness-patrol.toml", promptDir: "witness", wantVersionLine: "version = 11\n"},
+		{role: "deacon", formula: "mol-deacon-patrol.toml", promptDir: "deacon", wantVersionLine: "version = 16\n"},
+		{role: "witness", formula: "mol-witness-patrol.toml", promptDir: "witness", wantVersionLine: "version = 12\n"},
 	}
 
 	for _, p := range patrols {
@@ -2800,16 +2800,62 @@ func TestGastownDeaconWitnessPouredWispsClaimInProgress(t *testing.T) {
 			}
 			promptBody := string(prompt)
 
-			// The prompt bootstraps the first wisp the same way, but via $GC_ALIAS.
-			// Without --status=in_progress the resume check at the top of the
-			// prompt (`gc bd list --assignee="$GC_ALIAS" --status=in_progress`)
-			// never finds the wisp it just poured, so a restart pours a duplicate.
-			const promptBootstrap = `gc bd update "$NEW_WISP" --assignee="$GC_ALIAS" --status=in_progress`
+			// The prompt bootstraps the first wisp the same way, via $GC_AGENT
+			// (see TestDeaconWitnessPromptsUseCanonicalAgentIdentity for the
+			// identity rationale). Without --status=in_progress the resume check
+			// at the top of the prompt (`gc bd list --assignee="$GC_AGENT"
+			// --status=in_progress`) never finds the wisp it just poured, so a
+			// restart pours a duplicate.
+			const promptBootstrap = `gc bd update "$NEW_WISP" --assignee="$GC_AGENT" --status=in_progress`
 			if !strings.Contains(promptBody, promptBootstrap) {
 				t.Errorf("%s prompt bootstrap missing in_progress claim: %q", p.role, promptBootstrap)
 			}
-			if strings.Contains(promptBody, `gc bd update "$NEW_WISP" --assignee="$GC_ALIAS"`+"\n") {
+			if strings.Contains(promptBody, `gc bd update "$NEW_WISP" --assignee="$GC_AGENT"`+"\n") {
 				t.Errorf("%s prompt bootstrap leaves the first wisp status=open (missing --status=in_progress)", p.role)
+			}
+		})
+	}
+}
+
+// TestDeaconWitnessPromptsUseCanonicalAgentIdentity verifies the deacon and
+// witness prompt bootstraps look up and pour their patrol wisp via $GC_AGENT,
+// the harness-guaranteed identity (internal/session/lifecycle.go falls back to
+// the session name when no alias is set). $GC_ALIAS can be empty or stale;
+// using it would check/assign the wrong mailbox (upstream #1833, the same root
+// cause fixed for the refinery in ga-66k). It also keeps the prompt consistent
+// with the patrol formulas, which already pour next-iteration wisps under
+// $GC_AGENT — a mismatch would make the restart resume-check miss them and pour
+// a duplicate. Mirrors TestRefineryPromptUsesCanonicalAgentIdentity.
+func TestDeaconWitnessPromptsUseCanonicalAgentIdentity(t *testing.T) {
+	dir := exampleDir()
+
+	for _, p := range []struct {
+		role      string
+		promptDir string
+	}{
+		{role: "deacon", promptDir: "deacon"},
+		{role: "witness", promptDir: "witness"},
+	} {
+		t.Run(p.role, func(t *testing.T) {
+			data, err := os.ReadFile(filepath.Join(dir, "packs", "gastown", "agents", p.promptDir, "prompt.template.md"))
+			if err != nil {
+				t.Fatalf("reading %s prompt: %v", p.role, err)
+			}
+			body := string(data)
+
+			for _, want := range []string{
+				`gc bd list --assignee="$GC_AGENT" --status=in_progress`,
+				`gc bd update "$NEW_WISP" --assignee="$GC_AGENT" --status=in_progress`,
+			} {
+				if !strings.Contains(body, want) {
+					t.Errorf("%s prompt missing canonical $GC_AGENT usage %q", p.role, want)
+				}
+			}
+
+			// The prompt must NOT rely on $GC_ALIAS for its own identity — it can
+			// be empty/stale; the harness-guaranteed identity is $GC_AGENT.
+			if strings.Contains(body, `--assignee="$GC_ALIAS"`) {
+				t.Errorf("%s prompt still uses $GC_ALIAS for its own identity; switch to $GC_AGENT", p.role)
 			}
 		})
 	}

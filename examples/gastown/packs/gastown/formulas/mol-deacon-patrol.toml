@@ -46,7 +46,7 @@ between patrol cycles.
 
 Read each step's description before acting — Config values override defaults."""
 formula = "mol-deacon-patrol"
-version = 15
+version = 16
 
 [vars]
 [vars.binding_prefix]

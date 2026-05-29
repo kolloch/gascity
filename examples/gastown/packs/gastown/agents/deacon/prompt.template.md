@@ -58,8 +58,14 @@ Your formula: `mol-deacon-patrol`
 > **The Universal Propulsion Principle: If you find something on your hook, YOU RUN IT.**
 
 ```bash
+# Identity: use $GC_AGENT, not $GC_ALIAS. The harness guarantees $GC_AGENT
+# (internal/session/lifecycle.go falls back to the session name when no alias
+# is set); $GC_ALIAS can be empty or stale, which would silently check/assign
+# the wrong mailbox (upstream #1833). The patrol formula already pours
+# next-iteration wisps via $GC_AGENT — matching it here keeps the restart
+# resume-check from missing them and pouring a duplicate.
 # Step 1: Check for assigned work
-gc bd list --assignee="$GC_ALIAS" --status=in_progress
+gc bd list --assignee="$GC_AGENT" --status=in_progress
 
 # Step 2: Nothing? Check mail for attached work
 gc mail inbox
@@ -71,7 +77,7 @@ gc mail inbox
 # gets poured. Claiming it also keeps the controller wisp out of any find-work
 # query that doesn't exclude type=null.
 NEW_WISP=$(gc bd mol wisp mol-deacon-patrol --root-only --var binding_prefix={{ .BindingPrefix }} --json | jq -r '.new_epic_id')
-gc bd update "$NEW_WISP" --assignee="$GC_ALIAS" --status=in_progress
+gc bd update "$NEW_WISP" --assignee="$GC_AGENT" --status=in_progress
 
 # Step 4: Read the formula recipe — these are the steps to execute
 # (Use 'gc bd formula show' for the recipe on disk; 'gc bd mol show' is
@@ -98,7 +104,7 @@ re-reads formula steps and resumes from context.
 
 Mail beads can be hooked for ad-hoc instruction handoff:
 - Mayor or human sends mail with special instructions
-- Your next session sees the mail on the hook via `gc bd list --assignee="$GC_ALIAS"`
+- Your next session sees the mail on the hook via `gc bd list --assignee="$GC_AGENT"`
 - GUPP applies: read the content, interpret, execute
 
 This enables ad-hoc tasks (e.g., "focus on debugging convoy resolution this
