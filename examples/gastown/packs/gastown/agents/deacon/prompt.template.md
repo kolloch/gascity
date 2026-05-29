@@ -65,8 +65,13 @@ gc bd list --assignee="$GC_ALIAS" --status=in_progress
 gc mail inbox
 
 # Step 3: Still nothing? Create patrol wisp (root-only — no child step beads)
+# and claim it in_progress, not merely assign it: a poured wisp is
+# status=open/type=null, so without the claim the resume check above
+# (--status=in_progress) won't find it after a restart and a duplicate wisp
+# gets poured. Claiming it also keeps the controller wisp out of any find-work
+# query that doesn't exclude type=null.
 NEW_WISP=$(gc bd mol wisp mol-deacon-patrol --root-only --var binding_prefix={{ .BindingPrefix }} --json | jq -r '.new_epic_id')
-gc bd update "$NEW_WISP" --assignee="$GC_ALIAS"
+gc bd update "$NEW_WISP" --assignee="$GC_ALIAS" --status=in_progress
 
 # Step 4: Read the formula recipe — these are the steps to execute
 # (Use 'gc bd formula show' for the recipe on disk; 'gc bd mol show' is

@@ -2735,3 +2735,82 @@ func TestGastownRefineryPouredWispsClaimInProgress(t *testing.T) {
 		t.Errorf("refinery prompt bootstrap leaves the first wisp status=open (missing --status=in_progress)")
 	}
 }
+
+// TestGastownDeaconWitnessPouredWispsClaimInProgress verifies that every wisp
+// pour-then-assign site in the deacon and witness patrol formulas and their
+// agent prompts claims the wisp as in_progress, not merely assigns it. This is
+// the sibling defect to ga-66k (which fixed mol-refinery-patrol): a poured wisp
+// is status=open and type=null, and the patrol find-work query does not exclude
+// type=null, so an open controller wisp leaks into find-work while the prompt's
+// in_progress resume check never finds the wisp it just poured (a latent
+// restart-resume gap that pours duplicate wisps). Covers each formula's
+// bootstrap snippet and its single $NEXT next-iteration pour, plus each prompt's
+// first-wisp bootstrap (ga-tsh).
+func TestGastownDeaconWitnessPouredWispsClaimInProgress(t *testing.T) {
+	dir := exampleDir()
+
+	patrols := []struct {
+		role            string
+		formula         string
+		promptDir       string
+		wantVersionLine string
+	}{
+		{role: "deacon", formula: "mol-deacon-patrol.toml", promptDir: "deacon", wantVersionLine: "version = 15\n"},
+		{role: "witness", formula: "mol-witness-patrol.toml", promptDir: "witness", wantVersionLine: "version = 11\n"},
+	}
+
+	for _, p := range patrols {
+		t.Run(p.role, func(t *testing.T) {
+			formula, err := os.ReadFile(filepath.Join(dir, "packs", "gastown", "formulas", p.formula))
+			if err != nil {
+				t.Fatalf("reading %s formula: %v", p.role, err)
+			}
+			formulaBody := string(formula)
+
+			// No pour site may leave --assignee=$GC_AGENT as the trailing flag —
+			// that is the bug: an open wisp leaks into the --status=open find-work
+			// query. Both pour sites (bootstrap snippet and next-iteration) use
+			// $GC_AGENT; the other --assignee uses in these formulas are gc bd list
+			// queries with a different variable, so this guard is exact.
+			if strings.Contains(formulaBody, "--assignee=$GC_AGENT\n") {
+				t.Errorf("%s formula has a pour-then-assign site leaving the wisp status=open "+
+					"(--assignee=$GC_AGENT with no following --status=in_progress)", p.role)
+			}
+
+			// The single $NEXT next-iteration pour must claim the wisp in_progress.
+			const nextPour = `gc bd update "$NEXT" --assignee=$GC_AGENT --status=in_progress`
+			if got := strings.Count(formulaBody, nextPour); got != 1 {
+				t.Errorf("%s formula has %d in_progress $NEXT pour sites, want 1 (%q)", p.role, got, nextPour)
+			}
+
+			// The bootstrap snippet embedded in the formula description must match.
+			const bootstrapPour = `gc bd update $WISP --assignee=$GC_AGENT --status=in_progress`
+			if !strings.Contains(formulaBody, bootstrapPour) {
+				t.Errorf("%s formula description bootstrap missing in_progress claim: %q", p.role, bootstrapPour)
+			}
+
+			// The fix bumps the formula version so a re-synced city picks it up.
+			if !strings.Contains(formulaBody, p.wantVersionLine) {
+				t.Errorf("%s formula version not bumped (want %q) after the pour-site fix", p.role, p.wantVersionLine)
+			}
+
+			prompt, err := os.ReadFile(filepath.Join(dir, "packs", "gastown", "agents", p.promptDir, "prompt.template.md"))
+			if err != nil {
+				t.Fatalf("reading %s prompt: %v", p.role, err)
+			}
+			promptBody := string(prompt)
+
+			// The prompt bootstraps the first wisp the same way, but via $GC_ALIAS.
+			// Without --status=in_progress the resume check at the top of the
+			// prompt (`gc bd list --assignee="$GC_ALIAS" --status=in_progress`)
+			// never finds the wisp it just poured, so a restart pours a duplicate.
+			const promptBootstrap = `gc bd update "$NEW_WISP" --assignee="$GC_ALIAS" --status=in_progress`
+			if !strings.Contains(promptBody, promptBootstrap) {
+				t.Errorf("%s prompt bootstrap missing in_progress claim: %q", p.role, promptBootstrap)
+			}
+			if strings.Contains(promptBody, `gc bd update "$NEW_WISP" --assignee="$GC_ALIAS"`+"\n") {
+				t.Errorf("%s prompt bootstrap leaves the first wisp status=open (missing --status=in_progress)", p.role)
+			}
+		})
+	}
+}
