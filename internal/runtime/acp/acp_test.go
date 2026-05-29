@@ -719,27 +719,35 @@ func TestListRunning_FindsSessions(t *testing.T) {
 }
 
 func TestStartLongSocketPathUsesShortSocketName(t *testing.T) {
-	root, err := os.MkdirTemp("", "gc-acp-sock-")
-	if err != nil {
-		t.Fatalf("MkdirTemp: %v", err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	// Root at a short /tmp dir (not $TMPDIR). A long $TMPDIR — the agent/CI
+	// harness sets TMPDIR=/tmp/claude-1000, and macOS uses /var/folders/... —
+	// pushes every candidate past the socket limit so no depth qualifies and the
+	// search below would never find one (ga-d4t). shortTempDir sidesteps that.
+	root := shortTempDir(t)
 	const name = "control-dispatcher"
+	// macOS socket path limit is 104 bytes; Linux is 108. Use the stricter
+	// limit so the constructed short socket is valid on both.
+	const sunPathLimit = 104
 	longDir := ""
-	for i := 1; i <= 32; i++ {
-		candidate := filepath.Join(root, strings.Repeat("deep-path-", i), "acp")
+	// Grow the path one byte at a time. The legacy and hashed socket names
+	// differ in length by more than one byte, so the window of base-dir lengths
+	// where legacy > limit but the hashed short path still fits is only a few
+	// bytes wide. A coarse (multi-byte) step can straddle that window and never
+	// qualify; single-byte steps are guaranteed to land in it.
+	for i := 1; i <= 200; i++ {
+		candidate := filepath.Join(root, strings.Repeat("p", i), "acp")
 		p := NewProviderWithDir(candidate, Config{
 			HandshakeTimeout:  5 * time.Second,
 			NudgeBusyTimeout:  2 * time.Second,
 			OutputBufferLines: 100,
 		})
-		if len(p.legacySockPath(name)) > 108 && len(p.sockPath(name)) < 108 {
+		if len(p.legacySockPath(name)) > sunPathLimit && len(p.sockPath(name)) < sunPathLimit {
 			longDir = candidate
 			break
 		}
 	}
 	if longDir == "" {
-		t.Fatal("failed to construct path where legacy socket is too long but short socket fits")
+		t.Skipf("could not construct a base dir under %q where the legacy socket exceeds %d bytes but the hashed socket fits; base path too long", root, sunPathLimit)
 	}
 	if err := os.MkdirAll(longDir, 0o755); err != nil {
 		t.Fatalf("mkdir longDir: %v", err)
