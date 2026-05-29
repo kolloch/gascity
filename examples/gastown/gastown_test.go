@@ -2668,3 +2668,70 @@ func TestRefineryFormulaValidatesAgentIdentityAtStartup(t *testing.T) {
 		}
 	}
 }
+
+// TestGastownRefineryPouredWispsClaimInProgress verifies that every wisp
+// pour-then-assign site claims the wisp as in_progress, not merely assigns
+// it. A poured wisp is status=open and type=null; the find-work query
+// (`gc bd list --assignee=$GC_AGENT --status=open --exclude-type=epic`) does
+// not exclude type=null, so an open wisp leaks into find-work, where the
+// downstream steps read the absent metadata.branch and reject the patrol
+// loop's own controller wisp back to the pool. Claiming the wisp in_progress
+// at pour time keeps it out of the open-status query and closes the latent
+// restart-resume gap. Covers both the formula's four `$NEXT` pour sites plus
+// its embedded bootstrap snippet, and the refinery prompt's first-wisp
+// bootstrap (ga-66k; re-filed from dipcity di-otm).
+func TestGastownRefineryPouredWispsClaimInProgress(t *testing.T) {
+	dir := exampleDir()
+
+	formula, err := os.ReadFile(filepath.Join(dir, "packs", "gastown", "formulas", "mol-refinery-patrol.toml"))
+	if err != nil {
+		t.Fatalf("reading refinery formula: %v", err)
+	}
+	formulaBody := string(formula)
+
+	// No pour site may leave --assignee=$GC_AGENT as the trailing flag — that
+	// is the bug: an open wisp leaks into the --status=open find-work query.
+	// The find-work query (`--assignee=$GC_AGENT --status=open`) and the
+	// integration-branch convoy assignment (`--assignee=$GC_AGENT \`) both
+	// carry following content, so this guard does not catch them.
+	if strings.Contains(formulaBody, "--assignee=$GC_AGENT\n") {
+		t.Errorf("refinery formula has a pour-then-assign site leaving the wisp status=open " +
+			"(--assignee=$GC_AGENT with no following --status=in_progress)")
+	}
+
+	// All four `$NEXT` pour sites (rebase conflict, handle-failures,
+	// block_existing_pr, next-iteration) must claim the wisp in_progress.
+	const nextPour = `gc bd update "$NEXT" --assignee=$GC_AGENT --status=in_progress`
+	if got := strings.Count(formulaBody, nextPour); got != 4 {
+		t.Errorf("refinery formula has %d in_progress $NEXT pour sites, want 4 (%q)", got, nextPour)
+	}
+
+	// The bootstrap snippet embedded in the formula description must match.
+	const bootstrapPour = `gc bd update $WISP --assignee=$GC_AGENT --status=in_progress`
+	if !strings.Contains(formulaBody, bootstrapPour) {
+		t.Errorf("refinery formula description bootstrap missing in_progress claim: %q", bootstrapPour)
+	}
+
+	// The fix bumps the formula version so a re-synced city picks it up.
+	if !strings.Contains(formulaBody, "version = 5\n") {
+		t.Errorf("refinery formula version not bumped to 5 after the pour-site fix")
+	}
+
+	prompt, err := os.ReadFile(filepath.Join(dir, "packs", "gastown", "agents", "refinery", "prompt.template.md"))
+	if err != nil {
+		t.Fatalf("reading refinery prompt: %v", err)
+	}
+	promptBody := string(prompt)
+
+	// The prompt bootstraps the first wisp the same way. Without
+	// --status=in_progress the resume check at the top of the prompt
+	// (`gc bd list --assignee="$GC_AGENT" --status=in_progress`) never finds
+	// the wisp it just poured, so a restart pours a duplicate.
+	const promptBootstrap = `gc bd update "$WISP" --assignee="$GC_AGENT" --status=in_progress`
+	if !strings.Contains(promptBody, promptBootstrap) {
+		t.Errorf("refinery prompt bootstrap missing in_progress claim: %q", promptBootstrap)
+	}
+	if strings.Contains(promptBody, `gc bd update "$WISP" --assignee="$GC_AGENT"`+"\n") {
+		t.Errorf("refinery prompt bootstrap leaves the first wisp status=open (missing --status=in_progress)")
+	}
+}

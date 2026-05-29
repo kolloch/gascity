@@ -59,9 +59,13 @@ without catching the mismatch (upstream #1833).
 # Check for an in-progress patrol wisp
 gc bd list --assignee="$GC_AGENT" --status=in_progress
 
-# If none found, pour one (root-only — no child step beads) and assign it
+# If none found, pour one (root-only — no child step beads) and claim it
+# in_progress. Claiming (not merely assigning) keeps this controller wisp —
+# status=open, type=null — out of the find-work query (--status=open), which
+# would otherwise reject it for a missing metadata.branch, and lets the
+# in_progress check above resume it after a restart instead of pouring a duplicate.
 WISP=$(gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{ .DefaultBranch }} --var rig_name={{ .RigName }} --var binding_prefix={{ .BindingPrefix }} --json | jq -r '.new_epic_id')
-gc bd update "$WISP" --assignee="$GC_AGENT"
+gc bd update "$WISP" --assignee="$GC_AGENT" --status=in_progress
 ```
 
 Then follow the formula. The step descriptions below are your instructions —
