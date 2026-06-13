@@ -501,6 +501,82 @@ func TestDefaultScaleCheckCountsIgnoresOpenMoleculeContainers(t *testing.T) {
 	}
 }
 
+// TestDefaultScaleCheckCountsExcludesRoutedEpicForDefaultWorkQuery verifies a
+// parent epic routed to a pool is not counted as demand when the agent uses
+// the default work query. The default EffectiveWorkQuery skips epics
+// (--exclude-type=epic, gc-udx) because an epic has no executable spec, so
+// counting it as demand spawns a polecat that drains on an empty hook — the
+// ga-7bv respawn loop. The ga-bps back-off layer cannot catch this on its own:
+// it compares scale_check against this same claimable count, and both would
+// count the epic, so demand must be corrected at the source.
+func TestDefaultScaleCheckCountsExcludesRoutedEpicForDefaultWorkQuery(t *testing.T) {
+	backing := &readyFailStore{Store: beads.NewMemStore()}
+	if _, err := backing.Create(beads.Bead{
+		Title:  "parent epic routed to pool",
+		Type:   "epic",
+		Status: "open",
+		Metadata: map[string]string{
+			"gc.routed_to": "gascity/workflows.codex-min",
+		},
+	}); err != nil {
+		t.Fatalf("create epic bead: %v", err)
+	}
+	cache := beads.NewCachingStoreForTest(backing, nil)
+	if err := cache.PrimeActive(); err != nil {
+		t.Fatalf("PrimeActive: %v", err)
+	}
+
+	counts, _, errs := defaultScaleCheckCounts([]defaultScaleCheckTarget{{
+		template:     "gascity/workflows.codex-min",
+		storeKey:     "rig:gascity",
+		store:        cache,
+		excludeEpics: true,
+	}})
+	if len(errs) != 0 {
+		t.Fatalf("defaultScaleCheckCounts errs = %v", errs)
+	}
+	if got := counts["gascity/workflows.codex-min"]; got != 0 {
+		t.Fatalf("defaultScaleCheckCounts = %d, want 0 (routed epic must not be pool demand)", got)
+	}
+}
+
+// TestDefaultScaleCheckCountsCountsRoutedEpicForCustomWorkQuery is the converse:
+// when an agent sets an explicit work_query it owns its own type policy
+// (oversight/reviewer/closer roles legitimately claim epics), so the claimable
+// count must still surface routed epics for it (excludeEpics=false). This keeps
+// the epic exclusion scoped to default-work-query pools and prevents the
+// back-off layer from spuriously suppressing a legitimate epic-processing role.
+func TestDefaultScaleCheckCountsCountsRoutedEpicForCustomWorkQuery(t *testing.T) {
+	backing := &readyFailStore{Store: beads.NewMemStore()}
+	if _, err := backing.Create(beads.Bead{
+		Title:  "parent epic routed to closer",
+		Type:   "epic",
+		Status: "open",
+		Metadata: map[string]string{
+			"gc.routed_to": "gascity/workflows.codex-min",
+		},
+	}); err != nil {
+		t.Fatalf("create epic bead: %v", err)
+	}
+	cache := beads.NewCachingStoreForTest(backing, nil)
+	if err := cache.PrimeActive(); err != nil {
+		t.Fatalf("PrimeActive: %v", err)
+	}
+
+	counts, _, errs := defaultScaleCheckCounts([]defaultScaleCheckTarget{{
+		template:     "gascity/workflows.codex-min",
+		storeKey:     "rig:gascity",
+		store:        cache,
+		excludeEpics: false,
+	}})
+	if len(errs) != 0 {
+		t.Fatalf("defaultScaleCheckCounts errs = %v", errs)
+	}
+	if got := counts["gascity/workflows.codex-min"]; got != 1 {
+		t.Fatalf("defaultScaleCheckCounts = %d, want 1 (custom work_query keeps epic demand)", got)
+	}
+}
+
 func TestDefaultScaleCheckCountsHonorsCachedWriteThroughDependencies(t *testing.T) {
 	backing := &readyFailStore{Store: beads.NewMemStore()}
 	blocker, err := backing.Create(beads.Bead{
@@ -3737,6 +3813,73 @@ func TestBuildDesiredState_MinZeroDefaultScaleCheckRoutedWorkCreatesPoolSession(
 	}
 	if polecatSessions != 1 {
 		t.Fatalf("polecat desired sessions = %d, want 1 for min=0 routed ready work; stderr:\n%s", polecatSessions, stderr.String())
+	}
+}
+
+// TestBuildDesiredState_RoutedEpicDoesNotSpawnPoolSession is the end-to-end
+// regression guard for ga-7bv. A parent epic routed to a min=0 default-work-query
+// pool must produce zero demand and zero desired sessions: the polecat hook
+// excludes epics (gc-udx), so a spawned worker would drain on an empty hook and
+// the scaler would respawn it forever. A real task in the identical shape still
+// spawns one session, proving the gate is epic-specific and not a blanket
+// suppression of pool demand.
+func TestBuildDesiredState_RoutedEpicDoesNotSpawnPoolSession(t *testing.T) {
+	const template = "polecat"
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "test-city"},
+		Agents: []config.Agent{{
+			Name:              template,
+			StartCommand:      "true",
+			MinActiveSessions: intPtr(0),
+			MaxActiveSessions: intPtr(5),
+		}},
+	}
+
+	desiredSessions := func(t *testing.T, store beads.Store) (int, DesiredStateResult) {
+		t.Helper()
+		var stderr strings.Builder
+		dsResult := buildDesiredState("test-city", t.TempDir(), time.Now().UTC(), cfg, runtime.NewFake(), store, &stderr)
+		n := 0
+		for _, tp := range dsResult.State {
+			if tp.TemplateName == template {
+				n++
+			}
+		}
+		return n, dsResult
+	}
+
+	epicStore := beads.NewMemStore()
+	if _, err := epicStore.Create(beads.Bead{
+		Title:    "parent epic routed to pool",
+		Type:     "epic",
+		Status:   "open",
+		Metadata: map[string]string{"gc.routed_to": template},
+	}); err != nil {
+		t.Fatalf("create epic: %v", err)
+	}
+	epicSessions, epicResult := desiredSessions(t, epicStore)
+	if got := epicResult.ScaleCheckCounts[template]; got != 0 {
+		t.Fatalf("ScaleCheckCounts[%s] = %d, want 0 for a routed epic (ga-7bv)", template, got)
+	}
+	if epicSessions != 0 {
+		t.Fatalf("desired %s sessions = %d, want 0 for a routed epic (empty-hook respawn loop)", template, epicSessions)
+	}
+
+	taskStore := beads.NewMemStore()
+	if _, err := taskStore.Create(beads.Bead{
+		Title:    "real routed task",
+		Type:     "task",
+		Status:   "open",
+		Metadata: map[string]string{"gc.routed_to": template},
+	}); err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	taskSessions, taskResult := desiredSessions(t, taskStore)
+	if got := taskResult.ScaleCheckCounts[template]; got != 1 {
+		t.Fatalf("ScaleCheckCounts[%s] = %d, want 1 for a routed task", template, got)
+	}
+	if taskSessions != 1 {
+		t.Fatalf("desired %s sessions = %d, want 1 for a routed task", template, taskSessions)
 	}
 }
 

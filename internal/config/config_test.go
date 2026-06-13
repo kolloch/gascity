@@ -2287,6 +2287,55 @@ func TestEffectiveScaleCheckUsesReadyOnly(t *testing.T) {
 	}
 }
 
+// TestEffectiveScaleCheckExcludesEpicByDefault locks the demand counter to the
+// same epic exclusion EffectiveWorkQuery applies (--exclude-type=epic, gc-udx).
+// A parent epic has no executable spec, so a generic pool worker's default
+// work query skips it; counting it as demand would spawn a worker that drains
+// on an empty hook (ga-7bv). The exclusion must appear on every bd ready probe
+// in the default scale_check — both the city-scoped single probe and each of
+// the rig-scoped agent's rig + city-federation probes.
+func TestEffectiveScaleCheckExcludesEpicByDefault(t *testing.T) {
+	cityScoped := Agent{
+		Name:              "polecat",
+		MinActiveSessions: ptrInt(0), MaxActiveSessions: ptrInt(5),
+	}
+	check := cityScoped.EffectiveScaleCheck()
+	if !strings.Contains(check, "--exclude-type=epic") {
+		t.Errorf("city-scoped default scale_check must exclude epics, got %q", check)
+	}
+
+	rigScoped := Agent{
+		Name:              "polecat",
+		Dir:               "gascity",
+		MinActiveSessions: ptrInt(0), MaxActiveSessions: ptrInt(5),
+	}
+	rigCheck := rigScoped.EffectiveScaleCheck()
+	// Rig-scoped agents probe both their rig bd and (when federated) the city
+	// bd. Both bd ready invocations must carry the exclusion, otherwise a
+	// routed epic in either store re-creates the empty-hook spawn loop.
+	if got := strings.Count(rigCheck, "--exclude-type=epic"); got != 2 {
+		t.Errorf("rig-scoped default scale_check must exclude epics on both rig and city probes (got %d occurrences) in %q", got, rigCheck)
+	}
+}
+
+// TestEffectiveScaleCheckCustomWorkQueryKeepsEpics verifies the exclusion is
+// scoped to the default work query. A role that sets an explicit work_query
+// owns its own type policy (oversight/reviewer/closer roles legitimately claim
+// epics), so the default scale_check must not unilaterally hide epic demand
+// from them.
+func TestEffectiveScaleCheckCustomWorkQueryKeepsEpics(t *testing.T) {
+	a := Agent{
+		Name:              "closer",
+		Dir:               "gascity",
+		WorkQuery:         "bd ready --type=epic --json | jq 'length'",
+		MinActiveSessions: ptrInt(0), MaxActiveSessions: ptrInt(2),
+	}
+	check := a.EffectiveScaleCheck()
+	if strings.Contains(check, "--exclude-type=epic") {
+		t.Errorf("custom work_query agent must not get the default epic exclusion, got %q", check)
+	}
+}
+
 func TestIsMultiSession(t *testing.T) {
 	a := Agent{Name: "worker", MinActiveSessions: ptrInt(0), MaxActiveSessions: ptrInt(5)}
 	maxSess := a.EffectiveMaxActiveSessions()

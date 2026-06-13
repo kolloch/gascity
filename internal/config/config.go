@@ -2719,7 +2719,10 @@ func (a *Agent) DrainTimeoutDuration() time.Duration {
 // If ScaleCheck is set, returns it. Otherwise returns a default that
 // counts new unassigned work routed to this agent's template via ready().
 // Assigned in-progress work is resumed from session beads, so it must not
-// create additional generic pool demand here.
+// create additional generic pool demand here. Parent epics are excluded
+// (--exclude-type=epic) to stay symmetric with the default EffectiveWorkQuery,
+// which skips them (gc-udx) — counting an unclaimable epic as demand spawns a
+// worker that drains on an empty hook (ga-7bv).
 //
 // City-bd federation (ga-xw6): rig-scoped agents (a.Dir != "") also count
 // demand in the HQ city bd via $GC_CITY_BEADS_DIR, summing the rig and city
@@ -2731,20 +2734,32 @@ func (a *Agent) EffectiveScaleCheck() string {
 	if a.ScaleCheck != "" {
 		return a.ScaleCheck
 	}
+	// Mirror EffectiveWorkQuery's epic exclusion: a generic pool worker using
+	// the default work query skips parent epics (--exclude-type=epic, gc-udx)
+	// because an epic has no executable spec. Counting a routed epic as demand
+	// would spawn a worker that finds nothing on its hook and drains, and the
+	// scaler would respawn it on the next tick — the ga-7bv empty-hook loop. A
+	// custom work_query owns its own type policy (roles that legitimately
+	// process epics opt in there), so the exclusion is scoped to the default
+	// query just as it is in EffectiveWorkQuery.
+	excludeEpic := ""
+	if a.WorkQuery == "" {
+		excludeEpic = " --exclude-type=epic"
+	}
 	template := a.QualifiedName()
 	if a.Dir == "" {
 		return `ready_json=$(bd ready --metadata-field gc.routed_to=` + template +
-			` --unassigned --limit 0 --json) && printf '%s\n' "$ready_json" | jq 'length'`
+			` --unassigned` + excludeEpic + ` --limit 0 --json) && printf '%s\n' "$ready_json" | jq 'length'`
 	}
 	// Rig-scoped: count rig and (when GC_CITY_BEADS_DIR is set) city demand.
 	// The && chain ensures any bd or jq failure aborts before printf — empty
 	// output triggers parseScaleCheckCount's "empty output" error so a broken
 	// scope surfaces rather than masquerading as zero demand.
 	return `rig_json=$(bd ready --metadata-field gc.routed_to=` + template +
-		` --unassigned --limit 0 --json) && rig=$(printf '%s\n' "$rig_json" | jq 'length') && ` +
+		` --unassigned` + excludeEpic + ` --limit 0 --json) && rig=$(printf '%s\n' "$rig_json" | jq 'length') && ` +
 		`{ if [ -n "$GC_CITY_BEADS_DIR" ] && [ "$GC_CITY_BEADS_DIR" != "$BEADS_DIR" ]; then ` +
 		`city_json=$(BEADS_DIR="$GC_CITY_BEADS_DIR" bd ready --metadata-field gc.routed_to=` + template +
-		` --unassigned --limit 0 --json) && city=$(printf '%s\n' "$city_json" | jq 'length') && ` +
+		` --unassigned` + excludeEpic + ` --limit 0 --json) && city=$(printf '%s\n' "$city_json" | jq 'length') && ` +
 		`printf '%d\n' "$((rig + city))"; ` +
 		`else printf '%s\n' "$rig"; fi; }`
 }

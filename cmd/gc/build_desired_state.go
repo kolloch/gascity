@@ -83,6 +83,11 @@ type defaultScaleCheckTarget struct {
 	storeKey string
 	store    beads.Store
 	err      error
+	// excludeEpics drops parent epics from the count so it stays symmetric
+	// with the agent's work query. Set when the agent uses the default
+	// EffectiveWorkQuery, which excludes epics (gc-udx); a routed epic counted
+	// as demand spawns a worker that drains on an empty hook (ga-7bv).
+	excludeEpics bool
 }
 
 func evaluatePendingPools(
@@ -834,14 +839,19 @@ func defaultScaleCheckTargetsForAgent(
 ) []defaultScaleCheckTarget {
 	template := agentCfg.QualifiedName()
 	rigName := configuredRigName(cityPath, agentCfg, cfg.Rigs)
+	// Exclude epics from this count exactly when the agent's work query does
+	// (the default EffectiveWorkQuery, gc-udx). A custom work_query owns its
+	// own type policy, so leave epics countable for it.
+	excludeEpics := agentCfg.WorkQuery == ""
 
 	var targets []defaultScaleCheckTarget
 	seenStores := make(map[beads.Store]struct{})
 
 	if rigName != "" {
 		rigTarget := defaultScaleCheckTarget{
-			template: template,
-			storeKey: "rig:" + rigName,
+			template:     template,
+			storeKey:     "rig:" + rigName,
+			excludeEpics: excludeEpics,
 		}
 		if rigStores != nil {
 			if rigStore := rigStores[rigName]; rigStore != nil {
@@ -860,9 +870,10 @@ func defaultScaleCheckTargetsForAgent(
 		if _, dup := seenStores[cityStore]; !dup {
 			seenStores[cityStore] = struct{}{}
 			targets = append(targets, defaultScaleCheckTarget{
-				template: template,
-				storeKey: "city",
-				store:    cityStore,
+				template:     template,
+				storeKey:     "city",
+				store:        cityStore,
+				excludeEpics: excludeEpics,
 			})
 		}
 	}
@@ -883,9 +894,10 @@ func defaultScaleCheckTargetsForAgent(
 		}
 		seenStores[store] = struct{}{}
 		targets = append(targets, defaultScaleCheckTarget{
-			template: template,
-			storeKey: "rig:" + rig.Name,
-			store:    store,
+			template:     template,
+			storeKey:     "rig:" + rig.Name,
+			store:        store,
+			excludeEpics: excludeEpics,
 		})
 	}
 
@@ -903,6 +915,7 @@ func defaultScaleCheckCounts(targets []defaultScaleCheckTarget) (map[string]int,
 		templates map[string]struct{}
 	}
 	groups := make(map[string]*scaleStoreGroup)
+	excludeEpicForTemplate := make(map[string]bool)
 	var errs []error
 	var partialTemplates map[string]bool
 	for _, target := range targets {
@@ -911,6 +924,9 @@ func defaultScaleCheckCounts(targets []defaultScaleCheckTarget) (map[string]int,
 			continue
 		}
 		counts[template] = 0
+		if target.excludeEpics {
+			excludeEpicForTemplate[template] = true
+		}
 		if target.err != nil {
 			errs = append(errs, target.err)
 			partialTemplates = markScaleCheckPartialTemplate(partialTemplates, template)
@@ -953,6 +969,14 @@ func defaultScaleCheckCounts(targets []defaultScaleCheckTarget) (map[string]int,
 		for _, b := range ready {
 			template := strings.TrimSpace(b.Metadata["gc.routed_to"])
 			if _, ok := group.templates[template]; !ok {
+				continue
+			}
+			// Epics are parent containers with no executable spec; the default
+			// work query skips them (--exclude-type=epic, gc-udx). Counting one
+			// as pool demand spawns a worker that drains on an empty hook, and
+			// the back-off layer can't catch it because scale_check and this
+			// claimable count would agree on the epic (ga-7bv).
+			if excludeEpicForTemplate[template] && b.Type == "epic" {
 				continue
 			}
 			assignee := strings.TrimSpace(b.Assignee)
