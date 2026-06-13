@@ -408,6 +408,7 @@ func TestRenderSupervisorSystemdTemplate(t *testing.T) {
 		`KillMode=process`,
 		`Environment=GC_SUPERVISOR_PRESERVE_SESSIONS_ON_SIGNAL="1"`,
 		`ExecStart="/usr/local/bin/gc" supervisor run`,
+		`ExecStopPost=-"/usr/local/bin/gc" supervisor reap-worktree-dolts`,
 		`StandardOutput=append:/home/user/.gc/supervisor.log`,
 		`Environment=GC_HOME="/home/user/.gc"`,
 		`Environment=XDG_RUNTIME_DIR="/tmp/gc-run"`,

@@ -57,8 +57,71 @@ to add cities.`,
 		newSupervisorLogsCmd(stdout, stderr),
 		newSupervisorInstallCmd(stdout, stderr),
 		newSupervisorUninstallCmd(stdout, stderr),
+		newSupervisorReapWorktreeDoltsCmd(stdout, stderr),
 	)
 	return cmd
+}
+
+// newSupervisorReapWorktreeDoltsCmd builds `gc supervisor reap-worktree-dolts`,
+// the crash-case dolt-cleanup hook wired into the generated systemd unit's
+// ExecStopPost (cmd_supervisor_lifecycle.go: supervisorSystemdTemplate).
+//
+// The in-process toStop loop reaps worktree dolts only when the supervisor
+// shuts down through its Go signal handler; a SIGKILLed or crashed supervisor
+// bypasses it and leaves worktree dolt sql-server processes running until the
+// next start (pe-t07v, ga-enr). systemd runs ExecStopPost after the main
+// process exits regardless of how it died, so this command closes that gap by
+// enumerating the registered cities and reaping each one's worktree dolts. The
+// main managed dolt is never touched (its config lives outside the worktree
+// tree), so this is safe even when sessions are being preserved for re-adoption.
+func newSupervisorReapWorktreeDoltsCmd(stdout, stderr io.Writer) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "reap-worktree-dolts",
+		Short: "Reap worktree dolt processes for all registered cities (post-shutdown hook)",
+		Long: `Reap worktree dolt sql-server processes for every registered city.
+
+For each city in the supervisor registry, this terminates dolt sql-server
+processes whose --config lives under <city>/.gc/worktrees/ (SIGTERM, grace,
+then SIGKILL with a PID-reuse guard). The main managed dolt is never a
+candidate because its config sits outside the worktree tree.
+
+This is the same reap the supervisor runs for each city during graceful
+shutdown. It is wired into the generated systemd unit's ExecStopPost so a
+SIGKILLed or crashed supervisor — which bypasses the in-process reaper — still
+leaves zero orphaned worktree dolts.
+
+Intended to run AFTER the supervisor has stopped. It does not distinguish a
+leaked worktree dolt from one an active session is still using, so running it
+while a city is up will terminate in-use worktree dolt servers. With no
+registered cities or no worktree dolts running it is a no-op.`,
+		Args: cobra.NoArgs,
+		RunE: func(_ *cobra.Command, _ []string) error {
+			if runSupervisorReapWorktreeDolts(stdout, stderr) != 0 {
+				return errExit
+			}
+			return nil
+		},
+	}
+	return cmd
+}
+
+// runSupervisorReapWorktreeDolts enumerates the registered cities and reaps
+// each one's orphaned worktree dolt processes. A missing registry yields an
+// empty list (no error), so this is a safe no-op on a host with no cities.
+func runSupervisorReapWorktreeDolts(stdout, stderr io.Writer) int {
+	entries, err := supervisor.NewRegistry(supervisor.RegistryPath()).List()
+	if err != nil {
+		fmt.Fprintf(stderr, "gc supervisor reap-worktree-dolts: reading registry: %v\n", err) //nolint:errcheck
+		return 1
+	}
+	cityPaths := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if p := strings.TrimSpace(entry.Path); p != "" {
+			cityPaths = append(cityPaths, p)
+		}
+	}
+	reapWorktreeDoltsForCities(cityPaths, stdout, stderr)
+	return 0
 }
 
 func newSupervisorStartCmd(stdout, stderr io.Writer) *cobra.Command {

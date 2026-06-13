@@ -2,6 +2,7 @@ package main
 
 import (
 	"io"
+	"strings"
 	"syscall"
 	"testing"
 )
@@ -287,5 +288,58 @@ func TestReapCityWorktreeDolts_AlreadyGoneOnSigtermCountsReaped(t *testing.T) {
 
 	if res.Reaped != 1 {
 		t.Fatalf("a process that vanished on SIGTERM should count as reaped, got %d (errors %v)", res.Reaped, res.Errors)
+	}
+}
+
+func TestReapWorktreeDoltsForCities_IteratesEveryCityAndAggregates(t *testing.T) {
+	var seen []string
+	orig := supervisorReapCityWorktreeDolts
+	t.Cleanup(func() { supervisorReapCityWorktreeDolts = orig })
+	supervisorReapCityWorktreeDolts = func(cityPath string, _ io.Writer) worktreeDoltReapResult {
+		seen = append(seen, cityPath)
+		switch cityPath {
+		case "/home/peter/dipcity":
+			return worktreeDoltReapResult{Reaped: 2}
+		case "/tmp/city":
+			return worktreeDoltReapResult{Reaped: 1, Errors: []string{"pid 7 SIGKILL: boom"}}
+		default:
+			return worktreeDoltReapResult{}
+		}
+	}
+
+	var stdout, stderr strings.Builder
+	reaped, failures := reapWorktreeDoltsForCities([]string{"/home/peter/dipcity", "/tmp/city"}, &stdout, &stderr)
+
+	if reaped != 3 {
+		t.Fatalf("aggregate reaped = %d, want 3", reaped)
+	}
+	if failures != 1 {
+		t.Fatalf("aggregate failures = %d, want 1", failures)
+	}
+	if len(seen) != 2 || seen[0] != "/home/peter/dipcity" || seen[1] != "/tmp/city" {
+		t.Fatalf("reaped cities = %v, want [/home/peter/dipcity /tmp/city]", seen)
+	}
+	if !strings.Contains(stdout.String(), "reaped 3 worktree dolt") {
+		t.Fatalf("stdout missing aggregate summary, got %q", stdout.String())
+	}
+}
+
+func TestReapWorktreeDoltsForCities_EmptyListNeverCallsReaper(t *testing.T) {
+	orig := supervisorReapCityWorktreeDolts
+	t.Cleanup(func() { supervisorReapCityWorktreeDolts = orig })
+	called := false
+	supervisorReapCityWorktreeDolts = func(string, io.Writer) worktreeDoltReapResult {
+		called = true
+		return worktreeDoltReapResult{}
+	}
+
+	var stdout, stderr strings.Builder
+	reaped, failures := reapWorktreeDoltsForCities(nil, &stdout, &stderr)
+
+	if called {
+		t.Fatal("the per-city reaper must not be invoked for an empty city list")
+	}
+	if reaped != 0 || failures != 0 {
+		t.Fatalf("reaped=%d failures=%d, want 0/0", reaped, failures)
 	}
 }

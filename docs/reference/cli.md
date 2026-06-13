@@ -3128,6 +3128,7 @@ gc supervisor
 |------------|-------------|
 | [gc supervisor install](#gc-supervisor-install) | Install the supervisor as a platform service |
 | [gc supervisor logs](#gc-supervisor-logs) | Tail the supervisor log file |
+| [gc supervisor reap-worktree-dolts](#gc-supervisor-reap-worktree-dolts) | Reap worktree dolt processes for all registered cities (post-shutdown hook) |
 | [gc supervisor reload](#gc-supervisor-reload) | Trigger immediate reconciliation of all cities |
 | [gc supervisor run](#gc-supervisor-run) | Run the machine-wide supervisor in the foreground |
 | [gc supervisor start](#gc-supervisor-start) | Start the machine-wide supervisor in the background |
@@ -3158,6 +3159,29 @@ gc supervisor logs [flags]
 |------|------|---------|-------------|
 | `-f`, `--follow` | bool |  | follow log output |
 | `-n`, `--lines` | int | `50` | number of lines to show |
+
+## gc supervisor reap-worktree-dolts
+
+Reap worktree dolt sql-server processes for every registered city.
+
+For each city in the supervisor registry, this terminates dolt sql-server
+processes whose --config lives under &lt;city&gt;/.gc/worktrees/ (SIGTERM, grace,
+then SIGKILL with a PID-reuse guard). The main managed dolt is never a
+candidate because its config sits outside the worktree tree.
+
+This is the same reap the supervisor runs for each city during graceful
+shutdown. It is wired into the generated systemd unit's ExecStopPost so a
+SIGKILLed or crashed supervisor — which bypasses the in-process reaper — still
+leaves zero orphaned worktree dolts.
+
+Intended to run AFTER the supervisor has stopped. It does not distinguish a
+leaked worktree dolt from one an active session is still using, so running it
+while a city is up will terminate in-use worktree dolt servers. With no
+registered cities or no worktree dolts running it is a no-op.
+
+```
+gc supervisor reap-worktree-dolts
+```
 
 ## gc supervisor reload
 

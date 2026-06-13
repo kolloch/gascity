@@ -159,3 +159,35 @@ func reapCityWorktreeDolts(cityPath string, discover func() ([]DoltProcInfo, err
 	}
 	return result
 }
+
+// supervisorReapCityWorktreeDolts is the per-city reap used by the
+// reap-worktree-dolts lifecycle hook. It is indirected through a var so tests
+// can substitute a fake without walking /proc or signaling real processes.
+var supervisorReapCityWorktreeDolts = func(cityPath string, stderr io.Writer) worktreeDoltReapResult {
+	return reapCityWorktreeDolts(cityPath, nil, nil, supervisorWorktreeDoltReapGrace, stderr)
+}
+
+// reapWorktreeDoltsForCities reaps orphaned worktree dolt sql-server processes
+// for every supplied city, returning the aggregate count reaped and the number
+// of non-fatal errors. Per-city detail (and any signal failures) is written to
+// stderr by the underlying reaper; a one-line aggregate summary is written to
+// stdout so the supervisor.log records that the hook ran.
+//
+// This backs the `gc supervisor reap-worktree-dolts` command wired into the
+// generated systemd unit's ExecStopPost. systemd runs ExecStopPost after the
+// supervisor exits regardless of how it died, so this covers the crash/SIGKILL
+// case that the in-process graceful-shutdown reaper (cmd_supervisor.go toStop
+// loop) cannot reach. The main managed dolt is never a candidate — its config
+// lives outside the worktree tree — so this is safe in every shutdown path.
+func reapWorktreeDoltsForCities(cityPaths []string, stdout, stderr io.Writer) (reaped, failures int) {
+	for _, cityPath := range cityPaths {
+		res := supervisorReapCityWorktreeDolts(cityPath, stderr)
+		reaped += res.Reaped
+		failures += len(res.Errors)
+	}
+	if stdout != nil {
+		fmt.Fprintf(stdout, "gc supervisor reap-worktree-dolts: reaped %d worktree dolt sql-server process(es) across %d registered city(ies); %d error(s)\n", //nolint:errcheck
+			reaped, len(cityPaths), failures)
+	}
+	return reaped, failures
+}
