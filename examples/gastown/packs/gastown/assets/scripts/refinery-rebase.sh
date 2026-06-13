@@ -71,7 +71,15 @@ fi
 # Run the rebase with output redirected to a tempfile. Never pipe `git
 # rebase` through `tail`/`grep` — that masks rebase's non-zero exit
 # without `pipefail` and is fragile even with `pipefail`.
-if git rebase "origin/$TARGET" >>"$LOG" 2>&1; then
+#
+# --autostash: the refinery worktree may carry an uncommitted local
+# modification to a tracked file (notably `.beads/metadata.json`, whose
+# dolt-server bookkeeping the refinery rewrites on every run). Without
+# autostash, `git rebase` refuses to start on a dirty worktree and the
+# script below misreports that as a conflict. Autostash stashes the local
+# mod, rebases, and reapplies it; genuine branch/target conflicts still
+# surface as a non-zero exit (gu-spq5).
+if git rebase --autostash "origin/$TARGET" >>"$LOG" 2>&1; then
     tail -n 5 "$LOG" || true
     exit 0
 fi

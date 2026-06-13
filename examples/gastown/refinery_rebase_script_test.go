@@ -387,6 +387,69 @@ func TestRefineryRebaseScriptRecoversFromLeftoverTempBranch(t *testing.T) {
 	}
 }
 
+// TestRefineryRebaseScriptAutostashesLocalModification covers gu-spq5/ga-wp1:
+// the refinery worktree carries an uncommitted local modification to a tracked
+// file (in production, `.beads/metadata.json`, whose dolt-server bookkeeping
+// the refinery rewrites on every run). A plain `git rebase` refuses to start
+// while the working tree is dirty ("cannot rebase: you have unstaged changes"),
+// so the script mistook that for a conflict and exited 3 even though the branch
+// rebases cleanly. `git rebase --autostash` stashes the local mod, rebases, and
+// reapplies it — so a clean branch exits 0 and the local modification survives.
+// Genuine branch/target conflicts still surface (see
+// TestRefineryRebaseScriptExitsNonZeroOnConflict).
+func TestRefineryRebaseScriptAutostashesLocalModification(t *testing.T) {
+	repo := initRebaseTestRepo(t)
+
+	// Feature branch touches feature.txt only — rebases cleanly onto main.
+	gitInRepo(t, repo, "checkout", "-q", "-b", "feature")
+	if err := os.WriteFile(filepath.Join(repo, "feature.txt"), []byte("hi\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitInRepo(t, repo, "add", "feature.txt")
+	gitInRepo(t, repo, "commit", "-q", "-m", "feature work")
+	gitInRepo(t, repo, "push", "-q", "origin", "feature")
+
+	// Main advances on a non-conflicting file.
+	gitInRepo(t, repo, "checkout", "-q", "main")
+	if err := os.WriteFile(filepath.Join(repo, "main.txt"), []byte("m\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitInRepo(t, repo, "add", "main.txt")
+	gitInRepo(t, repo, "commit", "-q", "-m", "main forward")
+	gitInRepo(t, repo, "push", "-q", "origin", "main")
+
+	// Dirty the worktree with an uncommitted modification to a tracked file
+	// that is identical across main and origin/feature, so it carries into the
+	// `temp` checkout — exactly the `.beads/metadata.json` situation. Without
+	// --autostash this dirty state aborts the rebase.
+	const localMod = "local refinery bookkeeping\n"
+	if err := os.WriteFile(filepath.Join(repo, "seed.txt"), []byte(localMod), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	stderr, code := runRefineryRebase(t, repo, "feature", "main")
+	if code != 0 {
+		t.Fatalf("autostash rebase: expected clean exit 0 with a dirty worktree, got exit=%d stderr=%q", code, stderr)
+	}
+
+	// Rebased history must contain both the new main commit and the feature commit.
+	log := gitInRepo(t, repo, "log", "--format=%s", "-n", "3")
+	for _, want := range []string{"feature work", "main forward", "seed"} {
+		if !strings.Contains(log, want) {
+			t.Fatalf("rebased log missing %q:\n%s", want, log)
+		}
+	}
+
+	// --autostash must reapply the local modification, not discard it.
+	got, err := os.ReadFile(filepath.Join(repo, "seed.txt"))
+	if err != nil {
+		t.Fatalf("reading seed.txt after autostash rebase: %v", err)
+	}
+	if string(got) != localMod {
+		t.Fatalf("autostash did not restore the local modification; seed.txt=%q want %q", string(got), localMod)
+	}
+}
+
 // TestRefineryFormulaTeachesSafeRebasePattern enforces that the rebase
 // step explicitly warns against the masking-pipe anti-pattern that
 // caused ga-vnr, and points the refinery agent at the canonical script.
