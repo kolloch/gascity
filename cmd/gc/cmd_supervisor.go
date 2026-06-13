@@ -210,6 +210,12 @@ const supervisorOmitProviderCredsEnv = "GC_SUPERVISOR_OMIT_PROVIDER_CREDS"
 
 var supervisorShutdownSettleDelay = 50 * time.Millisecond
 
+// supervisorWorktreeDoltReapGrace is the SIGTERM→SIGKILL window applied when
+// reaping orphaned worktree dolt sql-server processes on shutdown. It mirrors
+// the value the operator-installed systemd drop-in used for the main dolt and
+// is only ever paid when a city actually has worktree-dolt orphans to reap.
+var supervisorWorktreeDoltReapGrace = 2 * time.Second
+
 var supervisorSignalNotify = signal.Notify
 
 func supervisorPreserveSessionsOnSignal() bool {
@@ -1060,6 +1066,17 @@ func runSupervisor(stdout, stderr io.Writer) int {
 						fmt.Fprintf(stdout, "City '%s' preserved.\n", name) //nolint:errcheck
 					} else {
 						fmt.Fprintf(stdout, "City '%s' stopped.\n", name) //nolint:errcheck
+					}
+				}
+				// Reap orphaned worktree dolt sql-server processes for this
+				// city. Worktree dolts (under <city>/.gc/worktrees/) routinely
+				// outlive the sessions that spawned them and pile up across
+				// restarts (ga-enr). This runs in both preserve and destructive
+				// modes; the main managed dolt is never a candidate because its
+				// config lives outside the worktree tree.
+				if reap := reapCityWorktreeDolts(name, nil, nil, supervisorWorktreeDoltReapGrace, stderr); len(reap.Errors) > 0 {
+					for _, e := range reap.Errors {
+						fmt.Fprintf(stderr, "gc supervisor: city '%s': worktree dolt reap: %s\n", name, e) //nolint:errcheck
 					}
 				}
 			}
