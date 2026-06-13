@@ -836,6 +836,51 @@ prefix = "mr"
 	}
 }
 
+// TestSuspendResumeAgentInlinePreservesComments is the configedit-layer
+// expression of the ga-1c2 acceptance criterion: suspending then resuming an
+// inline [[agent]] leaves city.toml byte-identical, with comments and key
+// order intact. This is the running-city/supervisor path
+// (api_state → configedit.Editor) that operators hit while the city is up.
+func TestSuspendResumeAgentInlinePreservesComments(t *testing.T) {
+	dir := t.TempDir()
+	original := `[workspace]
+name = "test-city"
+
+# the mayor coordinates globally — keep this note and key order (ga-1c2)
+[[agent]]
+name = "mayor"
+description = "overseer"
+provider = "claude"
+
+[[agent]]
+name = "scribe"
+provider = "claude"
+`
+	path := writeTOML(t, dir, original)
+	ed := configedit.NewEditor(fsys.OSFS{}, path)
+
+	if err := ed.SuspendAgent("mayor"); err != nil {
+		t.Fatalf("SuspendAgent: %v", err)
+	}
+	afterSuspend := string(mustReadFile(t, path))
+	if !strings.Contains(afterSuspend, "# the mayor coordinates globally") {
+		t.Errorf("suspend dropped the rationale comment:\n%s", afterSuspend)
+	}
+	if !strings.Contains(afterSuspend, "suspended = true") {
+		t.Errorf("suspend did not set suspended:\n%s", afterSuspend)
+	}
+	if !strings.Contains(afterSuspend, `description = "overseer"`) {
+		t.Errorf("suspend dropped/reordered the description key:\n%s", afterSuspend)
+	}
+
+	if err := ed.ResumeAgent("mayor"); err != nil {
+		t.Fatalf("ResumeAgent: %v", err)
+	}
+	if afterResume := string(mustReadFile(t, path)); afterResume != original {
+		t.Fatalf("agent suspend→resume not byte-identical (ga-1c2).\n--- want ---\n%s\n--- got ---\n%s", original, afterResume)
+	}
+}
+
 func mustReadFile(t *testing.T, path string) []byte {
 	t.Helper()
 	data, err := os.ReadFile(path)

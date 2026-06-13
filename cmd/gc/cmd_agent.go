@@ -236,6 +236,25 @@ func writeCityConfigForEditFS(fs fsys.FS, tomlPath string, cfg *config.City) err
 	return nil
 }
 
+// writeInlineAgentSuspendedInPlace toggles the suspended key of the inline
+// [[agent]] identified by qualifiedName with a surgical, comment- and
+// order-preserving edit of city.toml rather than a full re-marshal that would
+// strip comments and reorder keys (ga-1c2). It is the agent counterpart of
+// [writeRigSuspendedInPlace]. Callers resolve the agent against the raw config
+// first (so a match guarantees an inline [[agent]] table exists); a scanner
+// miss surfaces as config.ErrInPlaceTableNotFound.
+func writeInlineAgentSuspendedInPlace(fs fsys.FS, tomlPath, qualifiedName string, suspended bool) error {
+	raw, err := fs.ReadFile(tomlPath)
+	if err != nil {
+		return err
+	}
+	out, err := config.SetAgentSuspendedInPlace(raw, qualifiedName, suspended)
+	if err != nil {
+		return err
+	}
+	return fsys.WriteFileIfChangedAtomic(fs, tomlPath, out, 0o644)
+}
+
 func loadCityPackConfigForEditFS(fs fsys.FS, packPath string) (*initPackConfig, error) {
 	data, err := fs.ReadFile(packPath)
 	if err != nil {
@@ -878,16 +897,11 @@ func doAgentSuspendOrResume(fs fsys.FS, cityPath, name string, suspended bool, s
 		return 1
 	}
 
-	// Try to find agent in raw config.
+	// Try to find agent in raw config. Inline [[agent]] entries are edited in
+	// place so comments and key order survive (ga-1c2), mirroring the rig
+	// path (ga-4a9).
 	if resolved, ok := resolveAgentIdentity(cfg, name, currentRigContext(cfg)); ok {
-		resolvedQN := resolved.QualifiedName()
-		for i := range cfg.Agents {
-			if cfg.Agents[i].QualifiedName() == resolvedQN {
-				cfg.Agents[i].Suspended = suspended
-				break
-			}
-		}
-		if err := writeCityConfigForEditFS(fs, tomlPath, cfg); err != nil {
+		if err := writeInlineAgentSuspendedInPlace(fs, tomlPath, resolved.QualifiedName(), suspended); err != nil {
 			fmt.Fprintf(stderr, "gc agent %s: %v\n", verb, err) //nolint:errcheck // best-effort stderr
 			return 1
 		}

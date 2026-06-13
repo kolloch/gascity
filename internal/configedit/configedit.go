@@ -299,15 +299,34 @@ func boolPtr(b bool) *bool { return &b }
 // or [[patches.agent]] depending on provenance. Writes desired state
 // to durable config (not ephemeral session metadata).
 func (e *Editor) SuspendAgent(name string) error {
-	return e.EditExpanded(func(raw, expanded *config.City) error {
-		return mutateAgentSuspended(e.fs, filepath.Dir(e.tomlPath), raw, expanded, name, true)
-	})
+	return e.setAgentSuspended(name, true)
 }
 
 // ResumeAgent resumes a suspended agent, mirroring [Editor.SuspendAgent].
 func (e *Editor) ResumeAgent(name string) error {
+	return e.setAgentSuspended(name, false)
+}
+
+// setAgentSuspended writes an agent's desired suspended state to durable
+// config. An inline city.toml [[agent]] is edited in place so comments and
+// key order survive (ga-1c2), mirroring the rig/workspace path (ga-4a9). For
+// a derived agent (pack-declared, or convention agents/<name>/agent.toml)
+// there is no inline [[agent]] table, so the in-place editor reports the
+// table absent and we fall through to the provenance-aware path that writes
+// agent.toml or adds/updates [[patches.agent]].
+func (e *Editor) setAgentSuspended(name string, suspended bool) error {
+	err := e.editRaw(func(raw []byte) ([]byte, error) {
+		out, err := config.SetAgentSuspendedInPlace(raw, name, suspended)
+		if errors.Is(err, config.ErrInPlaceTableNotFound) {
+			return nil, errAgentNotInline
+		}
+		return out, err
+	})
+	if !errors.Is(err, errAgentNotInline) {
+		return err
+	}
 	return e.EditExpanded(func(raw, expanded *config.City) error {
-		return mutateAgentSuspended(e.fs, filepath.Dir(e.tomlPath), raw, expanded, name, false)
+		return mutateAgentSuspended(e.fs, filepath.Dir(e.tomlPath), raw, expanded, name, suspended)
 	})
 }
 
@@ -529,6 +548,12 @@ func WriteLocalDiscoveredAgentSuspended(fs fsys.FS, cityRoot string, agent confi
 // that the document has no [workspace] table to edit, triggering the
 // full-marshal fallback. It never escapes the package.
 var errWorkspaceTableAbsent = errors.New("configedit: no [workspace] table for in-place edit")
+
+// errAgentNotInline signals, from setAgentSuspended's in-place attempt, that
+// no inline [[agent]] table matched the identity — the agent is derived
+// (pack-declared or convention agents/<name>/agent.toml), so the caller
+// falls through to the provenance-aware path. It never escapes the package.
+var errAgentNotInline = errors.New("configedit: agent has no inline [[agent]] table for in-place edit")
 
 // editRaw applies fn to the raw city.toml bytes under the editor lock and
 // writes the result atomically, skipping the write when the bytes are

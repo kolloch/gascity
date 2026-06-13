@@ -154,6 +154,63 @@ func TestDoAgentSuspendInlinePreservesConfig(t *testing.T) {
 	}
 }
 
+// TestDoAgentSuspendResumeInlinePreservesComments is the CLI-layer expression
+// of the ga-1c2 acceptance criterion (the agent counterpart of
+// TestDoRigSuspendResumePreservesComments): suspending then resuming an
+// inline [[agent]] leaves city.toml byte-identical, with comments and key
+// order intact.
+func TestDoAgentSuspendResumeInlinePreservesComments(t *testing.T) {
+	cityPath := t.TempDir()
+	original := `[workspace]
+name = "test-city"
+
+# the mayor coordinates globally — keep this note and key order (ga-1c2)
+[[agent]]
+name = "mayor"
+description = "overseer"
+provider = "claude"
+
+[[agent]]
+name = "scribe"
+provider = "claude"
+`
+	tomlPath := filepath.Join(cityPath, "city.toml")
+	if err := os.WriteFile(tomlPath, []byte(original), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := doAgentSuspend(fsys.OSFS{}, cityPath, "mayor", &stdout, &stderr); code != 0 {
+		t.Fatalf("suspend code %d: %s", code, stderr.String())
+	}
+	afterSuspend, err := os.ReadFile(tomlPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, frag := range []string{
+		"# the mayor coordinates globally",
+		`description = "overseer"`,
+		"suspended = true",
+	} {
+		if !strings.Contains(string(afterSuspend), frag) {
+			t.Errorf("suspend dropped %q:\n%s", frag, afterSuspend)
+		}
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := doAgentResume(fsys.OSFS{}, cityPath, "mayor", &stdout, &stderr); code != 0 {
+		t.Fatalf("resume code %d: %s", code, stderr.String())
+	}
+	afterResume, err := os.ReadFile(tomlPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(afterResume) != original {
+		t.Fatalf("suspend→resume not byte-identical (ga-1c2 acceptance).\n--- want ---\n%s\n--- got ---\n%s", original, afterResume)
+	}
+}
+
 func TestDoAgentSuspendPackDerivedError(t *testing.T) {
 	fs := packConfigWithFragment(t)
 

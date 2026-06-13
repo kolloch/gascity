@@ -303,7 +303,183 @@ name = "test-city"
 	}
 }
 
+// agentCity mirrors a city.toml with inline [[agent]] tables: comments, a
+// city-scoped agent (no dir), and two rig-scoped agents that share the bare
+// name "worker" but differ by dir. It exercises identity disambiguation,
+// comment preservation, and an existing `suspended = false` line.
+const agentCity = `[workspace]
+provider = "claude"
+
+# The mayor coordinates globally — keep this rationale and ordering intact.
+[[agent]]
+name = "mayor"
+description = "city overseer"
+prompt_template = "agents/mayor/prompt.md"
+
+[[agent]]
+name = "worker"
+dir = "backend"
+provider = "claude-rotating"
+
+# Frontend worker shares the bare name but a different dir.
+[[agent]]
+name = "worker"
+dir = "frontend"
+suspended = false
+`
+
+func TestSetAgentSuspendedInPlace_InsertAndRemoveRoundTrip(t *testing.T) {
+	original := []byte(agentCity)
+
+	suspended, err := SetAgentSuspendedInPlace(original, "mayor", true)
+	if err != nil {
+		t.Fatalf("suspend: %v", err)
+	}
+	if got := lineDelta(string(original), string(suspended)); got != 1 {
+		t.Fatalf("suspend changed %d net lines, want exactly 1 added\n%s", got, suspended)
+	}
+	cfg, err := Parse(suspended)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if !agentSuspended(cfg, "mayor") {
+		t.Fatalf("mayor not suspended:\n%s", suspended)
+	}
+	for _, frag := range []string{
+		"# The mayor coordinates globally",
+		"keep this rationale and ordering intact",
+		`description = "city overseer"`,
+		"# Frontend worker shares the bare name",
+	} {
+		if !strings.Contains(string(suspended), frag) {
+			t.Errorf("suspend dropped fragment %q:\n%s", frag, suspended)
+		}
+	}
+
+	resumed, err := SetAgentSuspendedInPlace(suspended, "mayor", false)
+	if err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	if string(resumed) != string(original) {
+		t.Fatalf("suspend→resume not byte-identical.\n--- original ---\n%s\n--- resumed ---\n%s", original, resumed)
+	}
+}
+
+func TestSetAgentSuspendedInPlace_TogglesTargetAgentOnly(t *testing.T) {
+	out, err := SetAgentSuspendedInPlace([]byte(agentCity), "backend/worker", true)
+	if err != nil {
+		t.Fatalf("suspend backend/worker: %v", err)
+	}
+	cfg, err := Parse(out)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if !agentSuspended(cfg, "backend/worker") {
+		t.Errorf("backend/worker not suspended:\n%s", out)
+	}
+	if agentSuspended(cfg, "mayor") {
+		t.Errorf("mayor wrongly suspended:\n%s", out)
+	}
+	if agentSuspended(cfg, "frontend/worker") {
+		t.Errorf("frontend/worker wrongly suspended:\n%s", out)
+	}
+}
+
+func TestSetAgentSuspendedInPlace_QualifiedDisambiguatesSharedName(t *testing.T) {
+	// The bare name "worker" matches neither rig-scoped worker (both carry a
+	// dir), mirroring AgentMatchesIdentity. Only the qualified form resolves.
+	if _, err := SetAgentSuspendedInPlace([]byte(agentCity), "worker", true); !errors.Is(err, ErrInPlaceTableNotFound) {
+		t.Fatalf("bare 'worker' err = %v, want ErrInPlaceTableNotFound", err)
+	}
+}
+
+func TestSetAgentSuspendedInPlace_SuspendIdempotent(t *testing.T) {
+	once, err := SetAgentSuspendedInPlace([]byte(agentCity), "mayor", true)
+	if err != nil {
+		t.Fatalf("suspend: %v", err)
+	}
+	twice, err := SetAgentSuspendedInPlace(once, "mayor", true)
+	if err != nil {
+		t.Fatalf("suspend again: %v", err)
+	}
+	if string(twice) != string(once) {
+		t.Fatalf("re-suspending changed bytes:\n%s", twice)
+	}
+}
+
+func TestSetAgentSuspendedInPlace_ResumeNotSuspendedIsNoop(t *testing.T) {
+	out, err := SetAgentSuspendedInPlace([]byte(agentCity), "mayor", false)
+	if err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	if string(out) != agentCity {
+		t.Fatalf("resuming an unsuspended agent changed bytes:\n%s", out)
+	}
+}
+
+func TestSetAgentSuspendedInPlace_ExistingSuspendedFalseFlipsInPlace(t *testing.T) {
+	// The frontend worker's hand-written `suspended = false` is flipped in
+	// place, not moved or duplicated, preserving surrounding keys.
+	out, err := SetAgentSuspendedInPlace([]byte(agentCity), "frontend/worker", true)
+	if err != nil {
+		t.Fatalf("suspend: %v", err)
+	}
+	if got := lineDelta(agentCity, string(out)); got != 0 {
+		t.Fatalf("flip changed %d net lines, want 0\n%s", got, out)
+	}
+	want := strings.Replace(agentCity,
+		"name = \"worker\"\ndir = \"frontend\"\nsuspended = false\n",
+		"name = \"worker\"\ndir = \"frontend\"\nsuspended = true\n", 1)
+	if string(out) != want {
+		t.Fatalf("in-place flip mismatch:\n got: %q\nwant: %q", out, want)
+	}
+}
+
+func TestSetAgentSuspendedInPlace_NotFound(t *testing.T) {
+	if _, err := SetAgentSuspendedInPlace([]byte(agentCity), "ghost", true); !errors.Is(err, ErrInPlaceTableNotFound) {
+		t.Fatalf("err = %v, want ErrInPlaceTableNotFound", err)
+	}
+}
+
+func TestSetAgentSuspendedInPlace_NoAgentTableNotFound(t *testing.T) {
+	// A city.toml with no [[agent]] tables returns ErrInPlaceTableNotFound so
+	// the caller can fall through to the derived-agent / patch path.
+	if _, err := SetAgentSuspendedInPlace([]byte(realisticCity), "mayor", true); !errors.Is(err, ErrInPlaceTableNotFound) {
+		t.Fatalf("err = %v, want ErrInPlaceTableNotFound", err)
+	}
+}
+
+func TestSetAgentSuspendedInPlace_CRLFPreserved(t *testing.T) {
+	city := "[[agent]]\r\nname = \"mayor\"\r\ndescription = \"x\"\r\n"
+	out, err := SetAgentSuspendedInPlace([]byte(city), "mayor", true)
+	if err != nil {
+		t.Fatalf("suspend: %v", err)
+	}
+	if !strings.Contains(string(out), "suspended = true\r\n") {
+		t.Fatalf("CRLF terminator not used for inserted line:\n%q", out)
+	}
+	if strings.Contains(strings.ReplaceAll(string(out), "\r\n", ""), "\n") {
+		t.Fatalf("stray LF introduced:\n%q", out)
+	}
+	back, err := SetAgentSuspendedInPlace(out, "mayor", false)
+	if err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	if string(back) != city {
+		t.Fatalf("CRLF round trip not byte-identical:\n%q", back)
+	}
+}
+
 // --- helpers ---
+
+func agentSuspended(c *City, identity string) bool {
+	for i := range c.Agents {
+		if AgentMatchesIdentity(&c.Agents[i], identity) {
+			return c.Agents[i].Suspended
+		}
+	}
+	return false
+}
 
 func rigSuspended(c *City, name string) bool {
 	for _, r := range c.Rigs {

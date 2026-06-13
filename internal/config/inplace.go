@@ -67,6 +67,44 @@ func SetWorkspaceSuspendedInPlace(raw []byte, suspended bool) ([]byte, error) {
 	return out, nil
 }
 
+// SetAgentSuspendedInPlace returns city.toml content with the `suspended` key
+// of the inline [[agent]] table identified by `identity` set to `suspended`,
+// editing only that key's line with the same comment- and order-preserving
+// guarantees as [SetRigSuspendedInPlace] — the agent counterpart.
+//
+// `identity` is matched against each [[agent]] table's (name, dir) keys with
+// the canonical resolver [AgentMatchesIdentity], so a bare name and a
+// fully-qualified "dir/name" both resolve exactly as the struct-level
+// suspend path does. The `binding_name` key is intentionally ignored: it
+// carries `toml:"-"`, so it is never present in city.toml and the TOML
+// parser never reads it — reading it here would diverge from the parser.
+// The first matching table wins, mirroring SetAgentSuspended.
+//
+// As with the rig editor, suspend=true sets (or inserts) `suspended = true`
+// and suspend=false removes the line entirely, so a suspend→resume round
+// trip on an agent with no hand-written suspended line is byte-identical.
+//
+// It returns the input unchanged when the agent is already in the desired
+// state, or ErrInPlaceTableNotFound wrapped with the identity when no
+// [[agent]] table matches — letting the caller fall through to the
+// derived-agent path (agents/<name>/agent.toml or [[patches.agent]]) or a
+// full re-marshal. The result is self-verified by re-parsing.
+func SetAgentSuspendedInPlace(raw []byte, identity string, suspended bool) ([]byte, error) {
+	out, changed, found := editSuspendedInPlace(raw, suspended, func(lines []string, tables []tomlTable) (tomlTable, bool) {
+		return locateAgentTable(lines, tables, identity)
+	})
+	if !found {
+		return nil, fmt.Errorf("%w: agent %q", ErrInPlaceTableNotFound, identity)
+	}
+	if !changed {
+		return raw, nil
+	}
+	if err := verifyAgentSuspended(raw, out, identity, suspended); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // editSuspendedInPlace locates a table via `locate`, toggles its `suspended`
 // key, and returns the rewritten bytes. changed reports whether any byte
 // changed; found reports whether the target table was located. When found but
@@ -130,6 +168,45 @@ func rigTableName(lines []string, t tomlTable) string {
 		}
 	}
 	return ""
+}
+
+// locateAgentTable returns the first [[agent]] table whose (name, dir) keys
+// identify the agent matching `identity`, reusing the canonical
+// [AgentMatchesIdentity] resolver so in-place matching is identical to the
+// struct-level suspend path.
+func locateAgentTable(lines []string, tables []tomlTable, identity string) (tomlTable, bool) {
+	for _, t := range tables {
+		if !t.isArray || t.path != "agent" {
+			continue
+		}
+		a := agentTableIdentity(lines, t)
+		if AgentMatchesIdentity(&a, identity) {
+			return t, true
+		}
+	}
+	return tomlTable{}, false
+}
+
+// agentTableIdentity reads the identity-bearing keys (name, dir) from an
+// [[agent]] table's direct body into an Agent so the shared
+// [AgentMatchesIdentity] resolver can be reused. BindingName is left zero:
+// it is `toml:"-"`, so it never appears in city.toml and the parser never
+// populates it — reading it here would diverge from the parser's view.
+func agentTableIdentity(lines []string, t tomlTable) Agent {
+	var a Agent
+	for i := t.bodyStart; i < t.bodyEnd; i++ {
+		k, v, ok := parseScalarStringKV(stripLineEnding(lines[i]))
+		if !ok {
+			continue
+		}
+		switch k {
+		case "name":
+			a.Name = v
+		case "dir":
+			a.Dir = v
+		}
+	}
+	return a
 }
 
 // --- line editing ---
@@ -251,6 +328,30 @@ func verifyWorkspaceSuspended(raw, out []byte, suspended bool) error {
 	return nil
 }
 
+// verifyAgentSuspended is the [[agent]] counterpart of verifyRigSuspended:
+// it re-parses both byte slices and confirms the only semantic change is the
+// targeted agent's suspended flag reaching the desired value.
+func verifyAgentSuspended(raw, out []byte, identity string, suspended bool) error {
+	before, after, err := parseEditPair(raw, out)
+	if err != nil {
+		return err
+	}
+	bi, bok := agentIndex(before, identity)
+	ai, aok := agentIndex(after, identity)
+	if !bok || !aok {
+		return fmt.Errorf("in-place edit lost agent %q", identity)
+	}
+	if after.Agents[ai].Suspended != suspended {
+		return fmt.Errorf("in-place edit did not set agent %q suspended=%v", identity, suspended)
+	}
+	before.Agents[bi].Suspended = false
+	after.Agents[ai].Suspended = false
+	if !reflect.DeepEqual(before, after) {
+		return fmt.Errorf("in-place edit changed config beyond agent %q suspended flag", identity)
+	}
+	return nil
+}
+
 // parseEditPair parses the pre- and post-edit bytes. A failure to parse the
 // original is reported distinctly from corruption introduced by the edit.
 func parseEditPair(raw, out []byte) (before, after *City, err error) {
@@ -268,6 +369,18 @@ func parseEditPair(raw, out []byte) (before, after *City, err error) {
 func rigIndex(c *City, name string) (int, bool) {
 	for i := range c.Rigs {
 		if c.Rigs[i].Name == name {
+			return i, true
+		}
+	}
+	return 0, false
+}
+
+// agentIndex returns the index of the first agent matching `identity`, using
+// the same resolver as locateAgentTable so verification targets the agent
+// the edit actually changed.
+func agentIndex(c *City, identity string) (int, bool) {
+	for i := range c.Agents {
+		if AgentMatchesIdentity(&c.Agents[i], identity) {
 			return i, true
 		}
 	}
