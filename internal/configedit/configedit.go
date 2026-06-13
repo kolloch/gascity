@@ -525,34 +525,81 @@ func WriteLocalDiscoveredAgentSuspended(fs fsys.FS, cityRoot string, agent confi
 	return nil
 }
 
-// SuspendRig suspends a rig by setting suspended=true in city.toml.
+// errWorkspaceTableAbsent signals, from setCitySuspended's in-place attempt,
+// that the document has no [workspace] table to edit, triggering the
+// full-marshal fallback. It never escapes the package.
+var errWorkspaceTableAbsent = errors.New("configedit: no [workspace] table for in-place edit")
+
+// editRaw applies fn to the raw city.toml bytes under the editor lock and
+// writes the result atomically, skipping the write when the bytes are
+// unchanged. Unlike [Editor.Edit] it does not re-marshal the whole config, so
+// comments and key order survive narrow edits (ga-4a9). fn returns the new
+// bytes (returning the input unchanged is a no-op write) or an error.
+func (e *Editor) editRaw(fn func(raw []byte) ([]byte, error)) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	raw, err := e.fs.ReadFile(e.tomlPath)
+	if err != nil {
+		return fmt.Errorf("reading config: %w", err)
+	}
+	out, err := fn(raw)
+	if err != nil {
+		return err
+	}
+	return fsys.WriteFileIfChangedAtomic(e.fs, e.tomlPath, out, 0o644)
+}
+
+// SuspendRig suspends a rig by setting suspended=true in city.toml, editing
+// only that key's line so comments and key order are preserved (ga-4a9).
 func (e *Editor) SuspendRig(name string) error {
-	return e.Edit(func(cfg *config.City) error {
-		return SetRigSuspended(cfg, name, true)
-	})
+	return e.setRigSuspended(name, true)
 }
 
-// ResumeRig resumes a rig by clearing suspended in city.toml.
+// ResumeRig resumes a rig by clearing suspended in city.toml, with the same
+// comment- and order-preserving guarantee as [Editor.SuspendRig].
 func (e *Editor) ResumeRig(name string) error {
-	return e.Edit(func(cfg *config.City) error {
-		return SetRigSuspended(cfg, name, false)
+	return e.setRigSuspended(name, false)
+}
+
+func (e *Editor) setRigSuspended(name string, suspended bool) error {
+	return e.editRaw(func(raw []byte) ([]byte, error) {
+		out, err := config.SetRigSuspendedInPlace(raw, name, suspended)
+		if errors.Is(err, config.ErrInPlaceTableNotFound) {
+			return nil, fmt.Errorf("%w: rig %q", ErrNotFound, name)
+		}
+		return out, err
 	})
 }
 
-// SuspendCity sets workspace.suspended = true.
+// SuspendCity sets workspace.suspended = true, preserving comments and key
+// order (ga-4a9).
 func (e *Editor) SuspendCity() error {
-	return e.Edit(func(cfg *config.City) error {
-		cfg.Workspace.Suspended = true
-		return nil
-	})
+	return e.setCitySuspended(true)
 }
 
-// ResumeCity sets workspace.suspended = false.
+// ResumeCity sets workspace.suspended = false, preserving comments and key
+// order (ga-4a9).
 func (e *Editor) ResumeCity() error {
-	return e.Edit(func(cfg *config.City) error {
-		cfg.Workspace.Suspended = false
-		return nil
+	return e.setCitySuspended(false)
+}
+
+func (e *Editor) setCitySuspended(suspended bool) error {
+	err := e.editRaw(func(raw []byte) ([]byte, error) {
+		out, err := config.SetWorkspaceSuspendedInPlace(raw, suspended)
+		if errors.Is(err, config.ErrInPlaceTableNotFound) {
+			return nil, errWorkspaceTableAbsent
+		}
+		return out, err
 	})
+	if errors.Is(err, errWorkspaceTableAbsent) {
+		// No [workspace] table to edit in place; re-marshal to create one.
+		return e.Edit(func(cfg *config.City) error {
+			cfg.Workspace.Suspended = suspended
+			return nil
+		})
+	}
+	return err
 }
 
 // CreateAgent adds a new agent to the config. Returns an error if an

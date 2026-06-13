@@ -1089,26 +1089,45 @@ func doRigSuspend(fs fsys.FS, cityPath, rigName string, stdout, stderr io.Writer
 		return 1
 	}
 
-	found := false
-	for i := range cfg.Rigs {
-		if cfg.Rigs[i].Name == rigName {
-			cfg.Rigs[i].Suspended = true
-			found = true
-			break
-		}
-	}
-	if !found {
+	if !rigExists(cfg, rigName) {
 		fmt.Fprintln(stderr, rigNotFoundMsg("gc rig suspend", rigName, cfg)) //nolint:errcheck // best-effort stderr
 		return 1
 	}
 
-	if err := writeCityConfigForEditFS(fs, tomlPath, cfg); err != nil {
+	if err := writeRigSuspendedInPlace(fs, tomlPath, rigName, true); err != nil {
 		fmt.Fprintf(stderr, "gc rig suspend: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
 
 	fmt.Fprintf(stdout, "Suspended rig '%s'\n", rigName) //nolint:errcheck // best-effort stdout
 	return 0
+}
+
+// rigExists reports whether a rig with the given name is declared in cfg.
+func rigExists(cfg *config.City, rigName string) bool {
+	for i := range cfg.Rigs {
+		if cfg.Rigs[i].Name == rigName {
+			return true
+		}
+	}
+	return false
+}
+
+// writeRigSuspendedInPlace toggles the named rig's suspended flag with a
+// surgical, comment- and order-preserving edit of city.toml rather than a full
+// re-marshal that would strip comments and reorder keys (ga-4a9). Callers
+// validate the rig's existence first (for the rich not-found message); a
+// missing rig here surfaces as config.ErrInPlaceTableNotFound.
+func writeRigSuspendedInPlace(fs fsys.FS, tomlPath, rigName string, suspended bool) error {
+	raw, err := fs.ReadFile(tomlPath)
+	if err != nil {
+		return err
+	}
+	out, err := config.SetRigSuspendedInPlace(raw, rigName, suspended)
+	if err != nil {
+		return err
+	}
+	return fsys.WriteFileIfChangedAtomic(fs, tomlPath, out, 0o644)
 }
 
 func newRigResumeCmd(stdout, stderr io.Writer) *cobra.Command {
@@ -1191,20 +1210,12 @@ func doRigResume(fs fsys.FS, cityPath, rigName string, stdout, stderr io.Writer)
 		return 1
 	}
 
-	found := false
-	for i := range cfg.Rigs {
-		if cfg.Rigs[i].Name == rigName {
-			cfg.Rigs[i].Suspended = false
-			found = true
-			break
-		}
-	}
-	if !found {
+	if !rigExists(cfg, rigName) {
 		fmt.Fprintln(stderr, rigNotFoundMsg("gc rig resume", rigName, cfg)) //nolint:errcheck // best-effort stderr
 		return 1
 	}
 
-	if err := writeCityConfigForEditFS(fs, tomlPath, cfg); err != nil {
+	if err := writeRigSuspendedInPlace(fs, tomlPath, rigName, false); err != nil {
 		fmt.Fprintf(stderr, "gc rig resume: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1
 	}

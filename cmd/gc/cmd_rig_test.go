@@ -1152,6 +1152,70 @@ func TestDoRigResumeNotSuspended(t *testing.T) {
 	}
 }
 
+// TestDoRigSuspendResumePreservesComments is the CLI-layer (city-down fallback)
+// expression of the ga-4a9 acceptance criterion: `gc rig suspend X` then
+// `gc rig resume X` leaves city.toml byte-identical, with comments and key
+// order intact, instead of a full TOML round-trip that strips them.
+func TestDoRigSuspendResumePreservesComments(t *testing.T) {
+	cityPath := t.TempDir()
+	original := `[workspace]
+name = "test-city"
+
+[[agent]]
+name = "mayor"
+provider = "claude"
+
+[[rigs]]
+name = "frontend"
+path = "/some/path"
+prefix = "fe"
+default_branch = "main"
+
+# rationale block that must survive suspend/resume (ga-4a9)
+[rigs.formula_vars]
+build_command = "go build ./..."
+lint_command = "golangci-lint run"
+`
+	tomlPath := filepath.Join(cityPath, "city.toml")
+	if err := os.WriteFile(tomlPath, []byte(original), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if code := doRigSuspend(fsys.OSFS{}, cityPath, "frontend", &stdout, &stderr); code != 0 {
+		t.Fatalf("suspend code %d: %s", code, stderr.String())
+	}
+	afterSuspend, err := os.ReadFile(tomlPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, frag := range []string{
+		"# rationale block that must survive",
+		"[rigs.formula_vars]",
+		`lint_command = "golangci-lint run"`,
+		`prefix = "fe"`,
+		`path = "/some/path"`,
+		"suspended = true",
+	} {
+		if !strings.Contains(string(afterSuspend), frag) {
+			t.Errorf("suspend dropped %q:\n%s", frag, afterSuspend)
+		}
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := doRigResume(fsys.OSFS{}, cityPath, "frontend", &stdout, &stderr); code != 0 {
+		t.Fatalf("resume code %d: %s", code, stderr.String())
+	}
+	afterResume, err := os.ReadFile(tomlPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(afterResume) != original {
+		t.Fatalf("suspend→resume not byte-identical (ga-4a9 acceptance).\n--- want ---\n%s\n--- got ---\n%s", original, afterResume)
+	}
+}
+
 func TestDoRigListShowsSuspended(t *testing.T) {
 	cityPath := t.TempDir()
 	rigPath := filepath.Join(t.TempDir(), "my-frontend")

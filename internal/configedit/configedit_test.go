@@ -759,6 +759,83 @@ suspended = true
 	}
 }
 
+// TestSuspendResumeRigPreservesComments is the configedit-layer expression of
+// the ga-4a9 acceptance criterion: suspending then resuming a rig leaves
+// city.toml byte-identical, with comments and key order intact. This is the
+// running-city/supervisor path (api_state → configedit.Editor).
+func TestSuspendResumeRigPreservesComments(t *testing.T) {
+	dir := t.TempDir()
+	original := `[workspace]
+name = "test-city"
+
+[[rigs]]
+name = "my-rig"
+prefix = "mr"
+
+# rationale block that must survive config mutations (ga-4a9)
+[rigs.formula_vars]
+build_command = "go build ./..."
+`
+	path := writeTOML(t, dir, original)
+	ed := configedit.NewEditor(fsys.OSFS{}, path)
+
+	if err := ed.SuspendRig("my-rig"); err != nil {
+		t.Fatalf("SuspendRig: %v", err)
+	}
+	afterSuspend := string(mustReadFile(t, path))
+	if !strings.Contains(afterSuspend, "# rationale block that must survive") {
+		t.Errorf("suspend dropped the rationale comment:\n%s", afterSuspend)
+	}
+	if !strings.Contains(afterSuspend, "suspended = true") {
+		t.Errorf("suspend did not set suspended:\n%s", afterSuspend)
+	}
+	if !strings.Contains(afterSuspend, "[rigs.formula_vars]") {
+		t.Errorf("suspend dropped the formula_vars sub-table:\n%s", afterSuspend)
+	}
+
+	if err := ed.ResumeRig("my-rig"); err != nil {
+		t.Fatalf("ResumeRig: %v", err)
+	}
+	if afterResume := string(mustReadFile(t, path)); afterResume != original {
+		t.Fatalf("suspend→resume not byte-identical (ga-4a9).\n--- want ---\n%s\n--- got ---\n%s", original, afterResume)
+	}
+}
+
+// TestSuspendResumeCityPreservesComments mirrors the rig case for the
+// workspace (gc suspend / gc resume) path.
+func TestSuspendResumeCityPreservesComments(t *testing.T) {
+	dir := t.TempDir()
+	original := `# top-of-file note that must survive (ga-4a9)
+[workspace]
+name = "test-city"
+provider = "claude"
+
+[[rigs]]
+name = "my-rig"
+prefix = "mr"
+`
+	path := writeTOML(t, dir, original)
+	ed := configedit.NewEditor(fsys.OSFS{}, path)
+
+	if err := ed.SuspendCity(); err != nil {
+		t.Fatalf("SuspendCity: %v", err)
+	}
+	afterSuspend := string(mustReadFile(t, path))
+	if !strings.Contains(afterSuspend, "# top-of-file note that must survive") {
+		t.Errorf("suspend dropped the top-of-file comment:\n%s", afterSuspend)
+	}
+	if !strings.Contains(afterSuspend, "suspended = true") {
+		t.Errorf("suspend did not set workspace suspended:\n%s", afterSuspend)
+	}
+
+	if err := ed.ResumeCity(); err != nil {
+		t.Fatalf("ResumeCity: %v", err)
+	}
+	if afterResume := string(mustReadFile(t, path)); afterResume != original {
+		t.Fatalf("city suspend→resume not byte-identical (ga-4a9).\n--- want ---\n%s\n--- got ---\n%s", original, afterResume)
+	}
+}
+
 func mustReadFile(t *testing.T, path string) []byte {
 	t.Helper()
 	data, err := os.ReadFile(path)

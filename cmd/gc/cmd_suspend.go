@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -123,9 +124,7 @@ func doSuspendCity(fs fsys.FS, cityPath string, suspend bool, jsonOut bool, stdo
 		return 1
 	}
 
-	cfg.Workspace.Suspended = suspend
-
-	if err := writeCityConfigForEditFS(fs, tomlPath, cfg); err != nil {
+	if err := writeWorkspaceSuspendedInPlace(fs, tomlPath, cfg, suspend); err != nil {
 		fmt.Fprintf(stderr, "%s: %v\n", cmd, err) //nolint:errcheck // best-effort stderr
 		return 1
 	}
@@ -143,6 +142,28 @@ func doSuspendCity(fs fsys.FS, cityPath string, suspend bool, jsonOut bool, stdo
 		})
 	}
 	return writeCitySuspensionSuccess(stdout, stderr, cityPath, suspend, jsonOut)
+}
+
+// writeWorkspaceSuspendedInPlace toggles workspace.suspended with a surgical,
+// comment- and order-preserving edit of city.toml rather than a full re-marshal
+// that would strip comments and reorder keys (ga-4a9). When the document has no
+// [workspace] table to edit in place, it falls back to a full re-marshal of
+// cfg, which creates one. cfg must reflect the loaded config; its
+// Workspace.Suspended is set only on the fallback path.
+func writeWorkspaceSuspendedInPlace(fs fsys.FS, tomlPath string, cfg *config.City, suspend bool) error {
+	raw, err := fs.ReadFile(tomlPath)
+	if err != nil {
+		return err
+	}
+	out, err := config.SetWorkspaceSuspendedInPlace(raw, suspend)
+	if errors.Is(err, config.ErrInPlaceTableNotFound) {
+		cfg.Workspace.Suspended = suspend
+		return writeCityConfigForEditFS(fs, tomlPath, cfg)
+	}
+	if err != nil {
+		return err
+	}
+	return fsys.WriteFileIfChangedAtomic(fs, tomlPath, out, 0o644)
 }
 
 func writeCitySuspensionSuccess(stdout, stderr io.Writer, cityPath string, suspend bool, jsonOut bool) int {
