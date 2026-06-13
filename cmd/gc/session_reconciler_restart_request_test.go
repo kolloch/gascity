@@ -572,4 +572,87 @@ func TestReconcileSessionBeads_RestartRequestNamedAlwaysWakesSameTick(t *testing
 	}
 }
 
+// TestReconcileSessionBeads_RestartRequestResumeOnlyNamedAlwaysWakesDespiteStaleLiveHash
+// reproduces the exact scenario behind ga-r3w: a resume-wake (no
+// session_id_flag) named-always session — e.g. a mayor or witness — whose
+// runtime died without the supervisor noticing, so its live-hash fingerprints
+// went stale, and whose provider conversation file is gone so a plain
+// `--resume <uuid>` re-crashes the pane. The operator runs `gc session reset`,
+// which sets restart_requested and (for resume-wake sessions) clears
+// session_key. On the next reconciler tick the session must BOTH clear
+// session_key AND wake fresh on the same tick — the stale live_hash must not
+// short-circuit that respawn, because the live-drift check is alive-gated and
+// a dead runtime never consults it.
+//
+// Before this regression guard the scenario was only covered piecemeal:
+// RestartRequestClearsKeyForResumeOnlyProviders asserts the resume-only key
+// clear but on an on_demand session and without asserting the wake;
+// RestartRequestNamedAlwaysWakesSameTick asserts the same-tick wake but with a
+// session_id_flag provider that rotates rather than clears the key. Neither
+// guarded the resume-only + named-always + stale-live_hash combination the bug
+// report describes.
+func TestReconcileSessionBeads_RestartRequestResumeOnlyNamedAlwaysWakesDespiteStaleLiveHash(t *testing.T) {
+	env := newRestartRequestTestEnv()
+	env.cfg = &config.City{
+		Workspace:     config.Workspace{Name: "test-city"},
+		Agents:        []config.Agent{{Name: "worker", StartCommand: "true", MaxActiveSessions: restartRequestTestIntPtr(1)}},
+		NamedSessions: []config.NamedSession{{Template: "worker", Mode: "always"}},
+	}
+	sessionName := config.NamedSessionRuntimeName(env.cfg.Workspace.Name, env.cfg.Workspace, "worker")
+	env.desiredState[sessionName] = TemplateParams{
+		Command:      "true",
+		SessionName:  sessionName,
+		TemplateName: "worker",
+		ResolvedProvider: &config.ResolvedProvider{
+			ResumeFlag:  "--resume",
+			ResumeStyle: "flag",
+		},
+	}
+
+	session := env.createSessionBead(sessionName)
+	env.setSessionMetadata(&session, map[string]string{
+		namedSessionMetadataKey:      "true",
+		namedSessionIdentityMetadata: "worker",
+		namedSessionModeMetadata:     "always",
+		"restart_requested":          "true",
+		"session_key":                "missing-conversation-uuid",
+		"started_config_hash":        "hash-before-restart",
+		// Runtime died without the supervisor noticing, so the live-hash
+		// fingerprints are stale. They must NOT block the reset-driven respawn.
+		"started_live_hash": "stale-live-hash",
+		"live_hash":         "stale-live-hash",
+	})
+
+	// Runtime is NOT started — the pane died on a `claude --resume
+	// <missing-uuid>` crash loop and `gc session reset` then set
+	// restart_requested on the bead.
+	if env.sp.IsRunning(sessionName) {
+		t.Fatal("test fixture wrong: session should not be running")
+	}
+
+	env.reconcile([]beads.Bead{session})
+
+	// Same-tick wake: the restart-requested branch must fall through to the
+	// wake decision on a dead runtime and start the session this pass. A stale
+	// live_hash on a dead session is never consulted (live-drift is
+	// alive-gated), so it cannot short-circuit the respawn.
+	if !env.sp.IsRunning(sessionName) {
+		t.Fatalf("session %q did not wake on the same reconciler tick; stale live_hash or dead runtime blocked the reset-driven respawn", sessionName)
+	}
+
+	got, _ := env.store.Get(session.ID)
+	// Resume-wake providers cannot inject a fresh session id, so the stale
+	// conversation key must be CLEARED (not rotated) — the next wake starts a
+	// brand-new conversation instead of re-crashing on --resume <missing-uuid>.
+	if got.Metadata["session_key"] != "" {
+		t.Fatalf("session_key = %q, want empty for resume-only reset", got.Metadata["session_key"])
+	}
+	if got.Metadata["restart_requested"] != "" {
+		t.Fatalf("restart_requested = %q, want cleared after patch applied", got.Metadata["restart_requested"])
+	}
+	if got.Metadata["last_woke_at"] == "" {
+		t.Fatal("last_woke_at = empty, want timestamp from same-tick wake")
+	}
+}
+
 func restartRequestTestIntPtr(n int) *int { return &n }
