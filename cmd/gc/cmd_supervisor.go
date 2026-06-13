@@ -1082,13 +1082,33 @@ func runSupervisor(stdout, stderr io.Writer) int {
 		reconcileCities(reg, registry, supCfg.Publication, stdout, stderr)
 	}
 
+	// safeCapDoltLogs bounds each running city's managed dolt log on every
+	// patrol tick so it stays small even in preserve mode, where the main dolt
+	// is never relaunched and its log would otherwise grow without limit for
+	// the city's whole lifetime — the orphan-dolt re-adoption stall this fixes
+	// at source (ga-1op). Wrapped in panic recovery for the same reason as
+	// safeReconcile: log maintenance must never crash the supervisor.
+	safeCapDoltLogs := func() {
+		defer func() {
+			if r := recover(); r != nil {
+				fmt.Fprintf(stderr, "gc supervisor: dolt log cap panicked: %v\n", r) //nolint:errcheck
+			}
+		}()
+		capRunningCityDoltLogs(registry, stdout, stderr)
+	}
+
 	// Initial reconcile.
 	safeReconcile()
+	// Cap promptly on startup so a supervisor that just re-adopted a preserved
+	// city does not wait a full patrol interval before shrinking an inherited
+	// oversized log.
+	safeCapDoltLogs()
 
 	for {
 		select {
 		case <-ticker.C:
 			safeReconcile()
+			safeCapDoltLogs()
 		case req := <-reconcileCh:
 			safeReconcile()
 			// Also poke all running cities so they immediately reconcile

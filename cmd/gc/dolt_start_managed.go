@@ -122,6 +122,18 @@ func startManagedDoltProcessWithOptions(cityPath, host, port, user, logLevel str
 	}
 	archiveLevel = resolveDoltArchiveLevel(archiveLevel)
 
+	// Bound a pre-existing oversized log before this fresh server starts
+	// appending to it, so a non-preserve restart does not inherit the prior
+	// run's multi-hundred-MB log (ga-1op). Best-effort and non-fatal: the
+	// supervisor patrol re-caps the live log on its own cadence, so a
+	// persistent cap failure (e.g. a read-only pack dir) re-surfaces there and
+	// must never block the server from starting. Capping before the retry loop
+	// also keeps the per-attempt logOffset (captured below) pointing at the
+	// post-cap size, so startup-output reads stay correct.
+	if capMax, capKeep := resolveManagedDoltLogCap(); capMax > 0 {
+		_, _ = capManagedDoltLog(layout.LogFile, capMax, capKeep)
+	}
+
 	report := managedDoltStartReport{}
 	currentPort := portNum
 	for attempt := 1; attempt <= 5; attempt++ {
