@@ -167,6 +167,17 @@ func doBd(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
+	// Self-heal the formula symlink view before molecule subcommands so the
+	// witness/refinery can pour patrol wisps (`gc bd mol wisp ...`) even when a
+	// prior pack rebuild left <scope>/.beads/formulas/ partial. loadCityConfig
+	// above already re-materialized the builtin pack source files for this
+	// process, so re-resolving the symlinks here recovers the view without a
+	// manual `gc reload`. Gated to mol — the hot CRUD/query path does not read
+	// the formula symlinks. See ga-y9v.
+	if bdSubcommandNeedsFormulas(bdArgs) {
+		healFormulaSymlinksForScope(cfg, target, stderr)
+	}
+
 	reapStaleBdExportJSONL(target.ScopeRoot)
 	warnExternalBdOverrideDrift(stderr, cityPath, target)
 
