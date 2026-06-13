@@ -3128,7 +3128,7 @@ gc supervisor
 |------------|-------------|
 | [gc supervisor install](#gc-supervisor-install) | Install the supervisor as a platform service |
 | [gc supervisor logs](#gc-supervisor-logs) | Tail the supervisor log file |
-| [gc supervisor reap-worktree-dolts](#gc-supervisor-reap-worktree-dolts) | Reap worktree dolt processes for all registered cities (post-shutdown hook) |
+| [gc supervisor reap-city-dolts](#gc-supervisor-reap-city-dolts) | Reap a stopped city's dolt processes (worktree + main) for all registered cities (post-shutdown hook) |
 | [gc supervisor reload](#gc-supervisor-reload) | Trigger immediate reconciliation of all cities |
 | [gc supervisor run](#gc-supervisor-run) | Run the machine-wide supervisor in the foreground |
 | [gc supervisor start](#gc-supervisor-start) | Start the machine-wide supervisor in the background |
@@ -3160,27 +3160,30 @@ gc supervisor logs [flags]
 | `-f`, `--follow` | bool |  | follow log output |
 | `-n`, `--lines` | int | `50` | number of lines to show |
 
-## gc supervisor reap-worktree-dolts
+## gc supervisor reap-city-dolts
 
-Reap worktree dolt sql-server processes for every registered city.
+Reap dolt sql-server processes for every registered city.
 
 For each city in the supervisor registry, this terminates dolt sql-server
-processes whose --config lives under &lt;city&gt;/.gc/worktrees/ (SIGTERM, grace,
-then SIGKILL with a PID-reuse guard). The main managed dolt is never a
-candidate because its config sits outside the worktree tree.
+processes whose --config lives under &lt;city&gt;/.gc/worktrees/ (the worktree dolts)
+or equals &lt;city&gt;/.gc/runtime/packs/dolt/dolt-config.yaml (the main managed,
+bead-store dolt), via SIGTERM, grace, then SIGKILL with a PID-reuse guard.
+Dolts belonging to other cities and processes without a --config are never
+touched.
 
-This is the same reap the supervisor runs for each city during graceful
-shutdown. It is wired into the generated systemd unit's ExecStopPost so a
-SIGKILLed or crashed supervisor — which bypasses the in-process reaper — still
-leaves zero orphaned worktree dolts.
+It is wired into the generated systemd unit's ExecStopPost so a SIGKILLed or
+crashed supervisor — which bypasses the in-process worktree reaper — still
+leaves zero of its dolts behind, and so the next supervisor starts from a clean
+slate instead of re-adopting a stale bead-store dolt (pe-t07v).
 
 Intended to run AFTER the supervisor has stopped. It does not distinguish a
-leaked worktree dolt from one an active session is still using, so running it
-while a city is up will terminate in-use worktree dolt servers. With no
-registered cities or no worktree dolts running it is a no-op.
+leaked dolt from one an active session is still using, so running it while a
+city is up WILL terminate that city's in-use dolt servers, including its
+bead-store dolt. With no registered cities or no matching dolts running it is a
+no-op.
 
 ```
-gc supervisor reap-worktree-dolts
+gc supervisor reap-city-dolts
 ```
 
 ## gc supervisor reload

@@ -998,12 +998,15 @@ Type=simple
 # session conversation history. The reconciler re-adopts tmux on start.
 KillMode=process
 ExecStart={{systemdpath .GCPath}} supervisor run
-# Reap orphaned worktree dolt sql-server processes after the supervisor
-# exits. systemd runs ExecStopPost regardless of how the main process died,
-# so this covers the crash/SIGKILL case the in-process reaper cannot reach
-# (ga-enr, ga-kc8). Best-effort ('-' prefix): never blocks the unit stop.
-# Only worktree dolts are reaped; the main managed dolt is never touched.
-ExecStopPost=-{{systemdpath .GCPath}} supervisor reap-worktree-dolts
+# Reap this city's dolt sql-server processes after the supervisor exits —
+# its worktree dolts AND its main managed bead-store dolt. systemd runs
+# ExecStopPost regardless of how the main process died, so this covers the
+# crash/SIGKILL case the in-process reaper cannot reach (ga-enr, ga-kc8) and
+# clears the main dolt for a clean re-adoption on next start (pe-t07v, ga-s5y),
+# replacing the hand-installed dolt-cleanup.conf drop-in. Best-effort
+# ('-' prefix): never blocks the unit stop. It runs only after the supervisor
+# has stopped, so reaping the bead-store dolt is safe.
+ExecStopPost=-{{systemdpath .GCPath}} supervisor reap-city-dolts
 Restart=always
 RestartSec=5s
 StandardOutput=append:{{.LogPath}}
