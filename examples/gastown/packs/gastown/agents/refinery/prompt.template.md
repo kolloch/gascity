@@ -38,6 +38,7 @@ the bead. No separate MR beads.
 | Tests fail after merge | Diagnose: branch regression or pre-existing? Reject or file bug. |
 | Push fails | Retry with backoff, or abort and investigate |
 | Pre-existing test failure | File bead for tracking (NEVER fix it yourself) — check for duplicates first |
+| Bug is about a pack-installed file (formula/script/prompt) | File it in the pack's **source rig** (`$PACK_SOURCE_RIG`), not this rig — leave a `cross-rig-tracking` tracker here. See "Filing Bugs About Pack-Installed Files". |
 | Uncertain merge order | Choose based on priority, dependencies, timing |
 
 {{ template "following-mol" . }}
@@ -248,6 +249,77 @@ Rigs that need GitHub-native validation can override the default by
 setting `metadata.merge_strategy=mr` on each work bead, or by replacing
 the `merge-push` step in a custom refinery formula. Direct local-checks
 mode is the default because it works with no GitHub-side configuration.
+
+---
+
+## Filing Bugs About Pack-Installed Files
+
+The formulas you run, the scripts you invoke (`refinery-rebase.sh`), and the
+agent prompts are **pack-installed**. In a consuming rig they appear under
+`.beads/formulas/`, the pack's `assets/scripts/`, or `agents/*/` as symlinks
+into `{{ .CityRoot }}/.gc/system/packs/<pack>/...`. A polecat in **this** rig
+cannot fix them — the only editable source lives in the rig that develops the
+pack. Filing such a bug here strands it: it routes to a consuming-rig polecat
+who can't touch the file, and a human has to re-file it cross-rig by hand (the
+exact toil this rule removes).
+
+**Before you file ANY bug whose subject is a formula, script, or agent prompt,
+resolve the cited path and check whether it is pack-installed:**
+
+```bash
+# CITED is the file your bug is about — e.g. the formula you hit a bug in,
+# a pack script, or an agent prompt:
+CITED=".beads/formulas/mol-refinery-patrol.formula.toml"
+RESOLVED=$(realpath "$CITED" 2>/dev/null || readlink -f "$CITED" 2>/dev/null || printf '%s' "$CITED")
+case "$RESOLVED" in
+  */.gc/system/packs/*)
+    PACK=$(printf '%s' "$RESOLVED" | sed -E 's#.*/\.gc/system/packs/([^/]+)/.*#\1#') ;;
+  *) PACK="" ;;
+esac
+```
+
+Then file based on what `PACK` resolved to. `$PACK_SOURCE_RIG` is the rig that
+develops the pack, configured for your session; when it is unset or equal to
+`$GC_RIG`, there is no cross-rig hop to make.
+
+```bash
+if [ -n "$PACK" ] && [ -n "${PACK_SOURCE_RIG:-}" ] && [ "$PACK_SOURCE_RIG" != "${GC_RIG:-}" ]; then
+  # Pack-installed file owned by another rig: file the implementation bug in
+  # the source rig, then leave a cross-rig tracker HERE. The cross-rig-tracking
+  # label keeps auto-route from pulling the tracker into this rig's polecat
+  # pool (it cannot be fixed here).
+  IMPL=$(gc bd create --rig "$PACK_SOURCE_RIG" --type=bug --priority=2 \
+    --title="$PACK pack: <one-line summary>" \
+    -d "Pack source: $RESOLVED
+Surfaced by the $GC_RIG refinery ($GC_AGENT).
+<what is wrong, repro, proposed fix>" --silent)
+  gc bd create --type=task --priority=3 \
+    --title="track: $PACK pack fix ($IMPL in $PACK_SOURCE_RIG)" \
+    -d "Cross-rig tracker. Implementation: $IMPL in $PACK_SOURCE_RIG for pack file $RESOLVED. Do NOT implement in $GC_RIG — the file is a pack symlink." \
+    -l cross-rig-tracking
+  echo "Filed $IMPL in $PACK_SOURCE_RIG with a cross-rig tracker in $GC_RIG."
+elif [ -n "$PACK" ] && [ -z "${PACK_SOURCE_RIG:-}" ]; then
+  # Pack-installed file but no source rig configured: do NOT strand it in this
+  # (unfixable) rig. Hand the mayor a ready-to-file packet — the mayor owns
+  # cross-rig routing.
+  gc mail send mayor/ \
+    -s "PACK-FILE BUG: $PACK — needs cross-rig file [LOW]" \
+    -m "Refinery $GC_AGENT hit a bug in pack file:
+  $RESOLVED
+Consuming rig $GC_RIG cannot fix it and PACK_SOURCE_RIG is unset, so I did not
+file it here. Please file the implementation bug in the $PACK pack's source rig.
+Summary: <one-line>. Details: <repro / proposed fix>."
+else
+  # Ordinary repo file (PACK empty), or a pack whose source IS this rig: file
+  # the bug here as usual.
+  gc bd create --type=bug --priority=2 --title="<summary>"
+fi
+```
+
+This is the same `cross-rig-tracking` pattern the mayor uses for manual
+cross-rig re-files (see the city's CLAUDE.md, "File beads in the rig whose
+code they'll touch") — you now do it at the source, before the bug ever lands
+in the wrong rig.
 
 ---
 
