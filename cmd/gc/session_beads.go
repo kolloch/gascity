@@ -629,26 +629,41 @@ func unclaimWorkAssignedToRetiredSessionBead(
 					update := beads.UpdateOpts{Assignee: &empty}
 					// This path only fires for a genuinely REMOVED named session
 					// (retireRemovedConfiguredNamedSessionBead), so the assignee
-					// is cleared rather than re-parked on the route: the route is
-					// usually the removed session's own identity, which has no
-					// live agent left to re-claim, and parking work back on that
-					// identity would make the archived session bead look like it
-					// still owns work (sessionHasOpenAssignedWorkForConfig) and
-					// block re-adoption. Resetting an in_progress bead to "open"
-					// at least returns it to the routed queue (gc.routed_to +
-					// --unassigned), which an ephemeral pool worker can re-claim
-					// via the work_query's Tier 3. Work routed to a still-live
-					// NAMED target stays stranded here — Tier 3 is gated to
-					// ephemeral sessions — so rerouting genuinely-removed-named-
-					// session work to a fallback pool warrants its own design
-					// pass (ga-wv45). Contrast Agent.EffectiveOnDeath, which
-					// re-parks on the route because there the agent is live and
-					// respawns to re-claim via Tier 2.
+					// is cleared rather than re-parked on the route: the removed
+					// identity has no live agent left to re-claim, and parking
+					// work back on it would make the archived session bead look
+					// like it still owns work (sessionHasOpenAssignedWorkForConfig)
+					// and block re-adoption when the name returns. Contrast
+					// Agent.EffectiveOnDeath, which re-parks on the route because
+					// there the agent is live and respawns to re-claim via Tier 2.
 					if item.Status == "in_progress" {
 						update.Status = &open
 					}
-					if fallbackRoute != "" && strings.TrimSpace(item.Metadata["gc.routed_to"]) == "" {
-						update.Metadata = map[string]string{"gc.routed_to": fallbackRoute}
+					// Fix up gc.routed_to so the freed bead can actually be
+					// re-claimed instead of stranding on a dead route (ga-kw66):
+					//   - Unrouted: backfill the removed session's fallback route.
+					//     If that route names a live pool, its ephemeral workers
+					//     re-claim it via the work_query's routed queue; otherwise
+					//     the consumer-layer router picks it up on the next pass.
+					//   - Self-routed onto the removed identity itself: a dead
+					//     route with no live agent and no ephemeral pool querying
+					//     it (the work_query's Tier 3 is gated to ephemeral
+					//     sessions, so a named-target route is never re-discovered).
+					//     Clear it so the bead becomes unrouted and the
+					//     consumer-layer router (auto-route: gc.routed_to empty +
+					//     unassigned) re-slings it to a live pool. Mirrors the
+					//     route-clear in `gc workflow reopen-source`. ZFC-safe: Go
+					//     names no pool; the operator's routing config picks the
+					//     destination.
+					//   - Routed at some other (potentially live) target: leave it.
+					routedTo := strings.TrimSpace(item.Metadata["gc.routed_to"])
+					switch {
+					case routedTo == "":
+						if fallbackRoute != "" {
+							update.Metadata = map[string]string{"gc.routed_to": fallbackRoute}
+						}
+					case routeIsRetiredSessionIdentity(routedTo, identifiers):
+						update.Metadata = map[string]string{"gc.routed_to": ""}
 					}
 					if err := ownerStore.Update(item.ID, update); err != nil {
 						fmt.Fprintf(stderr, "session beads: unclaiming work %s assigned to retired session %s: %v\n", item.ID, sessionBead.ID, err) //nolint:errcheck
@@ -657,6 +672,25 @@ func unclaimWorkAssignedToRetiredSessionBead(
 			}
 		}
 	}
+}
+
+// routeIsRetiredSessionIdentity reports whether a work bead's gc.routed_to
+// points back at the retired session's own identity (named identity, runtime
+// session name, or session-bead ID). Such a self-route dies the instant the
+// session is removed from config: no live agent answers to it, so the bead
+// must be unrouted to re-enter normal routing. identifiers is the set returned
+// by sessionAssignmentIdentifiers — already trimmed and non-empty.
+func routeIsRetiredSessionIdentity(route string, identifiers []string) bool {
+	route = strings.TrimSpace(route)
+	if route == "" {
+		return false
+	}
+	for _, id := range identifiers {
+		if route == id {
+			return true
+		}
+	}
+	return false
 }
 
 func reassignWorkAssignedToRetiredSessionBead(

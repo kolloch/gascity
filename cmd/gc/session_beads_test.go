@@ -6214,6 +6214,87 @@ func TestUnclaimWorkAssignedToRetiredSessionBeadClearsRigStoreSessionIdentifiers
 	}
 }
 
+// TestUnclaimWorkAssignedToRetiredSessionBeadClearsDeadSelfRoute is the
+// ga-kw66 regression: work self-routed onto a removed named session's own
+// identity (gc.routed_to = the removed identity) is a dead route — no live
+// agent answers to it and no ephemeral pool queries it (the work_query's
+// Tier 3 is gated to ephemeral sessions, so a named-target route is never
+// re-discovered). The unclaim must CLEAR such a route so the bead becomes
+// unrouted and the consumer-layer router (auto-route: gc.routed_to empty +
+// unassigned) can re-sling it to a live pool. A route pointing at an
+// unrelated target must be left intact.
+func TestUnclaimWorkAssignedToRetiredSessionBeadClearsDeadSelfRoute(t *testing.T) {
+	store := beads.NewMemStore()
+
+	sessionBead, err := store.Create(beads.Bead{
+		Title:  "worker",
+		Type:   sessionBeadType,
+		Labels: []string{sessionBeadLabel},
+		Metadata: map[string]string{
+			"session_name":               "worker-1",
+			"state":                      "retired",
+			namedSessionIdentityMetadata: "frontend/worker",
+		},
+	})
+	if err != nil {
+		t.Fatalf("create session bead: %v", err)
+	}
+
+	// Self-routed onto the removed named identity itself — the dead route.
+	selfRouted, err := store.Create(beads.Bead{
+		Title:    "self-routed work",
+		Status:   "open",
+		Assignee: "frontend/worker",
+		Metadata: map[string]string{"gc.routed_to": "frontend/worker"},
+	})
+	if err != nil {
+		t.Fatalf("create self-routed work: %v", err)
+	}
+	inProgress := "in_progress"
+	if err := store.Update(selfRouted.ID, beads.UpdateOpts{Status: &inProgress}); err != nil {
+		t.Fatalf("mark self-routed work in_progress: %v", err)
+	}
+
+	// Routed at an unrelated, still-live target — must be preserved.
+	otherRouted, err := store.Create(beads.Bead{
+		Title:    "cross-routed work",
+		Status:   "open",
+		Assignee: "worker-1",
+		Metadata: map[string]string{"gc.routed_to": "frontend/gastown.polecat"},
+	})
+	if err != nil {
+		t.Fatalf("create cross-routed work: %v", err)
+	}
+
+	var stderr bytes.Buffer
+	unclaimWorkAssignedToRetiredSessionBead(store, nil, sessionBead, "frontend/codex-max", &stderr)
+
+	gotSelf, err := store.Get(selfRouted.ID)
+	if err != nil {
+		t.Fatalf("get self-routed work: %v", err)
+	}
+	if gotSelf.Assignee != "" {
+		t.Errorf("self-routed assignee = %q, want empty", gotSelf.Assignee)
+	}
+	if gotSelf.Status != "open" {
+		t.Errorf("self-routed status = %q, want open", gotSelf.Status)
+	}
+	if gotSelf.Metadata["gc.routed_to"] != "" {
+		t.Errorf("self-routed gc.routed_to = %q, want empty (dead self-route must be cleared so auto-route re-slings it)", gotSelf.Metadata["gc.routed_to"])
+	}
+
+	gotOther, err := store.Get(otherRouted.ID)
+	if err != nil {
+		t.Fatalf("get cross-routed work: %v", err)
+	}
+	if gotOther.Assignee != "" {
+		t.Errorf("cross-routed assignee = %q, want empty", gotOther.Assignee)
+	}
+	if gotOther.Metadata["gc.routed_to"] != "frontend/gastown.polecat" {
+		t.Errorf("cross-routed gc.routed_to = %q, want frontend/gastown.polecat (an unrelated live route must not be clobbered)", gotOther.Metadata["gc.routed_to"])
+	}
+}
+
 func TestReassignWorkAssignedToRetiredSessionBeadReassignsRigStoreSessionIdentifiers(t *testing.T) {
 	store := beads.NewMemStore()
 	rigStore := beads.NewMemStore()
