@@ -29,7 +29,7 @@ closes the bead once the PR is verified.
 
 Read each step's description before acting — Config values override defaults."""
 formula = "mol-refinery-patrol"
-version = 5
+version = 6
 contract = "graph.v2"
 
 [vars]
@@ -146,6 +146,45 @@ Search for work beads assigned to you with branch metadata:
 ```bash
 WORK=$(gc bd list --assignee=$GC_AGENT --status=open \
   --exclude-type=epic --limit=1 --json | jq -r '.[0].id // empty')
+```
+
+**Self-heal: recover work routed to you but left unassigned.** A polecat
+done-sequence hands a bead off by setting BOTH `assignee=$GC_AGENT` AND a
+`gc.routed_to` route that points at you (`$REFINERY_ROUTE` below). The query
+above only sees the assignee tier. If any release path clears the assignee
+while leaving that route pointing at you — orphan/crash recovery, an
+abandoned or partial reject, a manual edit — the bead becomes invisible to
+the assignee query and sits `ready` forever: you never re-claim your own
+routed pool, and the route pointing at you keeps the polecat pool away too.
+That is the exact dead-end behind ga-b91k / di-x9ud (ga-iri/ga-d7j/ga-zwy
+sat ~18 days).
+
+When the assignee query finds nothing, sweep the routed pool:
+```bash
+if [ -z "$WORK" ]; then
+  REFINERY_ROUTE="${GC_RIG:+$GC_RIG/}{{binding_prefix}}refinery"
+  STRANDED=$(gc bd list --metadata-field gc.routed_to="$REFINERY_ROUTE" \
+    --no-assignee --status=open --exclude-type=epic --limit=1 --json \
+    | jq -r '.[0].id // empty')
+  if [ -n "$STRANDED" ]; then
+    BRANCH=$(gc bd show "$STRANDED" --json | jq -r '.[0].metadata.branch // empty')
+    if [ -n "$BRANCH" ]; then
+      # Real merge handoff that lost its assignee: re-claim and merge it
+      # exactly like an assigned bead.
+      gc bd update "$STRANDED" --assignee="$GC_AGENT"
+      WORK="$STRANDED"
+    else
+      # No branch => this is dev work mis-routed to a refinery. You only
+      # merge, never implement, so return it to the polecat pool instead of
+      # dead-ending it here. Never leave a dev bead routed to a role that
+      # cannot implement dev work (ga-b91k).
+      gc bd update "$STRANDED" --status=open --assignee="" \
+        --set-metadata gc.routed_to="${GC_RIG:+$GC_RIG/}{{binding_prefix}}polecat"
+      # Leave WORK empty; fall through to the sleep+re-check below. The next
+      # sweep will not see this bead again (it is routed to the polecat now).
+    fi
+  fi
+fi
 ```
 
 If found: read the bead metadata to confirm it has a branch:

@@ -303,6 +303,7 @@ route through mayor.
 | Pour next wisp | `gc bd mol wisp mol-refinery-patrol --root-only --var target_branch={{ .DefaultBranch }} --var rig_name={{ .RigName }} --var binding_prefix={{ .BindingPrefix }}` |
 | Burn current wisp | `gc bd mol burn <wisp-id> --force` |
 | Find assigned work | `gc bd list --assignee="$GC_AGENT" --status=open` |
+| Recover stranded routed work | `gc bd list --metadata-field gc.routed_to="$REFINERY_ROUTE" --no-assignee --status=open` (see find-work step: claim if it has a branch, else bounce to the polecat pool) |
 | Snapshot event position | `gc events --seq` |
 | Wait for assignment | `gc events --watch --type=bead.updated --after=$SEQ` |
 | Read work metadata | `gc bd show $WORK --json \| jq '.[0].metadata'` |

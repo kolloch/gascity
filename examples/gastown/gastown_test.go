@@ -248,6 +248,54 @@ func TestRefineryFormulaSupportsMergeStrategies(t *testing.T) {
 	}
 }
 
+// TestRefineryFormulaRecoversStrandedRoutedWork guards the ROOT-cause fix
+// for ga-b91k / di-x9ud: dev beads dead-ended at
+// (gc.routed_to=<rig>/refinery, assignee=None, rejection_reason=None).
+//
+// The refinery is routed work via gc.routed_to=<rig>/refinery, but its
+// find-work query only ever matched by assignee ($GC_AGENT). So any release
+// path that cleared the assignee while leaving gc.routed_to pointing at the
+// refinery (orphan recovery, an abandoned/partial reject, a manual edit)
+// made the bead invisible to the refinery forever — and gc.routed_to=refinery
+// kept the polecat pool away too. ga-iri/ga-d7j/ga-zwy sat ~18 days ready.
+//
+// The fix makes the refinery self-heal its own routed pool: when no
+// assigned work is found, it sweeps gc.routed_to=<rig>/refinery + unassigned,
+// claims beads that carry a branch (orphaned legit merge handoffs), and
+// bounces branchless beads back to the polecat pool (dev work mis-routed to
+// a role that only merges, never implements — the bead's exact root cause).
+func TestRefineryFormulaRecoversStrandedRoutedWork(t *testing.T) {
+	dir := exampleDir()
+	path := filepath.Join(dir, "packs", "gastown", "formulas", "mol-refinery-patrol.toml")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("reading refinery formula: %v", err)
+	}
+	body := string(data)
+
+	// The recovery sweep must query routed-to-me work that lost its assignee.
+	for _, want := range []string{
+		`REFINERY_ROUTE="${GC_RIG:+$GC_RIG/}{{binding_prefix}}refinery"`,
+		`--metadata-field gc.routed_to="$REFINERY_ROUTE"`,
+		"--no-assignee",
+		".metadata.branch // empty",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("refinery formula missing stranded-work recovery clause %q", want)
+		}
+	}
+
+	// Branch present => claim and merge it; branch absent => bounce to the
+	// polecat pool. The claim must precede the bounce so a refinery agent
+	// recovers real merge handoffs before re-routing dev work.
+	assertContainsInOrder(t, body,
+		`STRANDED=$(gc bd list --metadata-field gc.routed_to="$REFINERY_ROUTE"`,
+		`BRANCH=$(gc bd show "$STRANDED"`,
+		`gc bd update "$STRANDED" --assignee="$GC_AGENT"`,
+		`--set-metadata gc.routed_to="${GC_RIG:+$GC_RIG/}{{binding_prefix}}polecat"`,
+	)
+}
+
 // TestRefineryFormulaChainsMergeMetadataWithClose guards against the
 // regression observed during concurrent fan-out (3 polecats, 3 work
 // beads, one refinery): when the formula presented `gc bd update
@@ -2769,9 +2817,12 @@ func TestGastownRefineryPouredWispsClaimInProgress(t *testing.T) {
 		t.Errorf("refinery formula description bootstrap missing in_progress claim: %q", bootstrapPour)
 	}
 
-	// The fix bumps the formula version so a re-synced city picks it up.
-	if !strings.Contains(formulaBody, "version = 5\n") {
-		t.Errorf("refinery formula version not bumped to 5 after the pour-site fix")
+	// Each behavioral fix bumps the formula version so a re-synced city
+	// picks it up. version 5 shipped the pour-site fix; version 6 shipped
+	// the stranded-routed-work self-heal (ga-b91k). Keep this pinned to the
+	// current version so an accidental version regression is caught.
+	if !strings.Contains(formulaBody, "version = 6\n") {
+		t.Errorf("refinery formula version not at expected current version 6")
 	}
 
 	prompt, err := os.ReadFile(filepath.Join(dir, "packs", "gastown", "agents", "refinery", "prompt.template.md"))
