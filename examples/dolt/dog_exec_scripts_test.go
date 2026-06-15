@@ -2629,6 +2629,70 @@ exit 0
 	}
 }
 
+// TestDoctorSkipBackupCheckShortCircuitsPerDBBackupCheck asserts that
+// GC_DOCTOR_SKIP_BACKUP_CHECK=1 fully short-circuits mol-dog-doctor's
+// per-DB backup freshness check (both the eligibility probe and the
+// freshness loop). A city that monitors backup freshness with its own
+// probe — e.g. dipcity's dolt-health-light.py, which does dedup-aware
+// per-rig freshness — sets this knob to delegate backup monitoring
+// entirely and avoid redundant WARN noise from the doctor's per-DB loop.
+//
+// The fixture mirrors TestDoctorBackupOnlyChecksDBsWithBackupRemote: prod
+// has a "prod-backup" remote but no artifact, so the un-skipped check
+// would emit "prod backup missing". With the knob set, no backup warning
+// may reach the mayor advisory, and the probe must still report server: ok.
+func TestDoctorSkipBackupCheckShortCircuitsPerDBBackupCheck(t *testing.T) {
+	cityPath := t.TempDir()
+	dataDir := filepath.Join(cityPath, "dolt-data")
+	artifactDir := filepath.Join(cityPath, ".dolt-backup")
+	if err := os.MkdirAll(artifactDir, 0o755); err != nil {
+		t.Fatalf("mkdir artifact dir: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(dataDir, "prod", ".dolt"), 0o755); err != nil {
+		t.Fatalf("mkdir prod: %v", err)
+	}
+
+	binDir := t.TempDir()
+	gcLogPath := writeDogFakeGC(t, binDir)
+	writeExecutable(t, filepath.Join(binDir, "dolt"), `#!/usr/bin/env bash
+set -euo pipefail
+case "$1" in
+  backup)
+    if [ "$(basename "$PWD")" = "prod" ]; then
+      printf 'prod-backup\n'
+    fi
+    exit 0
+    ;;
+esac
+case "$*" in
+  *"COUNT(*) FROM information_schema.PROCESSLIST"*)
+    printf 'COUNT(*)\n1\n'
+    exit 0
+    ;;
+  *"SHOW DATABASES"*)
+    printf 'Database\nprod\n'
+    exit 0
+    ;;
+esac
+exit 0
+`)
+
+	out := runDogScript(t, "mol-dog-doctor.sh", binDir, cityPath, dataDir,
+		"GC_DOCTOR_BACKUP_STALE_S=1", "GC_DOCTOR_SKIP_BACKUP_CHECK=1")
+	if !strings.Contains(out, "server: ok") {
+		t.Fatalf("unexpected doctor output:\n%s", out)
+	}
+	gcLog, err := os.ReadFile(gcLogPath)
+	if err != nil {
+		t.Fatalf("read gc log: %v", err)
+	}
+	for _, forbidden := range []string{"backup missing", "backup freshness", "backup is"} {
+		if strings.Contains(string(gcLog), forbidden) {
+			t.Fatalf("GC_DOCTOR_SKIP_BACKUP_CHECK=1 must short-circuit the per-DB backup check; found %q in advisory, log:\n%s", forbidden, gcLog)
+		}
+	}
+}
+
 func TestDoctorScriptDetectsDoctestOrphansWithBSDGrep(t *testing.T) {
 	cityPath := t.TempDir()
 	dataDir := filepath.Join(cityPath, "dolt-data")

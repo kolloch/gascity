@@ -19,6 +19,7 @@ CONN_MAX="${GC_DOCTOR_CONN_MAX:-50}"
 CONN_WARN_PCT="${GC_DOCTOR_CONN_WARN_PCT:-80}"
 BACKUP_STALE_S="${GC_DOCTOR_BACKUP_STALE_S:-43200}"  # 2x 6h backup interval
 BACKUP_ARTIFACT_DIR="${GC_BACKUP_ARTIFACT_DIR:-$GC_CITY_PATH/.dolt-backup}"
+SKIP_BACKUP_CHECK="${GC_DOCTOR_SKIP_BACKUP_CHECK:-0}"  # 1 = delegate backup monitoring to the city's own probe
 
 dolt_sql() {
     DOLT_CLI_PASSWORD="${GC_DOLT_PASSWORD:-}" \
@@ -119,37 +120,47 @@ fi
 # Scope mirrors mol-dog-backup.sh: only DBs with a configured <db>-backup
 # remote are eligible. Cities with user DBs but no backup remotes
 # (legitimate config) must not get false stale-backup alarms.
-BACKUP_ELIGIBLE_DBS=""
-for db in $USER_DBS; do
-    db_dir="$DOLT_DATA_DIR/$db"
-    if [ -d "$db_dir/.dolt" ]; then
-        if (cd "$db_dir" && dolt backup 2>/dev/null | awk '{print $1}' | grep -qx "${db}-backup"); then
-            BACKUP_ELIGIBLE_DBS="$BACKUP_ELIGIBLE_DBS $db"
-        fi
-    fi
-done
-BACKUP_ELIGIBLE_DBS=$(printf '%s\n' "$BACKUP_ELIGIBLE_DBS" | tr ' ' '\n' | grep -v '^$' || true)
-
+#
+# GC_DOCTOR_SKIP_BACKUP_CHECK=1 short-circuits the entire per-DB backup
+# check below (both the eligibility probe and the freshness loop). A city
+# that monitors backup freshness with its own probe — e.g. dipcity's
+# dolt-health-light.py, which does dedup-aware per-rig freshness — sets
+# this knob to delegate backup monitoring entirely and avoid redundant
+# WARN noise from this loop. Default unset (0) = current behavior, so
+# cities without their own probe see no regression.
 BACKUP_STALE=""
-if [ -n "$BACKUP_ELIGIBLE_DBS" ]; then
-    if [ ! -d "$BACKUP_ARTIFACT_DIR" ]; then
-        BACKUP_STALE=" [WARN: backup artifact dir missing]"
-    else
-        BACKUP_STALE_ITEMS=""
-        NOW_S=$(date +%s)
-        for db in $BACKUP_ELIGIBLE_DBS; do
-            NEWEST_BACKUP_MTIME=$(newest_backup_mtime_for_db "$db")
-            if [ "$NEWEST_BACKUP_MTIME" -le 0 ]; then
-                append_backup_stale "$db backup missing"
-                continue
+if [ "$SKIP_BACKUP_CHECK" != "1" ]; then
+    BACKUP_ELIGIBLE_DBS=""
+    for db in $USER_DBS; do
+        db_dir="$DOLT_DATA_DIR/$db"
+        if [ -d "$db_dir/.dolt" ]; then
+            if (cd "$db_dir" && dolt backup 2>/dev/null | awk '{print $1}' | grep -qx "${db}-backup"); then
+                BACKUP_ELIGIBLE_DBS="$BACKUP_ELIGIBLE_DBS $db"
             fi
-            BACKUP_AGE=$((NOW_S - NEWEST_BACKUP_MTIME))
-            if [ "$BACKUP_AGE" -gt "$BACKUP_STALE_S" ]; then
-                append_backup_stale "$db backup is $((BACKUP_AGE / 3600))h old"
+        fi
+    done
+    BACKUP_ELIGIBLE_DBS=$(printf '%s\n' "$BACKUP_ELIGIBLE_DBS" | tr ' ' '\n' | grep -v '^$' || true)
+
+    if [ -n "$BACKUP_ELIGIBLE_DBS" ]; then
+        if [ ! -d "$BACKUP_ARTIFACT_DIR" ]; then
+            BACKUP_STALE=" [WARN: backup artifact dir missing]"
+        else
+            BACKUP_STALE_ITEMS=""
+            NOW_S=$(date +%s)
+            for db in $BACKUP_ELIGIBLE_DBS; do
+                NEWEST_BACKUP_MTIME=$(newest_backup_mtime_for_db "$db")
+                if [ "$NEWEST_BACKUP_MTIME" -le 0 ]; then
+                    append_backup_stale "$db backup missing"
+                    continue
+                fi
+                BACKUP_AGE=$((NOW_S - NEWEST_BACKUP_MTIME))
+                if [ "$BACKUP_AGE" -gt "$BACKUP_STALE_S" ]; then
+                    append_backup_stale "$db backup is $((BACKUP_AGE / 3600))h old"
+                fi
+            done
+            if [ -n "$BACKUP_STALE_ITEMS" ]; then
+                BACKUP_STALE=" [WARN: backup freshness: $BACKUP_STALE_ITEMS]"
             fi
-        done
-        if [ -n "$BACKUP_STALE_ITEMS" ]; then
-            BACKUP_STALE=" [WARN: backup freshness: $BACKUP_STALE_ITEMS]"
         fi
     fi
 fi
