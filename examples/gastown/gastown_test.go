@@ -2819,10 +2819,11 @@ func TestGastownRefineryPouredWispsClaimInProgress(t *testing.T) {
 
 	// Each behavioral fix bumps the formula version so a re-synced city
 	// picks it up. version 5 shipped the pour-site fix; version 6 shipped
-	// the stranded-routed-work self-heal (ga-b91k). Keep this pinned to the
+	// the stranded-routed-work self-heal (ga-b91k); version 7 shipped the
+	// pack-formula-bug routing rule (ga-zwy). Keep this pinned to the
 	// current version so an accidental version regression is caught.
-	if !strings.Contains(formulaBody, "version = 6\n") {
-		t.Errorf("refinery formula version not at expected current version 6")
+	if !strings.Contains(formulaBody, "version = 7\n") {
+		t.Errorf("refinery formula version not at expected current version 7")
 	}
 
 	prompt, err := os.ReadFile(filepath.Join(dir, "packs", "gastown", "agents", "refinery", "prompt.template.md"))
