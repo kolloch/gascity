@@ -2913,20 +2913,26 @@ func (a *Agent) EffectiveOnDeath() string {
 	if a.PoolName != "" {
 		route = a.PoolName
 	}
-	// Reset both assignee and status: clearing assignee alone leaves the bead
-	// invisible to every work_query tier (Tier 1 needs assignee match, Tiers
-	// 2/3 only match "ready" status). The next worker re-claims via Tier 3
-	// (gc.routed_to + --unassigned). If routed metadata is missing entirely,
-	// backfill the fallback route so reopened direct-assigned work does not
-	// stay invisible.
+	// Re-park work on its route instead of clearing the assignee. A cleared
+	// assignee relies on the work_query's Tier 3 routed queue (gc.routed_to +
+	// --unassigned), but Tier 3 only fires for ephemeral sessions: work routed
+	// to a named-session target would never be re-discovered (ga-wv45). Setting
+	// assignee=route lets the route's own canonical work-finding re-claim it —
+	// a pool via the Tier-3b placeholder (assignee=route), a named session via
+	// Tier 2 (ready+assignee). Reset status to open so the bead re-enters the
+	// ready queue. If the bead carries no route, backfill the agent's route and
+	// park on it. This hook runs for a live, configured agent that respawns and
+	// re-claims its own work, so re-parking on the agent's identity is safe
+	// (unlike the removed-session path in unclaimWorkAssignedToRetiredSessionBead,
+	// where the identity is gone — see ga-wv45).
 	return `bd list --assignee=` + a.QualifiedName() +
 		` --status=in_progress --json 2>/dev/null | ` +
 		`jq -r '.[] | [.id, (.metadata["gc.routed_to"] // "")] | @tsv' 2>/dev/null | ` +
 		`while IFS="$(printf '\t')" read -r id current_route; do ` +
 		`[ -z "$id" ] && continue; ` +
 		`if [ -n "$current_route" ]; then ` +
-		`bd update "$id" --assignee "" --status open 2>/dev/null; ` +
-		`else bd update "$id" --assignee "" --status open --set-metadata gc.routed_to=` + route + ` 2>/dev/null; ` +
+		`bd update "$id" --assignee "$current_route" --status open 2>/dev/null; ` +
+		`else bd update "$id" --assignee "` + route + `" --status open --set-metadata gc.routed_to=` + route + ` 2>/dev/null; ` +
 		`fi; ` +
 		`done`
 }

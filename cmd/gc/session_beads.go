@@ -627,10 +627,23 @@ func unclaimWorkAssignedToRetiredSessionBead(
 					}
 					seen[key] = struct{}{}
 					update := beads.UpdateOpts{Assignee: &empty}
-					// Clearing assignee on an in_progress bead leaves it invisible to
-					// the work_query: Tier 1 needs an assignee match, Tiers 2/3 only
-					// match "ready" status. Reset to "open" so a fresh worker can
-					// re-claim via the routed queue (gc.routed_to + --unassigned).
+					// This path only fires for a genuinely REMOVED named session
+					// (retireRemovedConfiguredNamedSessionBead), so the assignee
+					// is cleared rather than re-parked on the route: the route is
+					// usually the removed session's own identity, which has no
+					// live agent left to re-claim, and parking work back on that
+					// identity would make the archived session bead look like it
+					// still owns work (sessionHasOpenAssignedWorkForConfig) and
+					// block re-adoption. Resetting an in_progress bead to "open"
+					// at least returns it to the routed queue (gc.routed_to +
+					// --unassigned), which an ephemeral pool worker can re-claim
+					// via the work_query's Tier 3. Work routed to a still-live
+					// NAMED target stays stranded here — Tier 3 is gated to
+					// ephemeral sessions — so rerouting genuinely-removed-named-
+					// session work to a fallback pool warrants its own design
+					// pass (ga-wv45). Contrast Agent.EffectiveOnDeath, which
+					// re-parks on the route because there the agent is live and
+					// respawns to re-claim via Tier 2.
 					if item.Status == "in_progress" {
 						update.Status = &open
 					}

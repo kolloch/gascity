@@ -4703,10 +4703,21 @@ func TestEffectiveOnDeathDefault(t *testing.T) {
 		MinActiveSessions: ptrInt(0), MaxActiveSessions: ptrInt(5),
 	}
 	got := a.EffectiveOnDeath()
-	for _, want := range []string{"bd list --assignee=myrig/dog", "--status=in_progress", `--assignee "" --status open`, "--set-metadata gc.routed_to=myrig/dog"} {
+	for _, want := range []string{
+		"bd list --assignee=myrig/dog",
+		"--status=in_progress",
+		`--assignee "$current_route" --status open`,
+		`--assignee "myrig/dog" --status open`,
+		"--set-metadata gc.routed_to=myrig/dog",
+	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("EffectiveOnDeath() = %q, want %q", got, want)
 		}
+	}
+	// ga-wv45: released work is re-parked on its route, never cleared to an
+	// empty assignee (which Tier 3 can only re-claim for ephemeral sessions).
+	if strings.Contains(got, `--assignee "" `) {
+		t.Errorf("EffectiveOnDeath() = %q, must not clear assignee to empty", got)
 	}
 }
 
@@ -4724,7 +4735,13 @@ func TestEffectiveOnDeathCustom(t *testing.T) {
 func TestEffectiveOnDeathFixedAgent(t *testing.T) {
 	a := Agent{Name: "mayor"}
 	got := a.EffectiveOnDeath()
-	for _, want := range []string{"bd list --assignee=mayor", "--status=in_progress", `--assignee "" --status open`, "--set-metadata gc.routed_to=mayor"} {
+	for _, want := range []string{
+		"bd list --assignee=mayor",
+		"--status=in_progress",
+		`--assignee "$current_route" --status open`,
+		`--assignee "mayor" --status open`,
+		"--set-metadata gc.routed_to=mayor",
+	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("EffectiveOnDeath() = %q, want %q", got, want)
 		}
@@ -4759,6 +4776,11 @@ esac
 	if !strings.Contains(log, "--set-metadata gc.routed_to=hello-world/dog") {
 		t.Fatalf("hook log = %q, want fallback route for ownerless reopened work", log)
 	}
+	// ga-wv45: routeless work is re-parked on the agent's fallback route, not
+	// cleared to an empty assignee.
+	if !strings.Contains(log, "--assignee hello-world/dog") {
+		t.Fatalf("hook log = %q, want work re-parked on the fallback route", log)
+	}
 }
 
 func TestEffectiveOnDeathPreservesExistingRouteOnReopen(t *testing.T) {
@@ -4785,6 +4807,48 @@ esac
 `)
 	if !strings.Contains(log, "--status open") {
 		t.Fatalf("hook log = %q, want reopened status", log)
+	}
+	if strings.Contains(log, "--set-metadata") {
+		t.Fatalf("hook log = %q, want existing route preserved without overwrite", log)
+	}
+	// ga-wv45: work is re-parked on its existing route so a named-session
+	// target re-claims via Tier 2 (ready+assignee).
+	if !strings.Contains(log, "--assignee already/routed --status open") {
+		t.Fatalf("hook log = %q, want work re-parked on its existing route", log)
+	}
+}
+
+func TestEffectiveOnDeathReparksWorkOnRouteForNamedSessionReclaim(t *testing.T) {
+	// Regression for ga-wv45: when a worker dies, its in-progress work must be
+	// re-parked on its gc.routed_to route (assignee=route), not cleared to an
+	// empty assignee. A cleared assignee relies on the work_query's Tier 3
+	// routed queue (gc.routed_to + --unassigned), which only fires for
+	// ephemeral sessions — a named-session route would never re-discover the
+	// work. assignee=route lets a named session re-claim via Tier 2
+	// (ready+assignee) and a pool via the Tier-3b placeholder.
+	a := Agent{
+		Name:              "dog-1",
+		Dir:               "hello-world",
+		MinActiveSessions: ptrInt(0), MaxActiveSessions: ptrInt(5),
+		PoolName: "hello-world/dog",
+	}
+
+	log := runLifecycleHookCommand(t, a.EffectiveOnDeath(), nil, `#!/bin/sh
+set -eu
+case "$1" in
+  list)
+    printf '[{"id":"ga-routed","metadata":{"gc.routed_to":"myrig/witness"}}]'
+    ;;
+  update)
+    printf '%s\n' "$*" >> "$BD_LOG"
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+`)
+	if !strings.Contains(log, "--assignee myrig/witness --status open") {
+		t.Fatalf("hook log = %q, want work re-parked on its named-session route (assignee=myrig/witness) for Tier-2 reclaim, not cleared empty", log)
 	}
 	if strings.Contains(log, "--set-metadata") {
 		t.Fatalf("hook log = %q, want existing route preserved without overwrite", log)

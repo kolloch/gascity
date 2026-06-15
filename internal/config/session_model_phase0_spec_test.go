@@ -111,11 +111,19 @@ func TestPhase0ConfigDefaults_OnDeathUnclaimsAssignedWorkByDefault(t *testing.T)
 	for _, want := range []string{
 		"bd list --assignee=myrig/worker",
 		"--status=in_progress",
-		"--assignee \"\"",
+		`--assignee "$current_route" --status open`,
+		`--assignee "myrig/worker" --status open`,
 	} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("EffectiveOnDeath() = %q, want %q", got, want)
 		}
+	}
+	// ga-wv45: OnDeath re-parks assigned work on its route for re-claim
+	// instead of clearing the assignee. A cleared assignee strands
+	// named-session-routed work, since the work_query's Tier 3 routed queue
+	// only re-claims for ephemeral sessions.
+	if strings.Contains(got, `--assignee "" `) {
+		t.Fatalf("EffectiveOnDeath() = %q, must not clear assignee to empty", got)
 	}
 }
 
