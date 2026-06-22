@@ -162,6 +162,108 @@ func TestInstallClaude(t *testing.T) {
 	}
 }
 
+// claudeDenyRules returns the permissions.deny list from a generated
+// settings.json document.
+func claudeDenyRules(t *testing.T, data []byte) []string {
+	t.Helper()
+	var cfg struct {
+		Permissions struct {
+			Deny []string `json:"deny"`
+		} `json:"permissions"`
+	}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		t.Fatalf("unmarshal claude permissions: %v", err)
+	}
+	return cfg.Permissions.Deny
+}
+
+func denyListContains(deny []string, tool string) bool {
+	for _, d := range deny {
+		if d == tool {
+			return true
+		}
+	}
+	return false
+}
+
+// TestInstallClaudeDeniesAskUserQuestion verifies the freeze-the-session
+// AskUserQuestion tool is denied for every managed agent (di-vnkz / ga-bste).
+// A bare tool-name deny rule removes the tool from Claude's context, which
+// is enforced even under --dangerously-skip-permissions — unlike a
+// PreToolUse hook, whose permissionDecision bypass mode does not honor.
+func TestInstallClaudeDeniesAskUserQuestion(t *testing.T) {
+	fs := fsys.NewFake()
+	if err := Install(fs, "/city", "/work", []string{"claude"}); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	runtimeData, ok := fs.Files["/city/.gc/settings.json"]
+	if !ok {
+		t.Fatal("expected /city/.gc/settings.json to be written")
+	}
+	if deny := claudeDenyRules(t, runtimeData); !denyListContains(deny, "AskUserQuestion") {
+		t.Errorf("permissions.deny should contain AskUserQuestion, got %v\n%s", deny, runtimeData)
+	}
+}
+
+// TestInstallClaudeAskUserQuestionDenySurvivesCityOverride defends the
+// hard-block guarantee against a city .claude/settings.json that defines its
+// own permissions block. The overlay merge resolves non-hook keys by
+// last-writer-wins, which would drop the base deny; the post-merge
+// enforcement must union AskUserQuestion back in while keeping the override's
+// own rules.
+func TestInstallClaudeAskUserQuestionDenySurvivesCityOverride(t *testing.T) {
+	fs := fsys.NewFake()
+	fs.Files["/city/.claude/settings.json"] = []byte(`{
+  "permissions": {
+    "deny": ["Bash(rm -rf *)"]
+  }
+}`)
+	if err := Install(fs, "/city", "/work", []string{"claude"}); err != nil {
+		t.Fatalf("Install: %v", err)
+	}
+	deny := claudeDenyRules(t, fs.Files["/city/.gc/settings.json"])
+	if !denyListContains(deny, "AskUserQuestion") {
+		t.Errorf("AskUserQuestion deny lost when city override defines permissions: %v", deny)
+	}
+	if !denyListContains(deny, "Bash(rm -rf *)") {
+		t.Errorf("city override's own deny rule should survive: %v", deny)
+	}
+}
+
+func TestEnsureClaudeToolsDenied(t *testing.T) {
+	t.Run("adds permissions and deny when absent", func(t *testing.T) {
+		out, err := ensureClaudeToolsDenied([]byte(`{"editorMode":"normal"}`), "AskUserQuestion")
+		if err != nil {
+			t.Fatalf("ensureClaudeToolsDenied: %v", err)
+		}
+		if deny := claudeDenyRules(t, out); !denyListContains(deny, "AskUserQuestion") {
+			t.Errorf("deny = %v, want AskUserQuestion", deny)
+		}
+	})
+
+	t.Run("idempotent and byte-stable when already present", func(t *testing.T) {
+		in := []byte(`{"permissions":{"deny":["AskUserQuestion"]}}`)
+		out, err := ensureClaudeToolsDenied(in, "AskUserQuestion")
+		if err != nil {
+			t.Fatalf("ensureClaudeToolsDenied: %v", err)
+		}
+		if !bytes.Equal(in, out) {
+			t.Errorf("expected unchanged bytes when tool already denied; got %s", out)
+		}
+	})
+
+	t.Run("unions without dropping existing rules", func(t *testing.T) {
+		out, err := ensureClaudeToolsDenied([]byte(`{"permissions":{"deny":["Existing"]}}`), "AskUserQuestion")
+		if err != nil {
+			t.Fatalf("ensureClaudeToolsDenied: %v", err)
+		}
+		deny := claudeDenyRules(t, out)
+		if !denyListContains(deny, "Existing") || !denyListContains(deny, "AskUserQuestion") {
+			t.Errorf("deny = %v, want both Existing and AskUserQuestion", deny)
+		}
+	})
+}
+
 func TestInstallClaudeUpgradesStaleGeneratedFile(t *testing.T) {
 	fs := fsys.NewFake()
 	current, err := readEmbedded("config/claude.json")

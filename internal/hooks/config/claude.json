@@ -2,6 +2,11 @@
   "skipDangerousModePermissionPrompt": true,
   "editorMode": "normal",
   "awaySummaryEnabled": false,
+  "permissions": {
+    "deny": [
+      "AskUserQuestion"
+    ]
+  },
   "hooks": {
     "SessionStart": [
       {

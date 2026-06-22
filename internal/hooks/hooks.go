@@ -450,7 +450,70 @@ func desiredClaudeSettings(fs fsys.FS, cityDir string) ([]byte, claudeSettingsSo
 		}
 		return nil, claudeSettingsSourceNone, fmt.Errorf("merging Claude settings from %s: %w", overridePath, err)
 	}
+	// The overlay merge resolves non-hook keys (including "permissions") by
+	// last-writer-wins, so a city override that defines its own permissions
+	// block would otherwise drop the embedded base's guard deny rules.
+	// Re-assert them after the merge so the guard cannot be silently lost.
+	merged, err = ensureClaudeToolsDenied(merged, claudeGuardedTools...)
+	if err != nil {
+		return nil, claudeSettingsSourceNone, fmt.Errorf("enforcing Claude tool guard on settings from %s: %w", overridePath, err)
+	}
 	return merged, sourceKind, nil
+}
+
+// claudeGuardedTools names Claude Code tools that managed Gas City sessions
+// must never be able to call. AskUserQuestion blocks the session on a
+// synchronous human answer, freezing an autonomous agent (and holding a
+// slot of the global agent-pool cap) until a human intervenes. A bare
+// tool-name deny rule removes the tool from the model's context entirely,
+// which — unlike a PreToolUse hook's permissionDecision — is enforced even
+// under --dangerously-skip-permissions (bypassPermissions only skips
+// prompts; deny rules always apply). The behavioral redirect for agents
+// (best-judgment, then mail, then a needs:human bead) lives in the role
+// prompts, keeping this guard role-agnostic. See ga-bste / di-vnkz.
+var claudeGuardedTools = []string{"AskUserQuestion"}
+
+// ensureClaudeToolsDenied guarantees that the settings document's
+// permissions.deny list contains each named tool, unioning them in rather
+// than replacing the list. It is idempotent: when every tool is already
+// present it returns the input bytes unchanged so repeated installs stay
+// byte-stable.
+func ensureClaudeToolsDenied(settings []byte, tools ...string) ([]byte, error) {
+	if len(tools) == 0 {
+		return settings, nil
+	}
+	var root map[string]any
+	if err := json.Unmarshal(settings, &root); err != nil {
+		return nil, err
+	}
+	if root == nil {
+		root = map[string]any{}
+	}
+	perms, ok := root["permissions"].(map[string]any)
+	if !ok {
+		perms = map[string]any{}
+		root["permissions"] = perms
+	}
+	deny, _ := perms["deny"].([]any)
+	present := make(map[string]bool, len(deny))
+	for _, d := range deny {
+		if s, ok := d.(string); ok {
+			present[s] = true
+		}
+	}
+	changed := false
+	for _, tool := range tools {
+		if !present[tool] {
+			deny = append(deny, tool)
+			present[tool] = true
+			changed = true
+		}
+	}
+	if !changed {
+		return settings, nil
+	}
+	perms["deny"] = deny
+	return overlay.MarshalCanonicalJSON(root)
 }
 
 func readClaudeSettingsOverride(fs fsys.FS, cityDir string, base []byte) (string, []byte, claudeSettingsSourceKind, error) {
