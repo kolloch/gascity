@@ -1,0 +1,88 @@
+#!/bin/sh
+# gascity pre-push hook — local mirror of the agent-pipeline vet gate.
+#
+# WHY THIS EXISTS (ga-9m26, di-sgjx, di-0pmi):
+#   The gascity rig's gate command (`go vet ./...`) is enforced inside the
+#   agent pipeline — the gastown polecat `self-review` step runs it before
+#   push, and the refinery re-runs it on the rebased SHA before merge. But a
+#   DIRECT commit + push to main (a mayor or human hotfix, outside the
+#   polecat -> refinery pipeline) bypasses that gate entirely. di-apxd showed
+#   this gap in dipcity (an unformatted file reached main and stalled the
+#   merge queue); di-sgjx asked each non-dipcity rig to close it locally.
+#
+#   This hook closes the gap for gascity: it runs the SAME gate (`go vet`)
+#   before every push, so direct pushes face the gate the pipeline enforces.
+#
+# WHY THE GATE IS HARD-CODED (not read from config):
+#   The dipcity hook reads its rig `lint_command` from city.toml at run time,
+#   but the gascity repo has NO city.toml (only the dipcity town-config repo
+#   carries one). So the gate is hard-coded here to mirror the gascity rig's
+#   `lint_command = "go vet ./..."` (dipcity city.toml) and the Makefile `vet`
+#   target. Keep all three in sync if the gascity gate ever changes —
+#   test/packlint/pre_push_hook_test.go guards the hook<->Makefile pairing.
+#
+# Install (one-time per clone): make setup
+#   (sets core.hooksPath=.githooks, activating this hook AND .githooks/pre-commit)
+#
+# Bypass (escape hatches):
+#   git push --no-verify
+#   GASCITY_SKIP_LINT_HOOK=1 git push
+#
+# On environment problems (no go toolchain / not a work tree) the hook prints a
+# warning and ALLOWS the push: this is a local convenience gate, and the
+# authoritative gate is still the refinery re-check. It fails CLOSED only on a
+# genuine `go vet` failure.
+
+set -eu
+
+# The gascity gate. Mirror of the gascity rig lint_command (dipcity city.toml)
+# and the Makefile `vet` target. test/packlint guards this against drift.
+lint_command="go vet ./..."
+
+if [ "${GASCITY_SKIP_LINT_HOOK:-}" = "1" ]; then
+    echo "pre-push: GASCITY_SKIP_LINT_HOOK=1 set — skipping gascity vet gate." >&2
+    exit 0
+fi
+
+# Run from the repo root so `./...` resolves the whole module, and so we gate
+# the tree actually being pushed (worktree-aware).
+repo_root=$(git rev-parse --show-toplevel 2>/dev/null) || {
+    echo "pre-push: not inside a git work tree — skipping gascity vet gate." >&2
+    exit 0
+}
+cd "$repo_root"
+
+# Test seam: print the resolved command and exit, without running it.
+if [ "${GASCITY_LINT_HOOK_DRYRUN:-}" = "1" ]; then
+    printf '%s' "$lint_command"
+    exit 0
+fi
+
+# The gate needs the Go toolchain; if `go` is missing we cannot gate locally —
+# warn and allow (the refinery re-gate still covers it).
+if ! command -v go >/dev/null 2>&1; then
+    echo "pre-push: go not found — cannot run gascity vet gate, skipping." >&2
+    echo "          install the Go toolchain (https://go.dev/dl/) to enable it." >&2
+    exit 0
+fi
+
+echo "pre-push: running gascity vet gate:" >&2
+echo "  $lint_command" >&2
+if sh -c "$lint_command"; then
+    echo "pre-push: gascity vet gate passed." >&2
+    exit 0
+fi
+
+cat >&2 <<'MSG'
+
+pre-push: gascity vet gate FAILED — push blocked.
+
+Fix the vet findings, then re-commit and re-push:
+  go vet ./...
+  # fix the reported issues
+  git add -u && git commit       # or: git commit --amend --no-edit
+
+To bypass (NOT recommended for pushes to main):
+  git push --no-verify
+MSG
+exit 1

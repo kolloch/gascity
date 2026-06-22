@@ -524,7 +524,7 @@ test-k8s:
 ## setup: install tools and git hooks
 setup: install-tools
 	git config core.hooksPath .githooks
-	@echo "Done. Tools installed, pre-commit hook active."
+	@echo "Done. Tools installed, git hooks active (pre-commit + pre-push)."
 
 ## docs-dev: run the Mintlify docs locally
 docs-dev:
