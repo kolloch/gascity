@@ -1,5 +1,7 @@
 #!/bin/sh
-# gc dolt compact — flatten Dolt commit history on managed databases.
+# gc dolt compact — reclaim Dolt storage on managed databases via two
+# decoupled mechanisms: flatten commit history above a commit threshold, and
+# periodically GC the working-set journal regardless of commit count.
 #
 # Why this exists: every bead mutation creates a Dolt commit. Over time
 # this builds an enormous commit graph (thousands of commits/day on busy
@@ -7,6 +9,13 @@
 # reclaim space when all commits are live history. Flattening squashes
 # the graph into a single commit and lets the next DOLT_GC reclaim
 # orphaned chunks.
+#
+# But the working-set journal (noms newgen) also grows with every commit,
+# independent of how large the commit graph is. A low-commit/high-write
+# database never crosses the flatten threshold, so without a separate path it
+# would never run DOLT_GC at all and its journal would bloat unbounded
+# (ga-qgtv). The below-threshold path closes that gap with a plain
+# time-cadenced CALL DOLT_GC().
 #
 # This command replaces the formula-based mol-dog-compactor that was
 # routed to the dog pool. Per the formula's own ZFC-exemption notice,
@@ -24,6 +33,13 @@
 #      full GC until preservation is proven.
 #   5. Run CALL DOLT_GC('--full') to reclaim chunks orphaned by the flatten.
 #
+# Algorithm (below-threshold journal-GC mode):
+#   When a database has fewer commits than the flatten threshold, flattening is
+#   skipped, but if at least GC_DOLT_COMPACT_GC_INTERVAL_SECS have elapsed since
+#   the last recorded journal GC (tracked per-DB in compact-last-gc markers), a
+#   plain CALL DOLT_GC() runs to reclaim the working-set journal. This is
+#   history-preserving and leaves noms/oldgen archives untouched.
+#
 # Remote push failures are recorded in compact-pending-push markers and do not
 # fail local compaction. Later runs retry those markers before threshold skips,
 # and unverified remote heads must become ancestry-verifiable before push.
@@ -40,7 +56,12 @@
 #   GC_DOLT_USER                          (default: root)
 #   GC_DOLT_PASSWORD                      (optional)
 #   GC_DOLT_COMPACT_THRESHOLD_COMMITS
-#     (default: 2000) — skip databases with fewer commits than this.
+#     (default: 2000) — flatten databases with at least this many commits.
+#                     Databases below it skip flatten but still run the
+#                     time-cadenced journal GC (see below).
+#   GC_DOLT_COMPACT_GC_INTERVAL_SECS
+#     (default: 43200) — minimum seconds between below-threshold journal GCs
+#                     per database. 0 runs journal GC on every invocation.
 #   GC_DOLT_COMPACT_CALL_TIMEOUT_SECS
 #     (default: 1800) — wall-clock bound for each SQL CALL.
 #   GC_DOLT_COMPACT_PUSH_TIMEOUT_SECS
@@ -55,7 +76,7 @@
 #                                         ambiguous multi-remote stores fail.
 #   GC_DOLT_COMPACT_DRY_RUN              (optional) — when set, prints
 #                                         what would happen but does not
-#                                         execute any DOLT_RESET / COMMIT.
+#                                         execute any DOLT_RESET / COMMIT / GC.
 #   GC_DOLT_COMPACT_ONLY_DBS              (optional) — comma-separated list of
 #                                         database names to compact. When set,
 #                                         all other databases are skipped.
@@ -131,6 +152,7 @@ fi
 
 host="${GC_DOLT_HOST:-127.0.0.1}"
 threshold_commits="${GC_DOLT_COMPACT_THRESHOLD_COMMITS:-2000}"
+journal_gc_interval_secs="${GC_DOLT_COMPACT_GC_INTERVAL_SECS:-43200}"
 call_timeout="${GC_DOLT_COMPACT_CALL_TIMEOUT_SECS:-1800}"
 push_timeout="${GC_DOLT_COMPACT_PUSH_TIMEOUT_SECS:-120}"
 pending_push_max_age_secs="${GC_DOLT_COMPACT_PENDING_PUSH_MAX_AGE_SECS:-172800}"
@@ -142,6 +164,14 @@ case "$threshold_commits" in
   ''|*[!0-9]*)
     printf 'compact: invalid GC_DOLT_COMPACT_THRESHOLD_COMMITS=%s (must be a non-negative integer)\n' \
       "$threshold_commits" >&2
+    exit 2
+    ;;
+esac
+
+case "$journal_gc_interval_secs" in
+  ''|*[!0-9]*)
+    printf 'compact: invalid GC_DOLT_COMPACT_GC_INTERVAL_SECS=%s (must be a non-negative integer)\n' \
+      "$journal_gc_interval_secs" >&2
     exit 2
     ;;
 esac
@@ -216,6 +246,7 @@ lock_cmd_path="$lock_dir/cmd"
 pending_gc_dir="$PACK_STATE_DIR/compact-pending-gc"
 pending_push_dir="$PACK_STATE_DIR/compact-pending-push"
 quarantine_dir="$PACK_STATE_DIR/compact-quarantine"
+last_gc_dir="$PACK_STATE_DIR/compact-last-gc"
 
 # DB discovery uses rig metadata.json files first (authoritative), with a
 # filesystem-scan fallback when gc itself is unavailable.
@@ -883,16 +914,81 @@ clear_compact_marker() {
   rm -f "$(compact_marker_path "$dir" "$db")"
 }
 
-run_full_gc() {
+# journal_gc_due — true (0) when periodic journal GC should run for this DB:
+# no prior last-gc marker, an unreadable/invalid marker, or a marker older
+# than journal_gc_interval_secs. An interval of 0 means "always due". A marker
+# stamped in the future (clock skew) is treated as due so a bad clock can't
+# wedge GC off indefinitely.
+journal_gc_due() {
   db="$1"
-  failure_prefix="$2"
-  success_prefix="$3"
-  start="$4"
+  if [ "$journal_gc_interval_secs" -eq 0 ]; then
+    return 0
+  fi
+  last_epoch=$(compact_marker_created_at_epoch "$last_gc_dir" "$db" 2>/dev/null || true)
+  if [ -z "$last_epoch" ]; then
+    return 0
+  fi
+  now_epoch=$(date -u +%s)
+  age_secs=$(( now_epoch - last_epoch ))
+  if [ "$age_secs" -lt 0 ]; then
+    return 0
+  fi
+  [ "$age_secs" -ge "$journal_gc_interval_secs" ]
+}
 
-  printf 'compact: db=%s — running DOLT_GC --full...\n' "$db"
+# record_journal_gc — write/refresh the last-periodic-GC marker with the
+# current timestamp. Unlike write_compact_marker (which preserves the original
+# created_at), this always stamps "now" so journal_gc_due measures elapsed time
+# since the most recent GC, not since the marker first appeared.
+record_journal_gc() {
+  db="$1"
+  now_iso=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  old_umask=$(umask)
+  umask 077
+  if ! mkdir -p "$last_gc_dir"; then
+    umask "$old_umask"
+    printf 'compact: db=%s unable to create last-gc marker directory %s\n' "$db" "$last_gc_dir" >&2
+    return 1
+  fi
+  tmp=$(mktemp "$last_gc_dir/$db.tmp.XXXXXX") || {
+    umask "$old_umask"
+    printf 'compact: db=%s unable to create last-gc marker in %s\n' "$db" "$last_gc_dir" >&2
+    return 1
+  }
+  umask "$old_umask"
+  {
+    printf 'db=%s\n' "$db"
+    printf 'reason=%s\n' "periodic journal GC"
+    printf 'created_at=%s\n' "$now_iso"
+  } > "$tmp" || {
+    rm -f "$tmp"
+    printf 'compact: db=%s unable to write last-gc marker %s\n' "$db" "$tmp" >&2
+    return 1
+  }
+  marker_path=$(compact_marker_path "$last_gc_dir" "$db")
+  if ! mv -f "$tmp" "$marker_path"; then
+    rm -f "$tmp"
+    printf 'compact: db=%s unable to install last-gc marker in %s\n' "$db" "$last_gc_dir" >&2
+    return 1
+  fi
+  return 0
+}
+
+# _run_dolt_gc_call — shared GC runner: execute one DOLT_GC SQL variant with
+# timing and error capture. running_msg/gc_call describe the variant; the
+# failure/success prefixes are the caller's context.
+_run_dolt_gc_call() {
+  db="$1"
+  running_msg="$2"
+  gc_call="$3"
+  failure_prefix="$4"
+  success_prefix="$5"
+  start="$6"
+
+  printf 'compact: db=%s — %s...\n' "$db" "$running_msg"
   gc_rc=0
   gc_err_tmp=$(mktemp)
-  dolt_query "$db" "CALL DOLT_GC('--full')" >/dev/null 2>"$gc_err_tmp" || gc_rc=$?
+  dolt_query "$db" "$gc_call" >/dev/null 2>"$gc_err_tmp" || gc_rc=$?
 
   elapsed=$(( $(date +%s) - start ))
   if [ "$gc_rc" -ne 0 ]; then
@@ -907,6 +1003,19 @@ run_full_gc() {
   printf 'compact: db=%s %s duration=%ss — ok\n' \
     "$db" "$success_prefix" "$elapsed"
   return 0
+}
+
+# run_full_gc — CALL DOLT_GC('--full'): reclaims working-set chunks AND
+# rewrites noms/oldgen archives. Used after a flatten orphans the whole graph.
+run_full_gc() {
+  _run_dolt_gc_call "$1" "running DOLT_GC --full" "CALL DOLT_GC('--full')" "$2" "$3" "$4"
+}
+
+# run_journal_gc — CALL DOLT_GC(): reclaims only the working-set journal
+# (noms newgen), leaving oldgen archives in place. Used by the below-threshold
+# periodic path where flattening is not warranted but the journal still grows.
+run_journal_gc() {
+  _run_dolt_gc_call "$1" "running DOLT_GC (journal reclaim)" "CALL DOLT_GC()" "$2" "$3" "$4"
 }
 
 push_remote_after_compaction() {
@@ -1276,14 +1385,37 @@ flatten_database() {
   esac
 
   if [ "$count" -lt "$threshold_commits" ]; then
+    # Below the flatten threshold, rewriting history is not warranted — but the
+    # working-set journal grows with every commit regardless of commit count,
+    # so a low-commit/high-write database would otherwise never reclaim it
+    # (ga-qgtv). Decouple periodic journal GC from the flatten threshold: run a
+    # plain DOLT_GC() on a time cadence (GC_DOLT_COMPACT_GC_INTERVAL_SECS) to
+    # reclaim the journal. Plain GC leaves noms/oldgen archives in place; those
+    # are only reclaimed by the --full GC that follows a flatten once the DB
+    # crosses the threshold.
     if oldgen_has_files "$db"; then
-      printf 'compact: db=%s commits=%s below_threshold=%s oldgen_archives=present pending_gc=absent — skip\n' \
-        "$db" "$count" "$threshold_commits"
+      oldgen_state="present"
+    else
+      oldgen_state="absent"
+    fi
+    if ! journal_gc_due "$db"; then
+      printf 'compact: db=%s commits=%s below_threshold=%s oldgen_archives=%s journal_gc=fresh — skip\n' \
+        "$db" "$count" "$threshold_commits" "$oldgen_state"
       return 0
     fi
-    printf 'compact: db=%s commits=%s below_threshold=%s — skip\n' \
-      "$db" "$count" "$threshold_commits"
-    return 0
+    if [ -n "$dry_run" ]; then
+      printf 'compact: db=%s commits=%s below_threshold=%s oldgen_archives=%s — dry-run (would run periodic DOLT_GC)\n' \
+        "$db" "$count" "$threshold_commits" "$oldgen_state"
+      return 0
+    fi
+    ensure_compact_marker_writable "$last_gc_dir" "$db" || return 1
+    start=$(date +%s)
+    journal_gc_context="journal GC below_threshold=$threshold_commits commits=$count oldgen_archives=$oldgen_state"
+    if run_journal_gc "$db" "$journal_gc_context" "$journal_gc_context" "$start"; then
+      record_journal_gc "$db" || return 1
+      return 0
+    fi
+    return 1
   fi
 
   if ! root=$(root_commit "$db"); then

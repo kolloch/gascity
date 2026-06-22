@@ -1,5 +1,5 @@
 [order]
-description = "Flatten Dolt commit history to reduce storage"
+description = "Flatten Dolt commit history and reclaim the journal to reduce storage"
 trigger = "cooldown"
 interval = "24h"
 exec = "gc dolt compact"

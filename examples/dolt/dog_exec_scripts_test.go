@@ -159,6 +159,7 @@ func (f compactScriptFixture) run(t *testing.T, mode string, extraEnv ...string)
 		"GC_DOLT_PASSWORD",
 		"GC_DOLT_MANAGED_LOCAL",
 		"GC_DOLT_COMPACT_THRESHOLD_COMMITS",
+		"GC_DOLT_COMPACT_GC_INTERVAL_SECS",
 		"GC_DOLT_COMPACT_CALL_TIMEOUT_SECS",
 		"GC_DOLT_COMPACT_PUSH_TIMEOUT_SECS",
 		"GC_DOLT_COMPACT_DRY_RUN",
@@ -681,21 +682,163 @@ exit 64
 	return logPath
 }
 
-func TestCompactScriptSkipsBelowThresholdWithoutFlattening(t *testing.T) {
+func TestCompactScriptRunsJournalGCBelowThresholdWithoutFlattening(t *testing.T) {
 	fixture := newCompactScriptFixture(t)
 	out, err := fixture.run(t, "below_threshold", "GC_DOLT_COMPACT_THRESHOLD_COMMITS=500")
 	if err != nil {
 		t.Fatalf("compact failed: %v\n%s", err, out)
 	}
-	if !strings.Contains(out, "below_threshold=500") {
-		t.Fatalf("output missing below-threshold skip:\n%s", out)
+	if !strings.Contains(out, "journal GC below_threshold=500") {
+		t.Fatalf("output missing below-threshold journal-GC context:\n%s", out)
+	}
+	if !strings.Contains(out, "— ok") {
+		t.Fatalf("below-threshold run should reclaim the journal via DOLT_GC:\n%s", out)
 	}
 	data, err := os.ReadFile(fixture.doltLog)
 	if err != nil {
 		t.Fatalf("read dolt log: %v", err)
 	}
-	if strings.Contains(string(data), "DOLT_RESET") || strings.Contains(string(data), "DOLT_COMMIT") {
-		t.Fatalf("below-threshold compact must not flatten:\n%s", data)
+	log := string(data)
+	if strings.Contains(log, "DOLT_RESET") || strings.Contains(log, "DOLT_COMMIT") {
+		t.Fatalf("below-threshold compact must not flatten:\n%s", log)
+	}
+	// The journal grows with every commit regardless of commit count, so a
+	// below-threshold database must still reclaim it with a plain DOLT_GC()
+	// (ga-qgtv). The --full variant (oldgen reclaim) stays flatten-gated.
+	if !strings.Contains(log, "CALL DOLT_GC()") {
+		t.Fatalf("below-threshold compact must reclaim journal via DOLT_GC:\n%s", log)
+	}
+	if strings.Contains(log, "DOLT_GC('--full')") {
+		t.Fatalf("below-threshold compact must not run --full GC:\n%s", log)
+	}
+	marker := filepath.Join(fixture.cityPath, ".gc", "runtime", "packs", "dolt", "compact-last-gc", "beads")
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("below-threshold journal GC should record a last-gc marker: %v", err)
+	}
+}
+
+func TestCompactScriptRateLimitsBelowThresholdJournalGC(t *testing.T) {
+	fixture := newCompactScriptFixture(t)
+	firstOut, err := fixture.run(t, "below_threshold", "GC_DOLT_COMPACT_THRESHOLD_COMMITS=500")
+	if err != nil {
+		t.Fatalf("first below-threshold run failed:\n%s", firstOut)
+	}
+	secondOut, err := fixture.run(t, "below_threshold", "GC_DOLT_COMPACT_THRESHOLD_COMMITS=500")
+	if err != nil {
+		t.Fatalf("second below-threshold run failed:\n%s", secondOut)
+	}
+	if !strings.Contains(secondOut, "journal_gc=fresh — skip") {
+		t.Fatalf("second run within the GC interval should skip:\n%s", secondOut)
+	}
+	logData, err := os.ReadFile(fixture.doltLog)
+	if err != nil {
+		t.Fatalf("read dolt log: %v", err)
+	}
+	if got := strings.Count(string(logData), "CALL DOLT_GC()"); got != 1 {
+		t.Fatalf("journal GC should run once within the interval, ran %d times:\n%s", got, logData)
+	}
+}
+
+func TestCompactScriptRerunsBelowThresholdJournalGCWhenIntervalElapsed(t *testing.T) {
+	fixture := newCompactScriptFixture(t)
+	firstOut, err := fixture.run(t, "below_threshold", "GC_DOLT_COMPACT_THRESHOLD_COMMITS=500")
+	if err != nil {
+		t.Fatalf("first below-threshold run failed:\n%s", firstOut)
+	}
+	marker := filepath.Join(fixture.cityPath, ".gc", "runtime", "packs", "dolt", "compact-last-gc", "beads")
+	replaceCompactMarkerCreatedAt(t, marker, "2020-01-01T00:00:00Z")
+
+	secondOut, err := fixture.run(t, "below_threshold", "GC_DOLT_COMPACT_THRESHOLD_COMMITS=500")
+	if err != nil {
+		t.Fatalf("second below-threshold run failed:\n%s", secondOut)
+	}
+	if !strings.Contains(secondOut, "journal GC below_threshold=500") || !strings.Contains(secondOut, "— ok") {
+		t.Fatalf("stale marker should trigger another journal GC:\n%s", secondOut)
+	}
+	logData, err := os.ReadFile(fixture.doltLog)
+	if err != nil {
+		t.Fatalf("read dolt log: %v", err)
+	}
+	if got := strings.Count(string(logData), "CALL DOLT_GC()"); got != 2 {
+		t.Fatalf("journal GC should rerun after the interval elapses, ran %d times:\n%s", got, logData)
+	}
+	if refreshed := compactMarkerValue(t, marker, "created_at"); strings.HasPrefix(refreshed, "2020-") {
+		t.Fatalf("journal GC should refresh the last-gc marker timestamp, got %s", refreshed)
+	}
+}
+
+func TestCompactScriptBelowThresholdJournalGCIntervalZeroAlwaysRuns(t *testing.T) {
+	fixture := newCompactScriptFixture(t)
+	for i := 0; i < 2; i++ {
+		out, err := fixture.run(t, "below_threshold",
+			"GC_DOLT_COMPACT_THRESHOLD_COMMITS=500", "GC_DOLT_COMPACT_GC_INTERVAL_SECS=0")
+		if err != nil {
+			t.Fatalf("run %d failed:\n%s", i, out)
+		}
+	}
+	logData, err := os.ReadFile(fixture.doltLog)
+	if err != nil {
+		t.Fatalf("read dolt log: %v", err)
+	}
+	if got := strings.Count(string(logData), "CALL DOLT_GC()"); got != 2 {
+		t.Fatalf("interval=0 should GC on every run, ran %d times:\n%s", got, logData)
+	}
+}
+
+func TestCompactScriptDryRunSkipsBelowThresholdJournalGC(t *testing.T) {
+	fixture := newCompactScriptFixture(t)
+	out, err := fixture.run(t, "below_threshold",
+		"GC_DOLT_COMPACT_THRESHOLD_COMMITS=500", "GC_DOLT_COMPACT_DRY_RUN=1")
+	if err != nil {
+		t.Fatalf("dry-run below-threshold failed:\n%s", out)
+	}
+	if !strings.Contains(out, "dry-run (would run periodic DOLT_GC)") {
+		t.Fatalf("dry-run below-threshold missing explanation:\n%s", out)
+	}
+	logData, err := os.ReadFile(fixture.doltLog)
+	if err != nil {
+		t.Fatalf("read dolt log: %v", err)
+	}
+	if strings.Contains(string(logData), "DOLT_GC") {
+		t.Fatalf("dry-run must not run journal GC:\n%s", logData)
+	}
+	marker := filepath.Join(fixture.cityPath, ".gc", "runtime", "packs", "dolt", "compact-last-gc", "beads")
+	if _, statErr := os.Stat(marker); !os.IsNotExist(statErr) {
+		t.Fatalf("dry-run must not record a last-gc marker, stat err=%v", statErr)
+	}
+}
+
+func TestCompactScriptBelowThresholdJournalGCFailureSurfacesError(t *testing.T) {
+	fixture := newCompactScriptFixture(t)
+	out, err := fixture.run(t, "gc_failure", "GC_DOLT_COMPACT_THRESHOLD_COMMITS=5000")
+	if err == nil {
+		t.Fatalf("below-threshold journal GC failure should fail the run:\n%s", out)
+	}
+	if !strings.Contains(out, "DOLT_GC failed") {
+		t.Fatalf("output missing journal GC failure explanation:\n%s", out)
+	}
+	logData, err := os.ReadFile(fixture.doltLog)
+	if err != nil {
+		t.Fatalf("read dolt log: %v", err)
+	}
+	if strings.Contains(string(logData), "DOLT_RESET") {
+		t.Fatalf("below-threshold journal GC failure must not flatten:\n%s", logData)
+	}
+	marker := filepath.Join(fixture.cityPath, ".gc", "runtime", "packs", "dolt", "compact-last-gc", "beads")
+	if _, statErr := os.Stat(marker); !os.IsNotExist(statErr) {
+		t.Fatalf("failed journal GC must not record a last-gc marker, stat err=%v", statErr)
+	}
+}
+
+func TestCompactScriptRejectsInvalidGCInterval(t *testing.T) {
+	fixture := newCompactScriptFixture(t)
+	out, err := fixture.run(t, "below_threshold",
+		"GC_DOLT_COMPACT_THRESHOLD_COMMITS=500", "GC_DOLT_COMPACT_GC_INTERVAL_SECS=soon")
+	if err == nil {
+		t.Fatalf("invalid GC interval should fail:\n%s", out)
+	}
+	if !strings.Contains(out, "invalid GC_DOLT_COMPACT_GC_INTERVAL_SECS") {
+		t.Fatalf("output missing interval validation message:\n%s", out)
 	}
 }
 
@@ -2074,7 +2217,7 @@ func TestCompactScriptKeepsPendingGCWhenPendingPushHandoffCannotBeWritten(t *tes
 	}
 }
 
-func TestCompactScriptSkipsHealthyBelowThresholdOldgenWithoutPendingMarker(t *testing.T) {
+func TestCompactScriptRunsJournalGCForBelowThresholdOldgenWithoutPendingMarker(t *testing.T) {
 	fixture := newCompactScriptFixture(t)
 	oldgen := filepath.Join(fixture.dataDir, "beads", ".dolt", "noms", "oldgen")
 	if err := os.MkdirAll(oldgen, 0o755); err != nil {
@@ -2086,17 +2229,26 @@ func TestCompactScriptSkipsHealthyBelowThresholdOldgenWithoutPendingMarker(t *te
 
 	out, err := fixture.run(t, "below_threshold")
 	if err != nil {
-		t.Fatalf("healthy below-threshold oldgen should skip:\n%s", out)
+		t.Fatalf("healthy below-threshold oldgen should reclaim the journal:\n%s", out)
 	}
-	if !strings.Contains(out, "oldgen_archives=present pending_gc=absent") {
-		t.Fatalf("output missing healthy oldgen skip explanation:\n%s", out)
+	if !strings.Contains(out, "oldgen_archives=present") {
+		t.Fatalf("output missing oldgen presence in journal-GC explanation:\n%s", out)
 	}
 	logData, err := os.ReadFile(fixture.doltLog)
 	if err != nil {
 		t.Fatalf("read dolt log: %v", err)
 	}
-	if strings.Contains(string(logData), "DOLT_GC") {
-		t.Fatalf("healthy below-threshold oldgen must not run full GC:\n%s", logData)
+	log := string(logData)
+	// Plain journal GC reclaims the newgen journal even when oldgen archives
+	// are present; the --full GC that reclaims oldgen stays flatten-gated.
+	if !strings.Contains(log, "CALL DOLT_GC()") {
+		t.Fatalf("below-threshold oldgen run should reclaim journal via DOLT_GC:\n%s", log)
+	}
+	if strings.Contains(log, "DOLT_GC('--full')") {
+		t.Fatalf("below-threshold oldgen run must not run --full GC:\n%s", log)
+	}
+	if strings.Contains(log, "DOLT_RESET") {
+		t.Fatalf("below-threshold oldgen run must not flatten:\n%s", log)
 	}
 }
 

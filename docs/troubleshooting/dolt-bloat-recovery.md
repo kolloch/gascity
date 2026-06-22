@@ -86,14 +86,22 @@ If GC finishes but the size barely moves, the chunks are nearly all live
   managed-Dolt floor; newer releases ship improved auto-GC heuristics and
   default archive compression.
 - **Let the dolt pack's `mol-dog-compactor` order run continuously.**
-  It ships embedded in the dolt pack and runs `gc dolt compact` once a
-  managed database crosses the commit threshold. Compaction fetches the
+  It ships embedded in the dolt pack and runs `gc dolt compact`. When a
+  managed database crosses the commit threshold
+  (`GC_DOLT_COMPACT_THRESHOLD_COMMITS`, default 2000), compaction fetches the
   configured remote, flattens live history, runs `CALL DOLT_GC('--full')`,
   and pushes the rewritten main branch back upstream. Dolt 1.86.x does not
   support an atomic `DOLT_PUSH('--force-with-lease', ...)`, so the script
   re-fetches and compares the remote head immediately before its force push.
   That check prevents known drift but cannot eliminate a remote write in the
   small fetch-to-push window.
+- **Below-threshold databases still get their journal reclaimed.** A
+  low-commit/high-write database never crosses the flatten threshold, but its
+  working-set journal (noms newgen) still grows with every write. For those
+  databases the compactor runs a plain `CALL DOLT_GC()` on a time cadence
+  (`GC_DOLT_COMPACT_GC_INTERVAL_SECS`, default 12h, tracked per-database) so the
+  journal is reclaimed without rewriting history. This is what keeps a quiet,
+  low-commit city from silently bloating to multi-GB journals between flattens.
 - **Mind `orders.max_timeout` if you set one.** The compactor order asks
   for a 24-hour timeout to accommodate serialized full-GC runs on large
   stores. A city-level `orders.max_timeout` below 24h will cap the
