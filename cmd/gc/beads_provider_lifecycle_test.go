@@ -446,6 +446,35 @@ func TestGcBeadsBdShellFallbackSanitizesArchiveLevel(t *testing.T) {
 	}
 }
 
+func TestGcBeadsBdPassesSanitizedMetricsPort(t *testing.T) {
+	cityPath := t.TempDir()
+	if err := MaterializeBuiltinPacks(cityPath); err != nil {
+		t.Fatalf("MaterializeBuiltinPacks: %v", err)
+	}
+	scriptData, err := os.ReadFile(gcBeadsBdScriptPath(cityPath))
+	if err != nil {
+		t.Fatalf("ReadFile(gc-beads-bd): %v", err)
+	}
+	script := string(scriptData)
+	// Raw, unsanitized interpolation into the gc helper invocation or the yaml
+	// would let a hostile/garbled GC_DOLT_METRICS_PORT inject shell or break the
+	// config; the value must flow through the sanitized $metrics_port variable.
+	if strings.Contains(script, `--metrics-port="${GC_DOLT_METRICS_PORT`) {
+		t.Fatalf("gc-beads-bd passes GC_DOLT_METRICS_PORT to the gc helper unsanitized")
+	}
+	for _, want := range []string{
+		"metrics_port=${GC_DOLT_METRICS_PORT:--1}", // sanitized default (off)
+		`--metrics-port="$metrics_port"`,           // gc-bin path uses sanitized var
+		`if [ "$metrics_port" -gt 0 ] 2>/dev/null`, // inline fallback arms only on positive port
+		"host: 127.0.0.1",                          // forensic listener is localhost-only
+		"port: $metrics_port",                      // inline fallback emits the armed port
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("gc-beads-bd missing sanitized metrics-port pattern %q", want)
+		}
+	}
+}
+
 func TestGcBeadsBdInitRejectsManagedProbeDatabaseName(t *testing.T) {
 	for _, dbName := range []string{
 		managedDoltProbeDatabase,
@@ -8994,7 +9023,7 @@ func TestManagedDoltConfigGoWriterMatchesShellFallbackSemantics(t *testing.T) {
 		t.Fatal(err)
 	}
 	goConfigPath := filepath.Join(t.TempDir(), "go", "dolt-config.yaml")
-	if err := writeManagedDoltConfigFile(goConfigPath, "0.0.0.0", "3311", filepath.Join(cityPath, ".beads", "dolt"), "info", 0); err != nil {
+	if err := writeManagedDoltConfigFile(goConfigPath, "0.0.0.0", "3311", filepath.Join(cityPath, ".beads", "dolt"), "info", 0, -1); err != nil {
 		t.Fatalf("writeManagedDoltConfigFile: %v", err)
 	}
 

@@ -584,14 +584,16 @@ func TestBuildSupervisorServiceDataReadsAllowlistedDoltCredentialKeysFromLaunchc
 		"GC_DOLT_USER",
 		"GC_DOLT_PASSWORD",
 		"GC_DOLT_LOGLEVEL",
+		"GC_DOLT_METRICS_PORT",
 	} {
 		t.Setenv(key, "")
 	}
 
 	stub := map[string]string{
-		"GC_DOLT_USER":     "gc_user",
-		"GC_DOLT_PASSWORD": "redacted-test-value",
-		"GC_DOLT_LOGLEVEL": "debug",
+		"GC_DOLT_USER":         "gc_user",
+		"GC_DOLT_PASSWORD":     "redacted-test-value",
+		"GC_DOLT_LOGLEVEL":     "debug",
+		"GC_DOLT_METRICS_PORT": "51913",
 	}
 	prev := supervisorLaunchctlGetenv
 	supervisorLaunchctlGetenv = func(key string) string { return stub[key] }

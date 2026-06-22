@@ -29,6 +29,7 @@ func newDoltConfigCmd(_ io.Writer, stderr io.Writer) *cobra.Command {
 		dataDir      string
 		logLevel     string
 		archiveLevel int
+		metricsPort  int
 		cityPath     string
 		scopeDir     string
 		issuePrefix  string
@@ -41,7 +42,7 @@ func newDoltConfigCmd(_ io.Writer, stderr io.Writer) *cobra.Command {
 		Hidden: true,
 		Args:   cobra.NoArgs,
 		RunE: func(_ *cobra.Command, _ []string) error {
-			if err := writeManagedDoltConfigFile(configFile, host, port, dataDir, logLevel, archiveLevel); err != nil {
+			if err := writeManagedDoltConfigFile(configFile, host, port, dataDir, logLevel, archiveLevel, metricsPort); err != nil {
 				fmt.Fprintf(stderr, "gc dolt-config write-managed: %v\n", err) //nolint:errcheck
 				return errExit
 			}
@@ -54,6 +55,7 @@ func newDoltConfigCmd(_ io.Writer, stderr io.Writer) *cobra.Command {
 	writeManaged.Flags().StringVar(&dataDir, "data-dir", "", "Dolt data directory")
 	writeManaged.Flags().StringVar(&logLevel, "log-level", "warning", "Dolt log level")
 	writeManaged.Flags().IntVar(&archiveLevel, "archive-level", 0, "Dolt auto_gc archive_level (0=off, 1=on)")
+	writeManaged.Flags().IntVar(&metricsPort, "metrics-port", -1, "Dolt forensic metrics port, localhost-only (<=0 disables; break-glass only)")
 	_ = writeManaged.MarkFlagRequired("file")
 	_ = writeManaged.MarkFlagRequired("host")
 	_ = writeManaged.MarkFlagRequired("port")
@@ -100,7 +102,16 @@ func newDoltConfigCmd(_ io.Writer, stderr io.Writer) *cobra.Command {
 	return cmd
 }
 
-func writeManagedDoltConfigFile(path, host, port, dataDir, logLevel string, archiveLevel int) error {
+// writeManagedDoltConfigFile writes the managed Dolt SQL server config.
+//
+// metricsPort arms Dolt's Prometheus metrics listener (which also exposes the
+// concurrent-query/connection gauges) on localhost only. It is an off-by-default
+// forensic break-glass: a positive value emits a `metrics` block so a recurring
+// Dolt CPU storm can be correlated with query/connection load before the
+// dolt-cpu-restart break-glass restarts the server. Values <= 0 omit the block
+// entirely, leaving the default config byte-identical. The listener is pinned to
+// 127.0.0.1 so the diagnostic port is never reachable off-host.
+func writeManagedDoltConfigFile(path, host, port, dataDir, logLevel string, archiveLevel, metricsPort int) error {
 	if path == "" {
 		return fmt.Errorf("missing --file")
 	}
@@ -124,10 +135,12 @@ func writeManagedDoltConfigFile(path, host, port, dataDir, logLevel string, arch
 	if waitTimeout > 0 {
 		waitTimeoutLine = fmt.Sprintf("  wait_timeout: %q\n", strconv.Itoa(waitTimeout))
 	}
+	metricsBlock := managedDoltMetricsBlock(metricsPort)
 	content := fmt.Sprintf(`# Dolt SQL server configuration — managed by gc-beads-bd
 # Do not edit manually; changes are overwritten on each server start.
 # To customize, set environment variables:
-#   GC_DOLT_PORT, GC_DOLT_HOST, GC_DOLT_USER, GC_DOLT_PASSWORD, GC_DOLT_LOGLEVEL
+#   GC_DOLT_PORT, GC_DOLT_HOST, GC_DOLT_USER, GC_DOLT_PASSWORD, GC_DOLT_LOGLEVEL,
+#   GC_DOLT_METRICS_PORT (forensic break-glass; localhost-only; <=0 disables)
 
 log_level: %s
 
@@ -160,11 +173,29 @@ system_variables:
   dolt_stats_gc_enabled: "OFF"
   dolt_stats_memory_only: "ON"
   dolt_stats_paused: "ON"
-%s`, logLevel, port, host, dataDir, archiveLevel, waitTimeoutLine)
+%s%s`, logLevel, port, host, dataDir, archiveLevel, waitTimeoutLine, metricsBlock)
 	if err := fsys.WriteFileAtomic(fsys.OSFS{}, path, []byte(content), 0o644); err != nil {
 		return fmt.Errorf("write config file: %w", err)
 	}
 	return nil
+}
+
+// managedDoltMetricsBlock renders the optional `metrics` section for the managed
+// Dolt config. A positive port arms Dolt's Prometheus metrics listener — bound
+// to 127.0.0.1 so it is never reachable off-host — for forensic break-glass use.
+// Ports <= 0 return the empty string, leaving the default config unchanged.
+func managedDoltMetricsBlock(metricsPort int) string {
+	if metricsPort <= 0 {
+		return ""
+	}
+	return fmt.Sprintf(`
+# Forensic metrics endpoint (Prometheus query/connection gauges), localhost-only.
+# Off by default; armed via GC_DOLT_METRICS_PORT as a break-glass so a recurring
+# Dolt CPU storm can be correlated with query/connection load before a restart.
+metrics:
+  host: 127.0.0.1
+  port: %d
+`, metricsPort)
 }
 
 func managedDoltWaitTimeout() int {

@@ -96,10 +96,10 @@ func init() {
 }
 
 func startManagedDoltProcess(cityPath, host, port, user, logLevel string, timeout time.Duration) (managedDoltStartReport, error) {
-	return startManagedDoltProcessWithOptions(cityPath, host, port, user, logLevel, -1, timeout, true)
+	return startManagedDoltProcessWithOptions(cityPath, host, port, user, logLevel, -1, -1, timeout, true)
 }
 
-func startManagedDoltProcessWithOptions(cityPath, host, port, user, logLevel string, archiveLevel int, timeout time.Duration, publish bool) (managedDoltStartReport, error) {
+func startManagedDoltProcessWithOptions(cityPath, host, port, user, logLevel string, archiveLevel, metricsPort int, timeout time.Duration, publish bool) (managedDoltStartReport, error) {
 	layout, err := resolveManagedDoltRuntimeLayout(cityPath)
 	if err != nil {
 		return managedDoltStartReport{}, err
@@ -121,6 +121,7 @@ func startManagedDoltProcessWithOptions(cityPath, host, port, user, logLevel str
 		timeout = 30 * time.Second
 	}
 	archiveLevel = resolveDoltArchiveLevel(archiveLevel)
+	metricsPort = resolveDoltMetricsPort(metricsPort)
 
 	// Bound a pre-existing oversized log before this fresh server starts
 	// appending to it, so a non-preserve restart does not inherit the prior
@@ -143,7 +144,7 @@ func startManagedDoltProcessWithOptions(cityPath, host, port, user, logLevel str
 		if err := managedDoltPreflightCleanupFn(cityPath); err != nil {
 			return report, err
 		}
-		if err := writeManagedDoltConfigFile(layout.ConfigFile, host, strconv.Itoa(currentPort), layout.DataDir, logLevel, archiveLevel); err != nil {
+		if err := writeManagedDoltConfigFile(layout.ConfigFile, host, strconv.Itoa(currentPort), layout.DataDir, logLevel, archiveLevel, metricsPort); err != nil {
 			return report, err
 		}
 
@@ -584,6 +585,24 @@ func resolveDoltArchiveLevel(explicit int) int {
 		}
 	}
 	return 0
+}
+
+// resolveDoltMetricsPort resolves the forensic Prometheus metrics port for the
+// managed dolt server. Explicit non-negative values are returned as-is. Negative
+// values trigger env-var fallback (GC_DOLT_METRICS_PORT), defaulting to -1
+// (metrics listener disabled). The port is an off-by-default break-glass: when
+// armed it lets the dolt-cpu-restart path correlate a CPU storm with
+// query/connection load before restarting. See managedDoltMetricsBlock.
+func resolveDoltMetricsPort(explicit int) int {
+	if explicit >= 0 {
+		return explicit
+	}
+	if v := os.Getenv("GC_DOLT_METRICS_PORT"); v != "" {
+		if parsed, err := strconv.Atoi(v); err == nil {
+			return parsed
+		}
+	}
+	return -1
 }
 
 // terminateManagedDoltPID stops a managed dolt subprocess on startup-failure

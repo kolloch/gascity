@@ -986,11 +986,21 @@ kill_imposter() {
 # Overwritten on each server start. Without read/write timeouts, CLOSE_WAIT connections
 # accumulate and the server enters unrecoverable read-only mode.
 write_config_yaml() {
-    local archive_level gc_bin raw_wait_timeout wait_timeout_line
+    local archive_level gc_bin raw_wait_timeout wait_timeout_line metrics_port metrics_block
     archive_level=${GC_DOLT_ARCHIVE_LEVEL:-0}
     case "$archive_level" in
         ''|*[!0-9]*)
             archive_level=0
+            ;;
+    esac
+    # GC_DOLT_METRICS_PORT arms Dolt's Prometheus metrics listener (localhost-only)
+    # as a forensic break-glass. Only a positive integer arms it; anything else
+    # (empty, "-1", non-numeric) disables it (-1). The Go writer and the inline
+    # fallback both treat <=0 as off.
+    metrics_port=${GC_DOLT_METRICS_PORT:--1}
+    case "$metrics_port" in
+        ''|*[!0-9]*)
+            metrics_port=-1
             ;;
     esac
     gc_bin=$(resolve_gc_helper_bin)
@@ -1001,7 +1011,8 @@ write_config_yaml() {
             --port "$DOLT_PORT" \
             --data-dir "$DATA_DIR" \
             --log-level "$DOLT_LOGLEVEL" \
-            --archive-level "$archive_level" || die "failed to write managed dolt config via gc helper $gc_bin"
+            --archive-level "$archive_level" \
+            --metrics-port="$metrics_port" || die "failed to write managed dolt config via gc helper $gc_bin"
         return 0
     fi
     wait_timeout_line='  wait_timeout: "30"'
@@ -1023,13 +1034,23 @@ write_config_yaml() {
             fi
             ;;
     esac
+    metrics_block=""
+    if [ "$metrics_port" -gt 0 ] 2>/dev/null; then
+        metrics_block="
+# Forensic metrics endpoint (Prometheus query/connection gauges), localhost-only.
+# Off by default; armed via GC_DOLT_METRICS_PORT as a break-glass.
+metrics:
+  host: 127.0.0.1
+  port: $metrics_port"
+    fi
     local tmp
     tmp=$(mktemp "$CONFIG_FILE.tmp.XXXXXX")
     cat > "$tmp" <<YAML
 # Dolt SQL server configuration — managed by gc-beads-bd
 # Do not edit manually; changes are overwritten on each server start.
 # To customize, set environment variables:
-#   GC_DOLT_PORT, GC_DOLT_HOST, GC_DOLT_USER, GC_DOLT_PASSWORD, GC_DOLT_LOGLEVEL
+#   GC_DOLT_PORT, GC_DOLT_HOST, GC_DOLT_USER, GC_DOLT_PASSWORD, GC_DOLT_LOGLEVEL,
+#   GC_DOLT_METRICS_PORT (forensic break-glass; localhost-only; <=0 disables)
 
 log_level: $DOLT_LOGLEVEL
 
@@ -1062,7 +1083,7 @@ system_variables:
   dolt_stats_gc_enabled: "OFF"
   dolt_stats_memory_only: "ON"
   dolt_stats_paused: "ON"
-$wait_timeout_line
+$wait_timeout_line$metrics_block
 YAML
     mv "$tmp" "$CONFIG_FILE"
 }

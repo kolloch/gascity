@@ -571,6 +571,32 @@ func TestResolveDoltArchiveLevel(t *testing.T) {
 	}
 }
 
+func TestResolveDoltMetricsPort(t *testing.T) {
+	tests := []struct {
+		name     string
+		explicit int
+		envVal   string
+		want     int
+	}{
+		{name: "explicit zero stays off", explicit: 0, want: 0},
+		{name: "explicit positive port", explicit: 51913, want: 51913},
+		{name: "negative defaults to disabled", explicit: -1, want: -1},
+		{name: "negative with valid env arms port", explicit: -1, envVal: "51913", want: 51913},
+		{name: "negative with env zero", explicit: -1, envVal: "0", want: 0},
+		{name: "negative with non-numeric env falls back to disabled", explicit: -1, envVal: "abc", want: -1},
+		{name: "negative with empty env", explicit: -1, envVal: "", want: -1},
+		{name: "explicit overrides env", explicit: 6060, envVal: "7070", want: 6060},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("GC_DOLT_METRICS_PORT", tt.envVal)
+			if got := resolveDoltMetricsPort(tt.explicit); got != tt.want {
+				t.Errorf("resolveDoltMetricsPort(%d) = %d, want %d", tt.explicit, got, tt.want)
+			}
+		})
+	}
+}
+
 // TestTerminateManagedDoltPID_HonorsSubPollGrace asserts that terminate uses
 // the grace-clamped poll interval (managedDoltStopPollInterval) rather than a
 // fixed sleep: a SIGTERM-ignoring process with a tiny configured grace must be

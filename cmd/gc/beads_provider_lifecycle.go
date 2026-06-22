@@ -28,8 +28,8 @@ import (
 
 // providerLifecycleLaunchctlGetenv reads a value from `launchctl getenv` on
 // macOS. Used by providerLifecycleProcessEnv as a fallback when an env var
-// the bd-provider script consumes (currently only GC_DOLT_LOGLEVEL) isn't
-// set in os.Environ — without this, `gc start` from a user shell silently
+// the bd-provider script consumes (GC_DOLT_LOGLEVEL, GC_DOLT_METRICS_PORT)
+// isn't set in os.Environ — without this, `gc start` from a user shell silently
 // drops `launchctl setenv` values because they live in launchd's domain,
 // not the shell's env. Returns "" on non-Darwin or when the key is unset
 // or launchctl is unavailable.
@@ -1836,22 +1836,25 @@ func providerLifecycleProcessEnvFromBase(cityPath, provider string, env []string
 		}
 	}
 	// `gc start` runs in the user's shell, which doesn't see vars set
-	// only via `launchctl setenv` — those live in launchd's domain.
-	// Fall back to launchctl-getenv so the managed dolt server's log
-	// level honors `launchctl setenv GC_DOLT_LOGLEVEL` even when the
-	// shell hasn't `export`ed it. The supervisor's reconcile path
-	// runs the same lookup; either source delivers the value.
-	const loglevelPrefix = "GC_DOLT_LOGLEVEL="
-	loglevelInEnv := false
-	for _, entry := range env {
-		if strings.HasPrefix(entry, loglevelPrefix) {
-			loglevelInEnv = true
-			break
+	// only via `launchctl setenv` — those live in launchd's domain. Fall
+	// back to launchctl-getenv so the managed dolt server honors break-glass
+	// env set via `launchctl setenv` even when the shell hasn't `export`ed it:
+	// GC_DOLT_LOGLEVEL (log verbosity) and GC_DOLT_METRICS_PORT (forensic
+	// Prometheus listener). The supervisor's reconcile path runs the same
+	// lookup; either source delivers the value.
+	for _, key := range []string{"GC_DOLT_LOGLEVEL", "GC_DOLT_METRICS_PORT"} {
+		prefix := key + "="
+		inEnv := false
+		for _, entry := range env {
+			if strings.HasPrefix(entry, prefix) {
+				inEnv = true
+				break
+			}
 		}
-	}
-	if !loglevelInEnv {
-		if val := providerLifecycleLaunchctlGetenv("GC_DOLT_LOGLEVEL"); val != "" {
-			env = append(env, loglevelPrefix+val)
+		if !inEnv {
+			if val := providerLifecycleLaunchctlGetenv(key); val != "" {
+				env = append(env, prefix+val)
+			}
 		}
 	}
 	return env

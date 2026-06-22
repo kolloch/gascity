@@ -787,6 +787,7 @@ var supervisorServiceEnvKeys = map[string]bool{
 	"CLAUDE_CODE_SUBAGENT_MODEL":               true,
 	"CLAUDE_CONFIG_DIR":                        true,
 	"GC_DOLT_LOGLEVEL":                         true,
+	"GC_DOLT_METRICS_PORT":                     true,
 	"GC_DOLT_PASSWORD":                         true,
 	"GC_DOLT_USER":                             true,
 	"HOME":                                     true,

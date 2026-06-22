@@ -55,7 +55,7 @@ func TestDoltConfigWriteManagedCmd(t *testing.T) {
 
 func TestDoltConfigWriterIncludesDoctorExpectedCoreValues(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "packs", "dolt", "dolt-config.yaml")
-	if err := writeManagedDoltConfigFile(configPath, "127.0.0.1", "3311", "/tmp/city/.beads/dolt", "warning", 0); err != nil {
+	if err := writeManagedDoltConfigFile(configPath, "127.0.0.1", "3311", "/tmp/city/.beads/dolt", "warning", 0, -1); err != nil {
 		t.Fatalf("writeManagedDoltConfigFile: %v", err)
 	}
 
@@ -143,7 +143,7 @@ func TestDoltConfigWriteManagedCmd_ExplicitArchiveLevel(t *testing.T) {
 
 func TestWriteManagedDoltConfigFile_DefaultLogLevel(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "packs", "dolt", "dolt-config.yaml")
-	if err := writeManagedDoltConfigFile(configPath, "127.0.0.1", "3311", "/tmp/dolt-data", "", 0); err != nil {
+	if err := writeManagedDoltConfigFile(configPath, "127.0.0.1", "3311", "/tmp/dolt-data", "", 0, -1); err != nil {
 		t.Fatalf("writeManagedDoltConfigFile: %v", err)
 	}
 	data, err := os.ReadFile(configPath)
@@ -159,7 +159,7 @@ func TestWriteManagedDoltConfigFile_DefaultLogLevel(t *testing.T) {
 func TestWriteManagedDoltConfigFile_WaitTimeoutCanBeDisabled(t *testing.T) {
 	t.Setenv("GC_DOLT_WAIT_TIMEOUT", "-1")
 	configPath := filepath.Join(t.TempDir(), "packs", "dolt", "dolt-config.yaml")
-	if err := writeManagedDoltConfigFile(configPath, "127.0.0.1", "3311", "/tmp/dolt-data", "", 0); err != nil {
+	if err := writeManagedDoltConfigFile(configPath, "127.0.0.1", "3311", "/tmp/dolt-data", "", 0, -1); err != nil {
 		t.Fatalf("writeManagedDoltConfigFile: %v", err)
 	}
 	data, err := os.ReadFile(configPath)
@@ -168,6 +168,89 @@ func TestWriteManagedDoltConfigFile_WaitTimeoutCanBeDisabled(t *testing.T) {
 	}
 	if strings.Contains(string(data), "wait_timeout") {
 		t.Fatalf("negative GC_DOLT_WAIT_TIMEOUT should disable wait_timeout override:\n%s", data)
+	}
+}
+
+func TestWriteManagedDoltConfigFile_MetricsPortOmittedWhenDisabled(t *testing.T) {
+	for _, port := range []int{-1, 0} {
+		configPath := filepath.Join(t.TempDir(), "packs", "dolt", "dolt-config.yaml")
+		if err := writeManagedDoltConfigFile(configPath, "127.0.0.1", "3311", "/tmp/dolt-data", "warning", 0, port); err != nil {
+			t.Fatalf("writeManagedDoltConfigFile(metricsPort=%d): %v", port, err)
+		}
+		data, err := os.ReadFile(configPath)
+		if err != nil {
+			t.Fatalf("ReadFile: %v", err)
+		}
+		if strings.Contains(string(data), "metrics:") {
+			t.Fatalf("metricsPort=%d should omit the metrics block, got:\n%s", port, data)
+		}
+		// Must remain valid YAML and preserve the doctor-asserted core keys.
+		var doc map[string]any
+		if err := yaml.Unmarshal(data, &doc); err != nil {
+			t.Fatalf("Unmarshal config (metricsPort=%d): %v", port, err)
+		}
+		if _, present := doc["metrics"]; present {
+			t.Fatalf("metricsPort=%d should not emit a metrics key:\n%s", port, data)
+		}
+	}
+}
+
+func TestWriteManagedDoltConfigFile_MetricsPortBindsLocalhostWhenArmed(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "packs", "dolt", "dolt-config.yaml")
+	if err := writeManagedDoltConfigFile(configPath, "0.0.0.0", "3311", "/tmp/dolt-data", "warning", 0, 51913); err != nil {
+		t.Fatalf("writeManagedDoltConfigFile: %v", err)
+	}
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+
+	var doc map[string]any
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		t.Fatalf("Unmarshal config: %v", err)
+	}
+	if got, _ := lookupTestYAMLPath(doc, "metrics.port"); !testYAMLValueEqual(got, 51913) {
+		t.Fatalf("metrics.port = %v, want 51913:\n%s", got, data)
+	}
+	// The forensic listener must never bind off-host, regardless of the SQL
+	// listener host (here 0.0.0.0).
+	if got, _ := lookupTestYAMLPath(doc, "metrics.host"); got != "127.0.0.1" {
+		t.Fatalf("metrics.host = %v, want 127.0.0.1 (localhost-only):\n%s", got, data)
+	}
+	// Arming metrics must not displace the doctor-asserted core contract.
+	for _, exp := range doctor.DoltConfigExpectedValues() {
+		got, ok := lookupTestYAMLPath(doc, exp.Path)
+		if !ok {
+			t.Fatalf("armed metrics config dropped doctor-expected path %q:\n%s", exp.Path, data)
+		}
+		if !testYAMLValueEqual(got, exp.Value) {
+			t.Fatalf("armed metrics config %s = %v, want %v", exp.Path, got, exp.Value)
+		}
+	}
+}
+
+func TestDoltConfigWriteManagedCmd_MetricsPort(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "packs", "dolt", "dolt-config.yaml")
+	var stdout, stderr bytes.Buffer
+	code := run([]string{
+		"dolt-config", "write-managed",
+		"--file", configPath,
+		"--host", "127.0.0.1",
+		"--port", "3311",
+		"--data-dir", "/tmp/city/.beads/dolt",
+		"--metrics-port", "51913",
+	}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("run() = %d, stderr = %s", code, stderr.String())
+	}
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%s): %v", configPath, err)
+	}
+	for _, want := range []string{"metrics:", "host: 127.0.0.1", "port: 51913"} {
+		if !strings.Contains(string(data), want) {
+			t.Fatalf("config missing %q:\n%s", want, data)
+		}
 	}
 }
 

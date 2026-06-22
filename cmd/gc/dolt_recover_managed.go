@@ -122,7 +122,7 @@ func recoverManagedDoltProcess(cityPath, host, port, user, logLevel string, time
 	}
 	time.Sleep(time.Second)
 
-	startReport, err := startManagedDoltProcessWithOptions(cityPath, host, port, user, logLevel, -1, timeout, false)
+	startReport, err := startManagedDoltProcessWithOptions(cityPath, host, port, user, logLevel, -1, -1, timeout, false)
 	report.Restarted = true
 	report.Ready = startReport.Ready
 	if startReport.PID > 0 {
