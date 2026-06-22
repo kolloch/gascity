@@ -794,15 +794,18 @@ func bdTransportRecoverableError(cityPath, scopeRoot string, env map[string]stri
 }
 
 // bdOutputIndicatesSilentFallback reports whether the given bd output
-// (typically captured stderr) contains the marker pair that bd emits
-// when it loses the managed Dolt server and silently falls back to
-// opening the on-disk store with a JSONL auto-import. Operators of
-// `gc bd ...` rely on this to convert the silent fallback into a loud,
-// non-zero-exit error — in managed mode (BD_EXPORT_AUTO=false) the
-// fallback drops writes. See gastownhall/gascity#2080 (bd update path)
-// and gastownhall/gascity#2079 (bd close path) — both subcommands flow
-// through the shared doBd handoff, so a single detection site covers
-// the bd-write-persistence quad.
+// (typically captured stderr) contains the marker pair bd emits for its
+// empty-DB JSONL auto-import ("auto-importing ... into empty database").
+// Post beads #3691 that banner fires only on a genuinely empty database,
+// so the auto-import is legitimate and persists — but gc cannot tell from
+// stderr alone whether bd imported into the managed Dolt server or into an
+// on-disk fallback it opened because the managed server was unreachable.
+// In managed mode (BD_EXPORT_AUTO=false) an on-disk fallback would drop the
+// command's write, so operators of `gc bd ...` rely on this to turn the
+// unverifiable case into a loud, non-zero-exit signal. See
+// gastownhall/gascity#2080 (bd update path) and gastownhall/gascity#2079
+// (bd close path) — both subcommands flow through the shared doBd handoff,
+// so a single detection site covers the bd-write-persistence quad.
 func bdOutputIndicatesSilentFallback(s string) bool {
 	lower := strings.ToLower(s)
 	return strings.Contains(lower, bdSilentFallbackMarkerImport) &&

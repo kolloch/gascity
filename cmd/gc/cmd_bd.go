@@ -14,10 +14,11 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// bdSilentFallbackExitCode is the exit code gc bd emits when it detects
-// that bd silently fell back to on-disk auto-import mode (managed Dolt
-// unreachable). Distinct from bd's own exits so operators and CI can
-// tell the loud-fail apart from a real bd error. Covers both the
+// bdSilentFallbackExitCode is the exit code gc bd emits when bd's stderr
+// shows an empty-DB JSONL auto-import that gc cannot confirm reached the
+// managed Dolt server (bd may have imported into an on-disk fallback if the
+// managed server was unreachable). Distinct from bd's own exits so operators
+// and CI can tell this signal apart from a real bd error. Covers both the
 // bd update path (gastownhall/gascity#2080) and the bd close path
 // (gastownhall/gascity#2079) because both subcommands flow through doBd.
 const bdSilentFallbackExitCode = 4
@@ -223,20 +224,29 @@ func doBd(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	// bd exited 0 — but if its stderr shows the silent fallback to on-disk
-	// auto-import, the managed Dolt server was unreachable and any write in
-	// this command was dropped (managed Gas City sets BD_EXPORT_AUTO=false;
-	// see applyExportSuppressionEnv in cmd/gc/bd_env.go). Surface that as a
-	// hard error instead of a misleading exit 0. One check here covers the
-	// whole bd-write-persistence quad (gastownhall/gascity#2079 / #2080 /
-	// #2149 / #2150) because every bd subcommand routes through this
-	// handoff. A non-zero bd exit is intentionally left to the block above:
-	// the existing transport-retry classifier already handles the
-	// timeout+marker case, and overriding a real bd exit code here would
-	// mask it. (Root cause fixed upstream in beads post-#3691; this surfaces
-	// the symptom for deployments still on stable bd builds.)
+	// bd exited 0 — but if its stderr shows bd's empty-DB auto-import banner
+	// ("auto-importing ... into empty database"), bd opened an EMPTY
+	// server-mode Dolt store and imported .beads/issues.jsonl into it. Post
+	// beads #3691 that banner fires only on a genuinely empty database, so
+	// the auto-import itself is legitimate — bd's empty-DB recovery, which
+	// commits the import on this path. The catch: gc cannot tell from stderr
+	// whether bd reached the managed Dolt server or fell back to an on-disk
+	// store. If it was the on-disk fallback (managed server unreachable), a
+	// write in this command never reached the managed server, and managed Gas
+	// City sets BD_EXPORT_AUTO=false so it won't sync later (see
+	// applyExportSuppressionEnv in cmd/gc/bd_env.go).
+	// Because gc cannot confirm the write landed on the managed server,
+	// surface a non-zero exit for operator attention instead of a silent
+	// exit 0 — without claiming, as the prior wording did, that the server
+	// was definitely unreachable or the write definitely lost (ga-c6jn). One
+	// check here covers the whole bd-write-persistence quad
+	// (gastownhall/gascity#2079 / #2080 / #2149 / #2150) because every bd
+	// subcommand routes through this handoff. A non-zero bd exit is
+	// intentionally left to the block above: the existing transport-retry
+	// classifier already handles the timeout+marker case, and overriding a
+	// real bd exit code here would mask it.
 	if bdOutputIndicatesSilentFallback(stderrScan.String()) {
-		fmt.Fprintln(stderr, "gc bd: managed Dolt unreachable; bd fell back to on-disk auto-import mode. If this command wrote data, that write was NOT persisted. Restart the managed Dolt server (or check connectivity) and retry. (See gastownhall/gascity#2080.)") //nolint:errcheck // best-effort stderr
+		fmt.Fprintln(stderr, "gc bd: bd performed an empty-DB auto-import (imported .beads/issues.jsonl into an empty Dolt database) and exited 0. This is bd's normal empty-DB recovery, not necessarily a failure. But gc cannot tell whether bd reached the managed Dolt server or fell back to an on-disk store, so it cannot confirm a write in THIS command reached the managed server. If you expected the managed server to already hold data, verify its connectivity and confirm your write landed before relying on it. (See gastownhall/gascity#2080.)") //nolint:errcheck // best-effort stderr
 		return bdSilentFallbackExitCode
 	}
 

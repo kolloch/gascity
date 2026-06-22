@@ -1880,10 +1880,11 @@ set -eu
 }
 
 // silentFallbackFakeBdScript builds a fake `bd` shell script that emits the
-// silent-fallback marker pair on stderr ("auto-importing ... into empty
-// database") and exits 0 — the exact shape bd produces when it loses the
-// managed Dolt server and falls back to opening the on-disk store. doBd
-// should treat this as a hard failure regardless of bd's exit code.
+// empty-DB auto-import marker pair on stderr ("auto-importing ... into empty
+// database") and exits 0 — the exact shape bd produces for its empty-DB JSONL
+// auto-import. gc cannot tell from stderr whether bd imported into the managed
+// Dolt server or an on-disk fallback, so doBd surfaces this as a non-zero exit
+// regardless of bd's exit code.
 const silentFallbackFakeBdScript = `#!/bin/sh
 echo "auto-importing 220929 bytes from .beads/issues.jsonl into empty database... auto-imported 123 issues" >&2
 echo "$@"
@@ -1939,9 +1940,11 @@ name = "demo"
 }
 
 // TestGcBdSurfacesSilentFallbackAsLoudError_UpdatePath pins the #2080 fix:
-// when bd's update path silently falls back to the on-disk store, gc bd must
-// convert that into a non-zero exit with an operator-facing message instead
-// of letting the silent write loss reach the operator as success.
+// when bd's update path emits the empty-DB auto-import banner, gc bd must
+// surface a non-zero exit with an operator-facing message — gc cannot confirm
+// the write reached the managed server, so it must not report success. The
+// message must NOT assert data loss as fact (ga-c6jn): post beads #3691 the
+// same banner fires on a legitimate empty-DB auto-import that did persist.
 func TestGcBdSurfacesSilentFallbackAsLoudError_UpdatePath(t *testing.T) {
 	silentFallbackTestSetup(t, silentFallbackFakeBdScript)
 
@@ -1951,8 +1954,11 @@ func TestGcBdSurfacesSilentFallbackAsLoudError_UpdatePath(t *testing.T) {
 		t.Fatalf("doBd(update) = %d, want %d (silent-fallback exit code); stderr=%q",
 			got, bdSilentFallbackExitCode, stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "managed Dolt unreachable") {
-		t.Fatalf("stderr missing loud-fail message; stderr=%q", stderr.String())
+	if !strings.Contains(stderr.String(), "empty-DB auto-import") {
+		t.Fatalf("stderr missing operator-facing message; stderr=%q", stderr.String())
+	}
+	if strings.Contains(stderr.String(), "NOT persisted") {
+		t.Fatalf("message asserts data loss as fact (ga-c6jn); stderr=%q", stderr.String())
 	}
 	if !strings.Contains(stderr.String(), "auto-importing") {
 		t.Fatalf("original bd stderr not passed through; stderr=%q", stderr.String())
@@ -1973,8 +1979,11 @@ func TestGcBdSurfacesSilentFallbackAsLoudError_ClosePath(t *testing.T) {
 		t.Fatalf("doBd(close) = %d, want %d (silent-fallback exit code); stderr=%q",
 			got, bdSilentFallbackExitCode, stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "managed Dolt unreachable") {
-		t.Fatalf("stderr missing loud-fail message; stderr=%q", stderr.String())
+	if !strings.Contains(stderr.String(), "empty-DB auto-import") {
+		t.Fatalf("stderr missing operator-facing message; stderr=%q", stderr.String())
+	}
+	if strings.Contains(stderr.String(), "NOT persisted") {
+		t.Fatalf("message asserts data loss as fact (ga-c6jn); stderr=%q", stderr.String())
 	}
 	if !strings.Contains(stderr.String(), "auto-importing") {
 		t.Fatalf("original bd stderr not passed through; stderr=%q", stderr.String())
@@ -1999,7 +2008,7 @@ exit 0
 	if got != 0 {
 		t.Fatalf("doBd(list) = %d, want 0; stderr=%q", got, stderr.String())
 	}
-	if strings.Contains(stderr.String(), "managed Dolt unreachable") {
+	if strings.Contains(stderr.String(), "empty-DB auto-import") {
 		t.Fatalf("loud-fail message fired on a happy-path run; stderr=%q", stderr.String())
 	}
 }
