@@ -70,7 +70,9 @@ func TestCheckDoesNotUseMessageLabelSupplement(t *testing.T) {
 			}
 			return []byte(`[]`), nil
 		}
-		if strings.Contains(cmd, "--assignee=mayor") && strings.Contains(cmd, "--type=message") && strings.Contains(cmd, "--status=open") {
+		// The candidate scan is a single global Type=message,Status=open list
+		// (no assignee); the recipient filter is applied in memory (ga-mik1).
+		if strings.Contains(cmd, "--type=message") && strings.Contains(cmd, "--status=open") {
 			return []byte(`[{"id":"msg-1","title":"hello","description":"body","status":"open","issue_type":"message","assignee":"mayor","from":"human","created_at":"2026-01-02T03:04:05Z","labels":["gc:message"]}]`), nil
 		}
 		return nil, errors.New("unexpected command: " + cmd)
@@ -98,7 +100,9 @@ func TestCheckSupportsSlashRecipientWithWispTier(t *testing.T) {
 			return []byte(`[]`), nil
 		case strings.Contains(cmd, "bd list --json") && strings.Contains(cmd, "--type=session"):
 			return []byte(`[]`), nil
-		case strings.Contains(cmd, "bd list --json") && strings.Contains(cmd, "--assignee="+recipient):
+		case strings.Contains(cmd, "bd list --json") && strings.Contains(cmd, "--type=message"):
+			// Issues-tier candidate scan is a single global Type=message list;
+			// the slash recipient's only message lives in the wisp tier below.
 			return []byte(`[]`), nil
 		case strings.Contains(cmd, "bd query --json"):
 			sawWispQuery = true

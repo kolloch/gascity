@@ -9,6 +9,7 @@ func TestIsBdReadOnlySubcommand_KnownReads(t *testing.T) {
 	reads := [][]string{
 		{"list"},
 		{"list", "--json"},
+		{"query", "--json", "ephemeral=true AND status=open AND type=message"},
 		{"ready", "--limit", "10"},
 		{"show", "ga-sc9"},
 		{"show", "ga-sc9", "--json"},

@@ -15,15 +15,19 @@ import (
 // proportional latency win (ga-a60).
 type callCountingStore struct {
 	*beads.MemStore
-	mu             sync.Mutex
-	candidateLists int // Type=message scoped to a recipient route
-	routeMetaLists int // alias=/session_name= session-route lookups
+	mu                 sync.Mutex
+	candidateLists     int // Type=message scoped to a recipient route (legacy per-route fan-out)
+	globalMessageLists int // Type=message with no assignee (the single global candidate scan)
+	routeMetaLists     int // alias=/session_name= session-route lookups
 }
 
 func (s *callCountingStore) List(query beads.ListQuery) ([]beads.Bead, error) {
 	s.mu.Lock()
 	if query.Type == "message" && query.Assignee != "" {
 		s.candidateLists++
+	}
+	if query.Type == "message" && query.Assignee == "" {
+		s.globalMessageLists++
 	}
 	if _, ok := query.Metadata["alias"]; ok {
 		s.routeMetaLists++
@@ -149,10 +153,12 @@ func TestInboxRecipientsEmpty(t *testing.T) {
 	}
 }
 
-// TestInboxRecipientsScansEachRouteOnce pins the perf contract: the message
-// candidate scan runs once per *unique* route, not once per route per
-// recipient as the per-recipient loop did.
-func TestInboxRecipientsScansEachRouteOnce(t *testing.T) {
+// TestInboxRecipientsUsesSingleCandidateScan pins the perf contract: the
+// message-candidate scan is a single global Type=message,Status=open list with
+// the recipient filter applied in memory, not the former per-route fan-out (one
+// List per unique route). Every backing-store query is a bd subprocess
+// round-trip, so collapsing the fan-out is the residual inbox N+1 fix (ga-mik1).
+func TestInboxRecipientsUsesSingleCandidateScan(t *testing.T) {
 	store := &callCountingStore{MemStore: beads.NewMemStore()}
 	p := New(store)
 	sess := newRoutedSession(t, store, "rig/worker", "wf__worker")
@@ -165,15 +171,17 @@ func TestInboxRecipientsScansEachRouteOnce(t *testing.T) {
 		t.Fatalf("InboxRecipients: %v", err)
 	}
 
-	// The session expands to exactly three routes (id, alias, session_name);
-	// the candidate scan must run once per unique route.
-	const wantRoutes = 3
-	if store.candidateLists != wantRoutes {
-		t.Errorf("candidate scans = %d, want %d (one per unique route)", store.candidateLists, wantRoutes)
+	// One global candidate scan, zero per-route candidate scans — regardless of
+	// how many routes the session expands to.
+	if store.globalMessageLists != 1 {
+		t.Errorf("global candidate scans = %d, want 1", store.globalMessageLists)
+	}
+	if store.candidateLists != 0 {
+		t.Errorf("per-route candidate scans = %d, want 0 (replaced by the global scan)", store.candidateLists)
 	}
 
-	// Sanity: the old per-recipient path scans the routes once per recipient,
-	// so it must issue strictly more candidate scans than the batched path.
+	// Sanity: the per-recipient fallback path issues one global scan per Inbox
+	// call, so two recipients cost strictly more scans than the batched path.
 	store2 := &callCountingStore{MemStore: beads.NewMemStore()}
 	p2 := New(store2)
 	s2 := newRoutedSession(t, store2, "rig/worker", "wf__worker")
@@ -185,8 +193,124 @@ func TestInboxRecipientsScansEachRouteOnce(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if store2.candidateLists <= store.candidateLists {
-		t.Errorf("per-recipient candidate scans = %d, expected more than batched %d", store2.candidateLists, store.candidateLists)
+	if store2.globalMessageLists <= store.globalMessageLists {
+		t.Errorf("per-recipient scans = %d, expected more than batched %d", store2.globalMessageLists, store.globalMessageLists)
+	}
+}
+
+// TestInboxRoutesSkipsRouteDerivation pins that InboxRoutes issues no
+// route-derivation queries: the caller supplies the resolved routes, so the
+// provider only runs the single global candidate scan. This is the redundancy
+// eliminated when mail-target resolution threads the already-loaded session's
+// routes into the inbox fetch (ga-mik1).
+func TestInboxRoutesSkipsRouteDerivation(t *testing.T) {
+	store := &callCountingStore{MemStore: beads.NewMemStore()}
+	p := New(store)
+	sess := newRoutedSession(t, store, "rig/worker", "wf__worker")
+	if _, err := p.Send("human", "rig/worker", "", "to alias"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.Send("human", sess.ID, "", "to id"); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := p.InboxRoutes(RoutesForSession(sess))
+	if err != nil {
+		t.Fatalf("InboxRoutes: %v", err)
+	}
+
+	if store.routeMetaLists != 0 {
+		t.Errorf("route-derivation metadata lists = %d, want 0 (routes supplied by caller)", store.routeMetaLists)
+	}
+	if store.globalMessageLists != 1 {
+		t.Errorf("global candidate scans = %d, want 1", store.globalMessageLists)
+	}
+	if store.candidateLists != 0 {
+		t.Errorf("per-route candidate scans = %d, want 0", store.candidateLists)
+	}
+	if len(got) != 2 {
+		t.Fatalf("InboxRoutes returned %d messages, want 2 (alias + id routes)", len(got))
+	}
+}
+
+// TestInboxRoutesMatchesInboxRecipients pins that threading pre-resolved routes
+// yields the same unread set as deriving them from the recipient addresses.
+func TestInboxRoutesMatchesInboxRecipients(t *testing.T) {
+	store := beads.NewMemStore()
+	p := New(store)
+	sess := newRoutedSession(t, store, "rig/worker", "wf__worker")
+	if _, err := p.Send("human", "rig/worker", "", "to alias"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.Send("human", sess.ID, "", "to id"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := p.Send("human", "wf__worker", "", "to name"); err != nil {
+		t.Fatal(err)
+	}
+
+	viaRoutes, err := p.InboxRoutes(RoutesForSession(sess))
+	if err != nil {
+		t.Fatalf("InboxRoutes: %v", err)
+	}
+	viaRecipients, err := p.InboxRecipients([]string{"rig/worker", sess.ID, "wf__worker"})
+	if err != nil {
+		t.Fatalf("InboxRecipients: %v", err)
+	}
+
+	routeIDs := map[string]bool{}
+	for _, m := range viaRoutes {
+		routeIDs[m.ID] = true
+	}
+	if len(viaRoutes) != len(viaRecipients) || len(routeIDs) != len(viaRecipients) {
+		t.Fatalf("InboxRoutes returned %d messages, InboxRecipients %d", len(viaRoutes), len(viaRecipients))
+	}
+	for _, m := range viaRecipients {
+		if !routeIDs[m.ID] {
+			t.Errorf("InboxRoutes missing %s present in InboxRecipients", m.ID)
+		}
+	}
+}
+
+// TestInboxRoutesEmpty pins that an empty route set returns no messages rather
+// than scanning every mailbox (mirrors InboxRecipients(nil)).
+func TestInboxRoutesEmpty(t *testing.T) {
+	store := beads.NewMemStore()
+	p := New(store)
+	if _, err := p.Send("human", "mayor", "", "msg"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := p.InboxRoutes(nil)
+	if err != nil {
+		t.Fatalf("InboxRoutes(nil): %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("InboxRoutes(nil) = %d messages, want 0", len(got))
+	}
+}
+
+// TestRoutesForSessionIncludesAllAddresses pins that the threaded route set
+// covers every address a session answers to: ID, alias, session name, and
+// historical aliases.
+func TestRoutesForSessionIncludesAllAddresses(t *testing.T) {
+	store := beads.NewMemStore()
+	b, err := store.Create(beads.Bead{
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"alias":         "rig/worker",
+			"session_name":  "wf__worker",
+			"alias_history": "rig/old-worker",
+		},
+	})
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	routes := RoutesForSession(b)
+	for _, want := range []string{b.ID, "rig/worker", "wf__worker", "rig/old-worker"} {
+		if !containsRecipientRoute(routes, want) {
+			t.Errorf("RoutesForSession missing %q: %v", want, routes)
+		}
 	}
 }
 

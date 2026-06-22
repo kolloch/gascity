@@ -33,6 +33,7 @@ func IsBdReadOnlySubcommand(args []string) bool {
 	switch sub {
 	case "count",
 		"list",
+		"query",
 		"ready",
 		"show",
 		"stats",

@@ -19,6 +19,7 @@ import (
 	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/extmsg"
 	"github.com/gastownhall/gascity/internal/mail"
+	"github.com/gastownhall/gascity/internal/mail/beadmail"
 	"github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/telemetry"
 	"github.com/spf13/cobra"
@@ -357,7 +358,7 @@ func doMailCheckTarget(mp mail.Provider, target resolvedMailTarget, inject bool,
 }
 
 func doMailCheckTargetWithFormat(mp mail.Provider, target resolvedMailTarget, inject bool, hookFormat string, stdout, stderr io.Writer) int {
-	messages, err := collectUnreadMail(mp, mp.Check, target.recipients)
+	messages, err := collectUnreadMail(mp, mp.Check, target)
 	if err != nil {
 		if inject {
 			fmt.Fprintf(stderr, "gc mail check: %v\n", err) //nolint:errcheck // best-effort stderr
@@ -677,6 +678,13 @@ func listLiveSessionMailboxesCached(store beads.Store, cache *mailIdentitySessio
 type resolvedMailTarget struct {
 	display    string
 	recipients []string
+	// routes is the fully resolved recipient route set for the target session,
+	// populated when resolution loaded an actual session bead. When present, the
+	// inbox/check fetch passes it straight to a route-aware provider
+	// (InboxRoutes) and skips re-deriving routes from the store — the residual
+	// `gc mail inbox` N+1 fix (ga-mik1). Empty for non-session targets (human,
+	// configured mailbox addresses), which fall back to recipient-based fetch.
+	routes []string
 }
 
 func mailSenderRouteMetadata(store beads.Store, sender string) (map[string]string, error) {
@@ -790,6 +798,7 @@ func resolveLiveConfiguredNamedMailTargetCached(store beads.Store, identifier st
 		matches[display] = resolvedMailTarget{
 			display:    display,
 			recipients: addresses,
+			routes:     beadmail.RoutesForSession(b),
 		}
 		order = append(order, display)
 	}
@@ -834,6 +843,7 @@ func resolveMailTargetsCached(store beads.Store, identifier string, cache *mailI
 	return resolvedMailTarget{
 		display:    addresses[0],
 		recipients: addresses,
+		routes:     beadmail.RoutesForSession(b),
 	}, nil
 }
 
@@ -1027,20 +1037,43 @@ type multiRecipientMailFetcher interface {
 	InboxRecipients([]string) ([]mail.Message, error)
 }
 
+// routeMailFetcher is implemented by providers that can serve the unread
+// messages for a pre-resolved set of recipient routes without re-deriving them
+// from the store. The inbox/check paths use it when target resolution already
+// loaded the owning session bead, collapsing the per-recipient route lookups
+// (each a bd subprocess round-trip) that multiRecipientMailFetcher repeats
+// (ga-mik1).
+type routeMailFetcher interface {
+	InboxRoutes([]string) ([]mail.Message, error)
+}
+
 // collectUnreadMail returns the deduplicated, sorted unread messages for the
-// target recipients. Providers implementing multiRecipientMailFetcher serve all
-// recipient routes in a single batched query; others fall back to the
-// per-recipient fetch. Both paths yield the same sorted, deduplicated result.
-func collectUnreadMail(mp mail.Provider, fetch func(string) ([]mail.Message, error), recipients []string) ([]mail.Message, error) {
+// target. When the target carries pre-resolved routes (resolution loaded the
+// session bead) and the provider implements routeMailFetcher, it serves the
+// inbox in a single candidate scan with no route re-derivation. Otherwise
+// providers implementing multiRecipientMailFetcher serve all recipient routes
+// in one batched query; the rest fall back to the per-recipient fetch. Every
+// path yields the same sorted, deduplicated result.
+func collectUnreadMail(mp mail.Provider, fetch func(string) ([]mail.Message, error), target resolvedMailTarget) ([]mail.Message, error) {
+	if len(target.routes) > 0 {
+		if fetcher, ok := mp.(routeMailFetcher); ok {
+			messages, err := fetcher.InboxRoutes(target.routes)
+			if err != nil {
+				return nil, err
+			}
+			sortMailMessages(messages)
+			return messages, nil
+		}
+	}
 	if fetcher, ok := mp.(multiRecipientMailFetcher); ok {
-		messages, err := fetcher.InboxRecipients(recipients)
+		messages, err := fetcher.InboxRecipients(target.recipients)
 		if err != nil {
 			return nil, err
 		}
 		sortMailMessages(messages)
 		return messages, nil
 	}
-	return collectMailMessages(fetch, recipients)
+	return collectMailMessages(fetch, target.recipients)
 }
 
 func newMailSendCmd(stdout, stderr io.Writer) *cobra.Command {
@@ -1570,7 +1603,7 @@ func doMailInboxTarget(mp mail.Provider, target resolvedMailTarget, stdout, stde
 }
 
 func doMailInboxTargetWithJSON(mp mail.Provider, target resolvedMailTarget, jsonOut bool, stdout, stderr io.Writer) int {
-	messages, err := collectUnreadMail(mp, mp.Inbox, target.recipients)
+	messages, err := collectUnreadMail(mp, mp.Inbox, target)
 	if err != nil {
 		fmt.Fprintf(stderr, "gc mail inbox: %v\n", err) //nolint:errcheck // best-effort stderr
 		return 1

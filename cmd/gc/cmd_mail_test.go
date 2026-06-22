@@ -753,16 +753,22 @@ func TestResolveMailTargetsIncludesAliasHistoryAndSessionID(t *testing.T) {
 	}
 }
 
-// getCountingStore counts store.Get calls so tests can pin the number of
-// identity loads on the hot mail-resolution path.
+// getCountingStore counts store.Get and store.List calls so tests can pin the
+// number of identity loads and message scans on the hot mail-resolution path.
 type getCountingStore struct {
 	beads.Store
-	getCalls int
+	getCalls  int
+	listCalls int
 }
 
 func (s *getCountingStore) Get(id string) (beads.Bead, error) {
 	s.getCalls++
 	return s.Store.Get(id)
+}
+
+func (s *getCountingStore) List(query beads.ListQuery) ([]beads.Bead, error) {
+	s.listCalls++
+	return s.Store.List(query)
 }
 
 // TestResolveMailTargets_LoadsSessionBeadOnce guards ga-qq8: resolving a mail
@@ -798,6 +804,65 @@ func TestResolveMailTargets_LoadsSessionBeadOnce(t *testing.T) {
 	}
 	if store.getCalls != 1 {
 		t.Fatalf("store.Get called %d times resolving a mail target by session ID, want 1", store.getCalls)
+	}
+}
+
+// TestMailInboxThreadsResolvedRoutes_MinimalRoundTrips is the headline ga-mik1
+// regression: resolving a polecat's inbox by its session bead ID and then
+// fetching it must cost a single identity Get plus a single message-candidate
+// List — no per-recipient route re-derivation (the Get + alias/session_name
+// Lists InboxRecipients would issue) and no per-route candidate fan-out. Each
+// store call is a bd subprocess round-trip in production, so this pins the
+// residual `gc mail inbox` N+1 closed (down from ~10 spawns to 2 queries).
+func TestMailInboxThreadsResolvedRoutes_MinimalRoundTrips(t *testing.T) {
+	mem := beads.NewMemStore()
+	sess, err := mem.Create(beads.Bead{
+		Type:   session.BeadType,
+		Labels: []string{session.LabelSession},
+		Metadata: map[string]string{
+			"alias":        "gascity/gastown.furiosa",
+			"session_name": "gastown__polecat-pe-3l225",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Create session: %v", err)
+	}
+	store := &getCountingStore{Store: mem}
+	provider := beadmail.NewCached(store)
+
+	if _, err := provider.Send("human", "gascity/gastown.furiosa", "hi", "body"); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	// Phase 1 — resolve the inbox target by session bead ID (mirrors the polecat
+	// GC_SESSION_ID identity). This loads the bead once and threads its routes.
+	store.getCalls, store.listCalls = 0, 0
+	target, err := resolveMailTargets(store, sess.ID)
+	if err != nil {
+		t.Fatalf("resolveMailTargets: %v", err)
+	}
+	if len(target.routes) == 0 {
+		t.Fatal("resolved target carries no routes — route threading not wired")
+	}
+	if store.getCalls != 1 || store.listCalls != 0 {
+		t.Errorf("resolution cost = %d Get + %d List, want 1 Get + 0 List", store.getCalls, store.listCalls)
+	}
+
+	// Phase 2 — fetch the inbox. With pre-resolved routes the provider runs only
+	// the single global candidate scan: no Get, no route-derivation Lists.
+	store.getCalls, store.listCalls = 0, 0
+	var out, errOut bytes.Buffer
+	if code := doMailInboxTargetWithJSON(provider, target, true, &out, &errOut); code != 0 {
+		t.Fatalf("doMailInboxTargetWithJSON exit = %d, stderr=%q", code, errOut.String())
+	}
+	if store.getCalls != 0 {
+		t.Errorf("inbox fetch issued %d store.Get calls, want 0 (routes already resolved)", store.getCalls)
+	}
+	if store.listCalls != 1 {
+		t.Errorf("inbox fetch issued %d store.List calls, want 1 (single global candidate scan)", store.listCalls)
+	}
+	if !strings.Contains(out.String(), "hi") {
+		t.Errorf("inbox output missing the message subject: %q", out.String())
 	}
 }
 

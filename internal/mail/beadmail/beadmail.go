@@ -487,7 +487,7 @@ func (p *Provider) CountRecipients(recipients []string) (int, int, error) {
 		return 0, 0, nil
 	}
 	routes := p.recipientRoutesForAll(recipients)
-	candidates, err := p.messageCandidatesForRoutes(routes)
+	candidates, err := p.openMessageCandidates()
 	if err != nil {
 		return 0, 0, fmt.Errorf("listing messages: %w", err)
 	}
@@ -511,7 +511,7 @@ func (p *Provider) CountRecipients(recipients []string) (int, int, error) {
 // When includeRead is false, messages with the "read" label are excluded.
 func (p *Provider) filterMessages(recipient string, includeRead bool) ([]mail.Message, error) {
 	routes := p.recipientRoutes(recipient)
-	candidates, err := p.messageCandidatesForRoutes(routes)
+	candidates, err := p.openMessageCandidates()
 	if err != nil {
 		return nil, fmt.Errorf("beadmail: listing beads: %w", err)
 	}
@@ -546,6 +546,20 @@ func (p *Provider) InboxRecipients(recipients []string) ([]mail.Message, error) 
 	return p.filterMessagesForRecipients(recipients)
 }
 
+// InboxRoutes returns the unread messages addressed to any of the given
+// pre-resolved recipient routes. Unlike [Provider.InboxRecipients] it does not
+// re-derive routes from the store: callers that already hold a session's full
+// route set — for example mail-target resolution, which loads the session bead
+// while resolving the inbox owner — pass those routes here to skip the per-
+// recipient `Get` + alias/session_name lookups InboxRecipients would otherwise
+// issue. Each of those lookups is a bd subprocess round-trip, so eliminating
+// the redundant re-derivation is the bulk of the residual `gc mail inbox` N+1
+// win (ga-mik1, follow-up to ga-a60). Routes are typically built with
+// [RoutesForSession]. An empty route set returns no messages.
+func (p *Provider) InboxRoutes(routes []string) ([]mail.Message, error) {
+	return p.filterUnreadForRoutes(routes)
+}
+
 // filterMessagesForRecipients returns open, unread message beads assigned to
 // any route in the union of the recipients' routes. It is the multi-recipient
 // analog of [Provider.filterMessages] and shares its open+unread filter. An
@@ -555,8 +569,20 @@ func (p *Provider) filterMessagesForRecipients(recipients []string) ([]mail.Mess
 	if len(recipients) == 0 {
 		return nil, nil
 	}
-	routes := p.recipientRoutesForAll(recipients)
-	candidates, err := p.messageCandidatesForRoutes(routes)
+	return p.filterUnreadForRoutes(p.recipientRoutesForAll(recipients))
+}
+
+// filterUnreadForRoutes returns the open, unread messages assigned to any of
+// the given recipient routes. It runs a single message-candidate scan and
+// filters in memory; the route set is supplied by the caller (already derived,
+// or threaded from session resolution) so this function issues no route-
+// derivation queries of its own. An empty route set returns no messages rather
+// than scanning every mailbox.
+func (p *Provider) filterUnreadForRoutes(routes []string) ([]mail.Message, error) {
+	if len(routes) == 0 {
+		return nil, nil
+	}
+	candidates, err := p.openMessageCandidates()
 	if err != nil {
 		return nil, fmt.Errorf("beadmail: listing beads: %w", err)
 	}
@@ -565,7 +591,7 @@ func (p *Provider) filterMessagesForRecipients(recipients []string) ([]mail.Mess
 		if b.Status != "open" {
 			continue
 		}
-		if len(routes) > 0 && !matchesRecipientRoute(routes, b.Assignee) {
+		if !matchesRecipientRoute(routes, b.Assignee) {
 			continue
 		}
 		if hasLabel(b.Labels, "read") {
@@ -574,6 +600,15 @@ func (p *Provider) filterMessagesForRecipients(recipients []string) ([]mail.Mess
 		msgs = append(msgs, beadToMessage(b))
 	}
 	return msgs, nil
+}
+
+// RoutesForSession returns the full set of recipient routes a session bead
+// answers to: its ID, current alias, session name, and every historical alias.
+// Callers that have already resolved a session bead (mail-target resolution)
+// pass these routes to [Provider.InboxRoutes] to skip re-deriving them from the
+// store. The set matches what recipientRoutes derives for a live session.
+func RoutesForSession(b beads.Bead) []string {
+	return sessionAddressesForRecipientRouting(b)
 }
 
 // Filter implements [mail.Filterer]. The candidate set is chosen by the most
@@ -731,13 +766,11 @@ func messageMatchesSender(b beads.Bead, want string) bool {
 	return false
 }
 
-// messageCandidates returns message beads relevant to a recipient using
-// targeted queries instead of a broad store scan. This avoids timeouts
-// on stores with many beads.
-//
-// For per-recipient queries, list by assignee+type+status — targeted to the
-// recipient's open messages. For global queries (recipient==""), falls back
-// to type-based listing since no assignee filter can be applied.
+// recipientRoutes returns the set of mailbox addresses a recipient string
+// resolves to: the recipient itself plus, when it names a live (or, failing
+// that, closed) session, that session's ID, alias, session name, and historical
+// aliases. The candidate-message scan ([Provider.openMessageCandidates]) then
+// filters in memory against these routes.
 //
 // Type="message" is the authoritative discriminator; the legacy gc:message
 // label supplement was removed in #862 along with writes to that label.
@@ -940,47 +973,28 @@ func matchesRecipientRoute(routes []string, assignee string) bool {
 	return false
 }
 
-func (p *Provider) messageCandidatesForRoutes(routes []string) ([]beads.Bead, error) {
-	seen := make(map[string]beads.Bead)
-	order := make([]string, 0)
-	add := func(bs []beads.Bead) {
-		for _, b := range bs {
-			if !isMessage(b) {
-				continue
-			}
-			if _, ok := seen[b.ID]; !ok {
-				order = append(order, b.ID)
-			}
-			seen[b.ID] = b
-		}
+// openMessageCandidates returns every open message bead in a single store
+// query. Mail callers (Inbox/Check/All/Count) narrow the result to the routes
+// they care about in memory, so one Type=message,Status=open scan replaces the
+// former per-route fan-out (one List per recipient route). Every backing-store
+// query is a bd subprocess round-trip, and the open-message set is small —
+// read and archived messages are excluded by Status=open — so the global scan
+// is both fewer round-trips and a bounded result. This is the residual N+1 fix
+// on the inbox/check poll path (ga-mik1, follow-up to ga-a60).
+func (p *Provider) openMessageCandidates() ([]beads.Bead, error) {
+	items, err := p.store.List(beads.ListQuery{
+		Type:     "message",
+		Status:   "open",
+		TierMode: beads.TierBoth,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("listing message beads: %w", err)
 	}
-
-	// Primary: targeted query scoped to recipient.
-	if len(routes) > 0 {
-		for _, route := range routes {
-			assigned, err := p.store.List(beads.ListQuery{
-				Assignee: route,
-				Type:     "message",
-				Status:   "open",
-				TierMode: beads.TierBoth,
-			})
-			if err != nil {
-				return nil, fmt.Errorf("listing by assignee %q: %w", route, err)
-			}
-			add(assigned)
+	result := make([]beads.Bead, 0, len(items))
+	for _, b := range items {
+		if isMessage(b) {
+			result = append(result, b)
 		}
-	} else {
-		// No recipient filter — use type-based query for global discovery.
-		all, err := p.store.List(beads.ListQuery{Type: "message", TierMode: beads.TierBoth})
-		if err != nil {
-			return nil, fmt.Errorf("listing message beads: %w", err)
-		}
-		add(all)
-	}
-
-	result := make([]beads.Bead, 0, len(order))
-	for _, id := range order {
-		result = append(result, seen[id])
 	}
 	return result, nil
 }
