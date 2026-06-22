@@ -2448,10 +2448,13 @@ func TestCombinedPackParses(t *testing.T) {
 func TestPackUsesIsolatedWorkDirs(t *testing.T) {
 	agents := discoverPackAgents(t, filepath.Join("packs", "gastown"))
 	want := map[string]string{
-		"mayor":    ".gc/agents/mayor",
-		"deacon":   ".gc/agents/deacon",
-		"boot":     ".gc/agents/boot",
-		"witness":  ".gc/agents/{{.Rig}}/witness",
+		"mayor":  ".gc/agents/mayor",
+		"deacon": ".gc/agents/deacon",
+		"boot":   ".gc/agents/boot",
+		// The witness lives in a rig worktree (not a bare .gc/agents dir) so
+		// that `gc bd` resolves its rig store from cwd — see
+		// TestWitnessRunsInRigWorktreeForBeadStoreResolution.
+		"witness":  ".gc/worktrees/{{.Rig}}/witness",
 		"refinery": ".gc/worktrees/{{.Rig}}/refinery",
 		"polecat":  ".gc/worktrees/{{.Rig}}/polecats/{{.AgentBase}}",
 	}
@@ -2459,6 +2462,57 @@ func TestPackUsesIsolatedWorkDirs(t *testing.T) {
 		if expected, ok := want[a.Name]; ok && a.WorkDir != expected {
 			t.Errorf("agent %q: work_dir = %q, want %q", a.Name, a.WorkDir, expected)
 		}
+	}
+}
+
+// TestWitnessRunsInRigWorktreeForBeadStoreResolution guards the root-cause
+// fix for ga-4sb7: the witness must run from a git worktree of its rig (like
+// the refinery and polecat), not a bare directory under the city's `.gc/agents`
+// tree.
+//
+// `gc bd` resolves which bead store to use from cwd (see
+// cmd/gc/rig_scope_resolution.go: rigForDir -> git worktree match). A bare
+// `.gc/agents/{{.Rig}}/witness` directory lives inside the *city* checkout, so
+// `gc bd mol wisp` and every other bead command resolved to the HQ store
+// instead of the rig store — the witness poured patrol wisps where its
+// formula isn't registered and the work it monitors doesn't exist. A rig
+// worktree shares the rig repo's git common dir, so cwd resolves to the rig
+// store with no per-deployment `.beads/redirect` band-aid. The refinery
+// already proves this model works.
+func TestWitnessRunsInRigWorktreeForBeadStoreResolution(t *testing.T) {
+	agents := discoverPackAgents(t, filepath.Join("packs", "gastown"))
+
+	var witness *config.Agent
+	for i := range agents {
+		if agents[i].Name == "witness" {
+			witness = &agents[i]
+			break
+		}
+	}
+	if witness == nil {
+		t.Fatal("witness agent not found in gastown pack")
+	}
+
+	// The work_dir must be a rig worktree, not a bare .gc/agents directory
+	// inside the city checkout (which resolves bead commands to the HQ store).
+	if !strings.HasPrefix(witness.WorkDir, ".gc/worktrees/") {
+		t.Errorf("witness work_dir = %q, want a rig worktree under .gc/worktrees/ "+
+			"so gc bd resolves the rig store from cwd (ga-4sb7)", witness.WorkDir)
+	}
+
+	// A worktree only exists if worktree-setup.sh runs before the session
+	// starts. Without it the directory is empty and cwd is not a git worktree
+	// of the rig, so store resolution falls back to the city store.
+	foundWorktreeSetup := false
+	for _, cmd := range witness.PreStart {
+		if strings.Contains(cmd, "worktree-setup.sh") {
+			foundWorktreeSetup = true
+			break
+		}
+	}
+	if !foundWorktreeSetup {
+		t.Errorf("witness pre_start = %v, want a worktree-setup.sh invocation so "+
+			"the work_dir is a real git worktree of the rig (ga-4sb7)", witness.PreStart)
 	}
 }
 

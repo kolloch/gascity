@@ -1,6 +1,16 @@
 scope = "rig"
 wake_mode = "fresh"
-work_dir = ".gc/agents/{{.Rig}}/witness"
+# The witness runs from a git worktree of its rig (like the refinery and
+# polecat), not a bare directory under the city's .gc/agents tree. `gc bd`
+# resolves which bead store to use from cwd: a directory inside the city
+# checkout resolves to the HQ store, so a witness rooted there poured its
+# patrol wisps into HQ — where its formula isn't registered and the work it
+# monitors doesn't exist. A rig worktree shares the rig repo's git common
+# dir, so every bead command resolves to the rig store with no per-deployment
+# .beads/redirect band-aid. The pre_start worktree-setup.sh makes the dir a
+# real worktree before the session starts. See ga-4sb7.
+work_dir = ".gc/worktrees/{{.Rig}}/witness"
+pre_start = ["{{.ConfigDir}}/assets/scripts/worktree-setup.sh {{.RigRoot}} {{.WorkDir}} {{.AgentBase}} --sync"]
 nudge = "Run 'gc prime' to check worker status and begin patrol cycle."
 idle_timeout = "1h"
 # Preemptively cycle the witness before the typical provider cred-cache
