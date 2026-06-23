@@ -691,20 +691,37 @@ func newCommandMailProvider(store beads.Store) mail.Provider {
 	}
 }
 
+// openCityStoreForMail opens the city bead store for store-backed mail
+// commands. It is a package var so tests can count store opens and assert that
+// the inbox/check/count paths share a single open across provider construction
+// and mail-target resolution (ga-iv4k).
+var openCityStoreForMail = openCityStore
+
 // openCityMailProvider opens the city's bead store and wraps it in a
 // mail.Provider. Returns (nil, exitCode) on failure.
 func openCityMailProvider(stderr io.Writer, cmdName string) (mail.Provider, int) {
+	_, mp, code := openCityMailProviderWithStore(stderr, cmdName)
+	return mp, code
+}
+
+// openCityMailProviderWithStore opens the city mail provider and, for
+// store-backed providers, also returns the underlying bead store so callers can
+// reuse a single store open across provider construction and mail-target
+// resolution instead of opening the city store twice. For storeless providers
+// (exec:, fake, fail) the returned store is nil and target resolution falls
+// back to its storeless path. (ga-iv4k)
+func openCityMailProviderWithStore(stderr io.Writer, cmdName string) (beads.Store, mail.Provider, int) {
 	// For exec: and test doubles, no store needed.
 	v := mailProviderName()
 	if strings.HasPrefix(v, "exec:") || v == "fake" || v == "fail" {
-		return newCommandMailProvider(nil), 0
+		return nil, newCommandMailProvider(nil), 0
 	}
 
-	store, code := openCityStore(stderr, cmdName)
+	store, code := openCityStoreForMail(stderr, cmdName)
 	if store == nil {
-		return nil, code
+		return nil, nil, code
 	}
-	return newCommandMailProvider(store), 0
+	return store, newCommandMailProvider(store), 0
 }
 
 // eventsProviderName returns the events provider name.

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -339,7 +340,7 @@ func TestResolveDefaultMailTargetsForCommand_UsesGCSessionIDBeforeAlias(t *testi
 	t.Setenv("GC_AGENT", "codeprobe-worker")
 
 	var stderr bytes.Buffer
-	target, ok := resolveDefaultMailTargetsForCommand(&stderr, "gc mail inbox")
+	target, ok := resolveDefaultMailTargetsForCommandWithStore(nil, &stderr, "gc mail inbox")
 	if !ok {
 		t.Fatalf("resolveDefaultMailTargetsForCommand() = not ok; stderr=%q", stderr.String())
 	}
@@ -391,7 +392,7 @@ func TestResolveDefaultMailTargetsForCommand_FallsBackToGCAliasWhenSessionIDMiss
 	_ = os.Unsetenv("GC_AGENT")
 
 	var stderr bytes.Buffer
-	target, ok := resolveDefaultMailTargetsForCommand(&stderr, "gc mail inbox")
+	target, ok := resolveDefaultMailTargetsForCommandWithStore(nil, &stderr, "gc mail inbox")
 	if !ok {
 		t.Fatalf("resolveDefaultMailTargetsForCommand() = not ok; stderr=%q", stderr.String())
 	}
@@ -606,7 +607,7 @@ func TestResolveDefaultMailTargetsForCommand_HumanDefaultWhenNoEnv(t *testing.T)
 	_ = os.Unsetenv("GC_AGENT")
 
 	var stderr bytes.Buffer
-	target, ok := resolveDefaultMailTargetsForCommand(&stderr, "gc mail inbox")
+	target, ok := resolveDefaultMailTargetsForCommandWithStore(nil, &stderr, "gc mail inbox")
 	if !ok {
 		t.Fatalf("resolveDefaultMailTargetsForCommand() = not ok; stderr=%q", stderr.String())
 	}
@@ -630,7 +631,7 @@ func TestResolveDefaultMailTargetsForCommand_StorelessProviderUsesFirstCandidate
 	t.Cleanup(func() { openMailTargetStore = prev })
 
 	var stderr bytes.Buffer
-	target, ok := resolveDefaultMailTargetsForCommand(&stderr, "gc mail inbox")
+	target, ok := resolveDefaultMailTargetsForCommandWithStore(nil, &stderr, "gc mail inbox")
 	if !ok {
 		t.Fatalf("resolveDefaultMailTargetsForCommand() = not ok; stderr=%q", stderr.String())
 	}
@@ -676,7 +677,7 @@ func TestResolveDefaultMailTargetsForCommand_SurfacesAmbiguousError_AndStops(t *
 	_ = os.Unsetenv("GC_AGENT")
 
 	var stderr bytes.Buffer
-	_, ok := resolveDefaultMailTargetsForCommand(&stderr, "gc mail inbox")
+	_, ok := resolveDefaultMailTargetsForCommandWithStore(nil, &stderr, "gc mail inbox")
 	if ok {
 		t.Fatalf("resolveDefaultMailTargetsForCommand() ok = true, want false")
 	}
@@ -863,6 +864,64 @@ func TestMailInboxThreadsResolvedRoutes_MinimalRoundTrips(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "hi") {
 		t.Errorf("inbox output missing the message subject: %q", out.String())
+	}
+}
+
+// TestMailPollSharesSingleCityStoreOpen is ga-iv4k's headline regression: each
+// store-backed mail poll (inbox/check/count) both builds a provider AND
+// resolves its target. Before ga-iv4k those two steps each opened the city
+// store independently, so every poll paid two gc-side store opens (and the
+// per-open `dolt remote -v` + git/uname spawns the bd exec store triggers).
+// The poll now threads one store open across both steps, so it opens the city
+// store exactly once.
+func TestMailPollSharesSingleCityStoreOpen(t *testing.T) {
+	cases := []struct {
+		name string
+		run  func(stdout, stderr io.Writer) int
+	}{
+		{"inbox", func(o, e io.Writer) int { return cmdMailInboxWithJSON(nil, true, o, e) }},
+		{"check", func(o, e io.Writer) int { return cmdMailCheckWithFormat(nil, false, "", o, e) }},
+		{"count", func(o, e io.Writer) int { return cmdMailCountWithJSON(nil, true, o, e) }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Default (store-backed) beadmail provider; single identity
+			// candidate so resolution drives straight through the shared store.
+			t.Setenv("GC_MAIL", "")
+			t.Setenv("GC_ALIAS", "")
+			t.Setenv("GC_AGENT", "")
+
+			mem := beads.NewMemStore()
+			sess, err := mem.Create(beads.Bead{
+				Type:   session.BeadType,
+				Labels: []string{session.LabelSession},
+				Metadata: map[string]string{
+					"alias":        "gascity/gastown.furiosa",
+					"session_name": "gastown__polecat-pe-iv4k",
+				},
+			})
+			if err != nil {
+				t.Fatalf("Create session: %v", err)
+			}
+			t.Setenv("GC_SESSION_ID", sess.ID)
+
+			opens := 0
+			prev := openCityStoreForMail
+			openCityStoreForMail = func(_ io.Writer, _ string) (beads.Store, int) {
+				opens++
+				return mem, 0
+			}
+			t.Cleanup(func() { openCityStoreForMail = prev })
+
+			var out, errOut bytes.Buffer
+			// Exit code is not asserted: `check` returns 1 for an empty inbox,
+			// which is not an error. The store-open count is the contract.
+			_ = tc.run(&out, &errOut)
+			if opens != 1 {
+				t.Fatalf("gc mail %s opened the city store %d times, want 1 (ga-iv4k: provider + resolution must share one open); stderr=%q",
+					tc.name, opens, errOut.String())
+			}
+		})
 	}
 }
 

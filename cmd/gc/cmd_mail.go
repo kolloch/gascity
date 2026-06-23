@@ -327,7 +327,7 @@ func cmdMailCheckWithFormat(args []string, inject bool, hookFormat string, stdou
 		}
 	}
 
-	mp, code := openCityMailProvider(stderr, "gc mail check")
+	store, mp, code := openCityMailProviderWithStore(stderr, "gc mail check")
 	if mp == nil {
 		if inject {
 			return 0 // --inject always exits 0
@@ -335,7 +335,7 @@ func cmdMailCheckWithFormat(args []string, inject bool, hookFormat string, stdou
 		return code
 	}
 
-	target, ok := resolveMailTargetFromArgs(args, stderr, "gc mail check")
+	target, ok := resolveMailTargetFromArgsWithStore(args, store, stderr, "gc mail check")
 	if !ok {
 		if inject {
 			return 0
@@ -848,16 +848,27 @@ func resolveMailTargetsCached(store beads.Store, identifier string, cache *mailI
 }
 
 func resolveMailTargetsForCommand(identifier string, stderr io.Writer, cmdName string) (resolvedMailTarget, bool) {
+	return resolveMailTargetsForCommandWithStore(identifier, nil, stderr, cmdName)
+}
+
+// resolveMailTargetsForCommandWithStore is resolveMailTargetsForCommand with an
+// optional pre-opened store. When store is non-nil (and the provider is
+// store-backed) resolution reuses it instead of opening a fresh city store
+// (ga-iv4k).
+func resolveMailTargetsForCommandWithStore(identifier string, store beads.Store, stderr io.Writer, cmdName string) (resolvedMailTarget, bool) {
 	if identifier == "" || identifier == "human" {
 		return resolvedMailTarget{display: "human", recipients: []string{"human"}}, true
 	}
 	if isStorelessMailProvider() {
 		return resolveRawMailTargetForStorelessProvider(identifier, stderr, cmdName)
 	}
-	store, code := openCityStore(stderr, cmdName)
 	if store == nil {
-		_ = code
-		return resolvedMailTarget{}, false
+		var code int
+		store, code = openCityStoreForMail(stderr, cmdName)
+		if store == nil {
+			_ = code
+			return resolvedMailTarget{}, false
+		}
 	}
 	target, err := resolveMailTargets(store, identifier)
 	if err != nil {
@@ -867,19 +878,25 @@ func resolveMailTargetsForCommand(identifier string, stderr io.Writer, cmdName s
 	return target, true
 }
 
-// resolveDefaultMailTargetsForCommand tries each default identity candidate
-// against the city's bead store and returns the first that resolves. A
-// stale GC_ALIAS on a pool worker would otherwise block inbox access when
-// GC_SESSION_ID still matches the bead via session_name.
-func resolveDefaultMailTargetsForCommand(stderr io.Writer, cmdName string) (resolvedMailTarget, bool) {
+// resolveDefaultMailTargetsForCommandWithStore tries each default identity
+// candidate against the city's bead store and returns the first that resolves.
+// A stale GC_ALIAS on a pool worker would otherwise block inbox access when
+// GC_SESSION_ID still matches the bead via session_name. When store is non-nil
+// the multi-candidate scan reuses it instead of opening a second city store;
+// the inbox/check/count paths pass the store already opened for the mail
+// provider so the poll opens the city store once instead of twice (ga-iv4k).
+func resolveDefaultMailTargetsForCommandWithStore(store beads.Store, stderr io.Writer, cmdName string) (resolvedMailTarget, bool) {
 	candidates := defaultMailIdentityCandidates()
 	if len(candidates) == 1 || isStorelessMailProvider() {
-		return resolveMailTargetsForCommand(candidates[0], stderr, cmdName)
+		return resolveMailTargetsForCommandWithStore(candidates[0], store, stderr, cmdName)
 	}
-	store, code := openCityStore(stderr, cmdName)
 	if store == nil {
-		_ = code
-		return resolvedMailTarget{}, false
+		var code int
+		store, code = openCityStoreForMail(stderr, cmdName)
+		if store == nil {
+			_ = code
+			return resolvedMailTarget{}, false
+		}
 	}
 	// Memoize the gc:session enumeration so multi-candidate retry shares one
 	// broad scan instead of issuing one per candidate (ga-q6ct Layer 2).
@@ -918,11 +935,14 @@ func resolveDefaultMailSenderForCommandCached(cityPath string, cfg *config.City,
 	return "", false
 }
 
-func resolveMailTargetFromArgs(args []string, stderr io.Writer, cmdName string) (resolvedMailTarget, bool) {
+// resolveMailTargetFromArgsWithStore resolves the mail target named by args[0],
+// or the default identity when args is empty. An optional pre-opened store is
+// reused for resolution instead of opening a second city store (ga-iv4k).
+func resolveMailTargetFromArgsWithStore(args []string, store beads.Store, stderr io.Writer, cmdName string) (resolvedMailTarget, bool) {
 	if len(args) > 0 {
-		return resolveMailTargetsForCommand(args[0], stderr, cmdName)
+		return resolveMailTargetsForCommandWithStore(args[0], store, stderr, cmdName)
 	}
-	return resolveDefaultMailTargetsForCommand(stderr, cmdName)
+	return resolveDefaultMailTargetsForCommandWithStore(store, stderr, cmdName)
 }
 
 func resolveRawMailTargetForStorelessProvider(identifier string, stderr io.Writer, cmdName string) (resolvedMailTarget, bool) {
@@ -1580,12 +1600,12 @@ func cmdMailInbox(args []string, stdout, stderr io.Writer) int {
 }
 
 func cmdMailInboxWithJSON(args []string, jsonOut bool, stdout, stderr io.Writer) int {
-	mp, code := openCityMailProvider(stderr, "gc mail inbox")
+	store, mp, code := openCityMailProviderWithStore(stderr, "gc mail inbox")
 	if mp == nil {
 		return code
 	}
 
-	target, ok := resolveMailTargetFromArgs(args, stderr, "gc mail inbox")
+	target, ok := resolveMailTargetFromArgsWithStore(args, store, stderr, "gc mail inbox")
 	if !ok {
 		return 1
 	}
@@ -2120,12 +2140,12 @@ func canonicalMailThreadID(fallback string, msgs []mail.Message) string {
 }
 
 func cmdMailCountWithJSON(args []string, jsonOut bool, stdout, stderr io.Writer) int {
-	mp, code := openCityMailProvider(stderr, "gc mail count")
+	store, mp, code := openCityMailProviderWithStore(stderr, "gc mail count")
 	if mp == nil {
 		return code
 	}
 
-	target, ok := resolveMailTargetFromArgs(args, stderr, "gc mail count")
+	target, ok := resolveMailTargetFromArgsWithStore(args, store, stderr, "gc mail count")
 	if !ok {
 		return 1
 	}
