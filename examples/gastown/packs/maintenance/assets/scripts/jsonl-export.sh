@@ -23,11 +23,21 @@ PACK_STATE_DIR="${GC_PACK_STATE_DIR:-${GC_CITY_RUNTIME_DIR:-$CITY/.gc/runtime}/p
 LEGACY_ARCHIVE_REPO="$CITY/.gc/jsonl-archive"
 LEGACY_STATE_FILE="$CITY/.gc/jsonl-export-state.json"
 
-# Configurable via environment (defaults match the old formula).
-SPIKE_THRESHOLD="${GC_JSONL_SPIKE_THRESHOLD:-20}"  # percentage (0-100)
-# Skip the percentage spike check when the previous record count is below
-# this absolute floor — small-N percentages are noise. Set to 0 to disable.
-MIN_PREV_FOR_SPIKE_CHECK="${GC_JSONL_MIN_PREV_FOR_SPIKE:-10}"
+# Configurable via environment.
+# Alarm threshold: most legitimate DB growth is bursty, so a real pollution
+# event (scrubber regression, runaway insert) clears 50% with room to spare
+# while routine churn stays below it (ga-dlxq raised this from 20%).
+SPIKE_THRESHOLD="${GC_JSONL_SPIKE_THRESHOLD:-50}"  # percentage (0-100)
+# The percentage is only trusted when one of two floors is satisfied, because
+# percentages are noise at small N (a 17→21 bump is +23% but only +4 records):
+#   - the previous record count is at least MIN_PREV_FOR_SPIKE_CHECK, or
+#   - the absolute swing is at least MIN_SPIKE_DELTA records.
+# Below both floors the spike check is skipped. Set MIN_PREV_FOR_SPIKE_CHECK=0
+# to evaluate the percentage at every baseline (disables the small-N skip).
+# ga-dlxq raised MIN_PREV from 10 to 50 and added the MIN_SPIKE_DELTA escape
+# hatch so a genuine spike on a small store (e.g. 40→400) still fires.
+MIN_PREV_FOR_SPIKE_CHECK="${GC_JSONL_MIN_PREV_FOR_SPIKE:-50}"
+MIN_SPIKE_DELTA="${GC_JSONL_MIN_SPIKE_DELTA:-25}"
 MAX_PUSH_FAILURES="${GC_JSONL_MAX_PUSH_FAILURES:-3}"
 PUSH_RETRY_DELAY_MIN="${GC_JSONL_PUSH_RETRY_DELAY_MIN:-1}"
 PUSH_RETRY_DELAY_SPAN="${GC_JSONL_PUSH_RETRY_DELAY_SPAN:-4}"
@@ -891,27 +901,35 @@ while IFS= read -r DB; do
         PREV_COUNT=$(git -C "$ARCHIVE_REPO" show "HEAD:$DB/issues.jsonl" 2>/dev/null | count_jsonl_rows || echo "0")
     fi
 
-    # Skip the percentage check on the first run (no prior commit) and when
-    # the previous count is below the absolute floor — a 1→2 swing is 100% but
-    # meaningless on a tiny database. The PREV_COUNT > 0 guard also avoids the
-    # division-by-zero on line `DELTA=...` when the floor is set to 0 to
-    # disable the small-N skip.
-    if [ "$PREV_COUNT" -gt 0 ] && [ "$PREV_COUNT" -ge "$MIN_PREV_FOR_SPIKE_CHECK" ]; then
+    # Skip the percentage check on the first run (no prior commit). The
+    # PREV_COUNT > 0 guard also avoids the division-by-zero on `DELTA=...`.
+    # Then trust the percentage only when one of two floors holds, because
+    # percentages are noise at small N (a 17→21 swing is +23% but only +4
+    # records): a large enough baseline, OR a large enough absolute swing.
+    # Below both floors the percentage is ignored — see the config block.
+    if [ "$PREV_COUNT" -gt 0 ]; then
         FILTERED_COUNT=$(count_jsonl_rows < "$DB_DIR/issues.jsonl")
-        # Signed delta: positive is growth (records added), negative is shrinkage.
-        DELTA=$(( (FILTERED_COUNT - PREV_COUNT) * 100 / PREV_COUNT ))
-        if [ "$DELTA" -gt "$SPIKE_THRESHOLD" ]; then
-            HALTED=1
-            HALT_DB="$DB"
-            HALT_PREV_COUNT="$PREV_COUNT"
-            HALT_CURRENT_COUNT="$FILTERED_COUNT"
-            HALT_DELTA="$DELTA"
-            echo "jsonl-export: HALTED — growth spike in $DB (+${DELTA}% > ${SPIKE_THRESHOLD}%)"
-            break
-        elif [ "$DELTA" -lt 0 ]; then
-            SHRINK=$(( -DELTA ))
-            if [ "$SHRINK" -gt "$SPIKE_THRESHOLD" ]; then
-                echo "jsonl-export: NOTICE — $DB export shrank ${SHRINK}% (${PREV_COUNT} -> ${FILTERED_COUNT}); not an anomaly (compaction/sweep), advancing baseline" >&2
+        # Signed: positive is growth (records added), negative is shrinkage.
+        DELTA_RECORDS=$(( FILTERED_COUNT - PREV_COUNT ))
+        DELTA=$(( DELTA_RECORDS * 100 / PREV_COUNT ))
+        ABS_DELTA_RECORDS=$DELTA_RECORDS
+        if [ "$ABS_DELTA_RECORDS" -lt 0 ]; then
+            ABS_DELTA_RECORDS=$(( -ABS_DELTA_RECORDS ))
+        fi
+        if [ "$PREV_COUNT" -ge "$MIN_PREV_FOR_SPIKE_CHECK" ] || [ "$ABS_DELTA_RECORDS" -ge "$MIN_SPIKE_DELTA" ]; then
+            if [ "$DELTA" -gt "$SPIKE_THRESHOLD" ]; then
+                HALTED=1
+                HALT_DB="$DB"
+                HALT_PREV_COUNT="$PREV_COUNT"
+                HALT_CURRENT_COUNT="$FILTERED_COUNT"
+                HALT_DELTA="$DELTA"
+                echo "jsonl-export: HALTED — growth spike in $DB (+${DELTA}% > ${SPIKE_THRESHOLD}%)"
+                break
+            elif [ "$DELTA" -lt 0 ]; then
+                SHRINK=$(( -DELTA ))
+                if [ "$SHRINK" -gt "$SPIKE_THRESHOLD" ]; then
+                    echo "jsonl-export: NOTICE — $DB export shrank ${SHRINK}% (${PREV_COUNT} -> ${FILTERED_COUNT}); not an anomaly (compaction/sweep), advancing baseline" >&2
+                fi
             fi
         fi
     fi

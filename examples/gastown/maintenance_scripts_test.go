@@ -5045,9 +5045,10 @@ func TestJsonlExportCountsRecordsViaJq(t *testing.T) {
 
 func TestJsonlExportSkipsSpikeCheckBelowMinPrev(t *testing.T) {
 	// Bug 2 (#1547): percent-delta with no absolute floor escalates on tiny
-	// counts. prev=2, current=4 → 100% growth would cross the 20% threshold.
-	// With the fix, no escalation when prev < GC_JSONL_MIN_PREV_FOR_SPIKE
-	// (default 10).
+	// counts. prev=2, current=4 → 100% growth would cross the spike threshold.
+	// No escalation when prev < GC_JSONL_MIN_PREV_FOR_SPIKE (default 50 since
+	// ga-dlxq) and the absolute swing is below GC_JSONL_MIN_SPIKE_DELTA — here
+	// the +2-record delta is far under both gates.
 	cityDir := t.TempDir()
 	binDir := t.TempDir()
 	stateDir := t.TempDir()
@@ -5234,6 +5235,150 @@ func TestJsonlExportFirstRunWithDisabledFloorSkipsSpikeCheck(t *testing.T) {
 	}
 	if !strings.Contains(string(gcData), "DOG_DONE: jsonl") {
 		t.Fatalf("expected DOG_DONE nudge in gc log:\n%s", gcData)
+	}
+}
+
+func TestJsonlExportSmallAbsoluteGrowthDoesNotEscalate(t *testing.T) {
+	// ga-dlxq: a tiny absolute growth on a small rig store must not fire a HIGH
+	// escalation. The original 17→21 incident (+4 records = +23%) crossed the
+	// old 20% threshold despite the MIN_PREV=10 floor passing (17 ≥ 10), paging
+	// the mayor over routine bead churn. With the tuned defaults — threshold
+	// raised to 50% and MIN_PREV raised to 50 — the percentage is no longer
+	// trusted at this baseline (prev=17 < 50) and the absolute swing (+4) is far
+	// below the new MIN_SPIKE_DELTA escape hatch (25), so the spike check is
+	// skipped entirely: no escalation, no HALT, normal export path.
+	cityDir := t.TempDir()
+	binDir := t.TempDir()
+	stateDir := t.TempDir()
+	gcLog := filepath.Join(t.TempDir(), "gc.log")
+	mailLog := filepath.Join(t.TempDir(), "gc-mail.log")
+	archiveRepo := filepath.Join(cityDir, "archive")
+
+	initSeedArchive(t, archiveRepo, 17)
+	writeMultiRecordDoltStub(t, binDir, 21)
+	writeJsonlExportGCStub(t, binDir)
+
+	env := jsonlExportEnv(t, cityDir, binDir, stateDir, archiveRepo, gcLog, mailLog)
+
+	runScript(t, filepath.Join(exampleDir(), "packs", "maintenance", "assets", "scripts", "jsonl-export.sh"), env)
+
+	mailData, err := os.ReadFile(mailLog)
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatalf("ReadFile(mail log): %v", err)
+	}
+	if strings.Contains(string(mailData), "ESCALATION: JSONL spike") {
+		t.Fatalf("a +4-record (17→21) bump must not escalate a spike; mail log:\n%s", mailData)
+	}
+
+	gcData, err := os.ReadFile(gcLog)
+	if err != nil {
+		t.Fatalf("ReadFile(gc log): %v", err)
+	}
+	if strings.Contains(string(gcData), "HALTED on spike detection") {
+		t.Fatalf("a +4-record (17→21) bump must not HALT; gc log:\n%s", gcData)
+	}
+	if !strings.Contains(string(gcData), "DOG_DONE: jsonl — exported") {
+		t.Fatalf("expected the normal export summary nudge after benign small growth; gc log:\n%s", gcData)
+	}
+}
+
+func TestJsonlExportLargeAbsoluteGrowthOnSmallBaselineHalts(t *testing.T) {
+	// ga-dlxq: raising MIN_PREV to 50 must NOT blind the detector to a genuine
+	// spike on a small store. A 10x explosion (prev=40 → current=400, e.g. a
+	// scrubber regression dumping test rows) sits below the MIN_PREV floor
+	// (40 < 50), so without the absolute-delta escape hatch it would slip
+	// through silently. The new MIN_SPIKE_DELTA gate (25) trusts the percentage
+	// when the absolute swing is large enough (+360 ≥ 25), so the +900% growth
+	// still HALTs and escalates.
+	cityDir := t.TempDir()
+	binDir := t.TempDir()
+	stateDir := t.TempDir()
+	gcLog := filepath.Join(t.TempDir(), "gc.log")
+	mailLog := filepath.Join(t.TempDir(), "gc-mail.log")
+	archiveRepo := filepath.Join(cityDir, "archive")
+
+	prevHead := initSeedArchive(t, archiveRepo, 40)
+	writeMultiRecordDoltStub(t, binDir, 400)
+	writeJsonlExportGCStub(t, binDir)
+
+	env := jsonlExportEnv(t, cityDir, binDir, stateDir, archiveRepo, gcLog, mailLog)
+
+	runScript(t, filepath.Join(exampleDir(), "packs", "maintenance", "assets", "scripts", "jsonl-export.sh"), env)
+
+	mailData, err := os.ReadFile(mailLog)
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatalf("ReadFile(mail log): %v", err)
+	}
+	if !strings.Contains(string(mailData), "ESCALATION: JSONL spike") {
+		t.Fatalf("a 10x growth (40→400) below MIN_PREV must still escalate via the absolute-delta gate; mail log:\n%s", mailData)
+	}
+
+	gcData, err := os.ReadFile(gcLog)
+	if err != nil {
+		t.Fatalf("ReadFile(gc log): %v", err)
+	}
+	if !strings.Contains(string(gcData), "HALTED on spike detection") {
+		t.Fatalf("a 10x growth (40→400) must HALT; gc log:\n%s", gcData)
+	}
+
+	// Baseline must advance with a [HALT]-tagged commit (same contract as the
+	// large-baseline halt test).
+	revOut, err := exec.Command("git", "-C", archiveRepo, "rev-parse", "HEAD").CombinedOutput()
+	if err != nil {
+		t.Fatalf("git rev-parse: %v\n%s", err, revOut)
+	}
+	if strings.TrimSpace(string(revOut)) == prevHead {
+		t.Fatalf("HEAD did not advance after HALT; baseline frozen at %s", prevHead)
+	}
+	logOut, err := exec.Command("git", "-C", archiveRepo, "log", "-1", "--format=%s").CombinedOutput()
+	if err != nil {
+		t.Fatalf("git log: %v\n%s", err, logOut)
+	}
+	if headMsg := strings.TrimSpace(string(logOut)); !strings.Contains(headMsg, "HALT") {
+		t.Fatalf("HALT-baseline commit must include HALT marker; got: %q", headMsg)
+	}
+}
+
+func TestJsonlExportModeratePercentGrowthBelowRaisedThresholdDoesNotEscalate(t *testing.T) {
+	// ga-dlxq: most legitimate DB growth is bursty, not catastrophic, so the
+	// alarm threshold moved from 20% to 50%. A +30% jump on a healthy baseline
+	// (prev=100 → current=130) clears the OLD threshold (30 > 20) but not the
+	// new one (30 < 50), so it must no longer escalate. This also pins the
+	// absolute-delta gate as a FLOOR on the percentage, not an independent OR
+	// trigger: the +30 swing satisfies MIN_SPIKE_DELTA (≥ 25), yet the run stays
+	// quiet because the percentage itself is below threshold.
+	cityDir := t.TempDir()
+	binDir := t.TempDir()
+	stateDir := t.TempDir()
+	gcLog := filepath.Join(t.TempDir(), "gc.log")
+	mailLog := filepath.Join(t.TempDir(), "gc-mail.log")
+	archiveRepo := filepath.Join(cityDir, "archive")
+
+	initSeedArchive(t, archiveRepo, 100)
+	writeMultiRecordDoltStub(t, binDir, 130)
+	writeJsonlExportGCStub(t, binDir)
+
+	env := jsonlExportEnv(t, cityDir, binDir, stateDir, archiveRepo, gcLog, mailLog)
+
+	runScript(t, filepath.Join(exampleDir(), "packs", "maintenance", "assets", "scripts", "jsonl-export.sh"), env)
+
+	mailData, err := os.ReadFile(mailLog)
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatalf("ReadFile(mail log): %v", err)
+	}
+	if strings.Contains(string(mailData), "ESCALATION: JSONL spike") {
+		t.Fatalf("a +30%% growth (100→130) is below the 50%% threshold and must not escalate; mail log:\n%s", mailData)
+	}
+
+	gcData, err := os.ReadFile(gcLog)
+	if err != nil {
+		t.Fatalf("ReadFile(gc log): %v", err)
+	}
+	if strings.Contains(string(gcData), "HALTED on spike detection") {
+		t.Fatalf("a +30%% growth (100→130) is below the 50%% threshold and must not HALT; gc log:\n%s", gcData)
+	}
+	if !strings.Contains(string(gcData), "DOG_DONE: jsonl — exported") {
+		t.Fatalf("expected the normal export summary nudge after benign moderate growth; gc log:\n%s", gcData)
 	}
 }
 
