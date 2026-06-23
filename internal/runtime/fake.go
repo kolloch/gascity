@@ -29,6 +29,8 @@ type Fake struct {
 	StopLeavesRunning       map[string]bool              // per-session Stop returns nil without deleting the session
 	PendingInteractions     map[string]*PendingInteraction
 	Responses               map[string][]InteractionResponse
+	ParkedInputResults      map[string]bool  // session → ParkedInput result
+	ParkedInputErrors       map[string]error // session → ParkedInput error
 	SleepCapabilityValue    SessionSleepCapability
 	WaitForIdleErrors       map[string]error
 	WaitForIdleSequence     map[string][]error
@@ -88,6 +90,8 @@ func NewFake() *Fake {
 		StopLeavesRunning:       make(map[string]bool),
 		PendingInteractions:     make(map[string]*PendingInteraction),
 		Responses:               make(map[string][]InteractionResponse),
+		ParkedInputResults:      make(map[string]bool),
+		ParkedInputErrors:       make(map[string]error),
 		SleepCapabilityValue:    SessionSleepCapabilityFull,
 		WaitForIdleErrors:       make(map[string]error),
 		WaitForIdleSequence:     make(map[string][]error),
@@ -113,6 +117,8 @@ func NewFailFake() *Fake {
 		StopLeavesRunning:       make(map[string]bool),
 		PendingInteractions:     make(map[string]*PendingInteraction),
 		Responses:               make(map[string][]InteractionResponse),
+		ParkedInputResults:      make(map[string]bool),
+		ParkedInputErrors:       make(map[string]error),
 		SleepCapabilityValue:    SessionSleepCapabilityFull,
 		WaitForIdleErrors:       make(map[string]error),
 		WaitForIdleSequence:     make(map[string][]error),
@@ -567,6 +573,22 @@ func (f *Fake) CopyTo(name, src, relDst string) error {
 		return fmt.Errorf("session unavailable")
 	}
 	return nil
+}
+
+// ParkedInput records the call and returns the canned parked-input result for
+// name (see [Fake.ParkedInputResults] / [Fake.ParkedInputErrors]). Returns an
+// error if the fake is broken. Satisfies [ParkedInputProvider].
+func (f *Fake) ParkedInput(name string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.Calls = append(f.Calls, Call{Method: "ParkedInput", Name: name})
+	if f.broken {
+		return false, fmt.Errorf("session unavailable")
+	}
+	if err, ok := f.ParkedInputErrors[name]; ok {
+		return false, err
+	}
+	return f.ParkedInputResults[name], nil
 }
 
 // SendKeys records the call and returns nil (or error if broken).

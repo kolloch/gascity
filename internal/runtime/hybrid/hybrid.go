@@ -23,6 +23,7 @@ var (
 	_ runtime.InteractionProvider           = (*Provider)(nil)
 	_ runtime.InterruptBoundaryWaitProvider = (*Provider)(nil)
 	_ runtime.InterruptedTurnResetProvider  = (*Provider)(nil)
+	_ runtime.ParkedInputProvider           = (*Provider)(nil)
 )
 
 // New creates a hybrid provider. isRemote returns true for sessions
@@ -140,6 +141,15 @@ func (p *Provider) Respond(name string, response runtime.InteractionResponse) er
 		return ip.Respond(name, response)
 	}
 	return runtime.ErrInteractionUnsupported
+}
+
+// ParkedInput delegates to the routed backend when it supports parked-input
+// detection.
+func (p *Provider) ParkedInput(name string) (bool, error) {
+	if pip, ok := p.route(name).(runtime.ParkedInputProvider); ok {
+		return pip.ParkedInput(name)
+	}
+	return false, runtime.ErrInteractionUnsupported
 }
 
 // SetMeta delegates to the routed backend.

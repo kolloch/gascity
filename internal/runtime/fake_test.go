@@ -10,6 +10,9 @@ import (
 // Compile-time check: Fake implements Provider.
 var _ Provider = (*Fake)(nil)
 
+// Compile-time check: Fake implements the optional ParkedInputProvider.
+var _ ParkedInputProvider = (*Fake)(nil)
+
 func TestFake_StartStop(t *testing.T) {
 	f := NewFake()
 

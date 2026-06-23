@@ -2579,6 +2579,7 @@ gc session
 | [gc session submit](#gc-session-submit) | Submit a message with semantic delivery intent |
 | [gc session suspend](#gc-session-suspend) | Suspend a session (save state, free resources) |
 | [gc session unpin](#gc-session-unpin) | Remove a session awake pin |
+| [gc session unstick](#gc-session-unstick) | Submit input left parked in a session's input box |
 | [gc session wait](#gc-session-wait) | Register a dependency wait for a session |
 | [gc session wake](#gc-session-wake) | Wake a session (request start and clear holds) |
 
@@ -2872,6 +2873,37 @@ gc session unpin <session-id-or-alias> [flags]
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--json` | bool |  | emit JSONL |
+
+## gc session unstick
+
+Detect and submit text left unsent in a session's input box.
+
+After a restart or resume, a session can come back alive but with text sitting
+unsubmitted in its input box — the agent looks frozen because it will not act
+until the input is submitted. unstick detects that state (an idle prompt holding
+non-whitespace text) and presses Enter to submit it.
+
+Pass a session ID (e.g. gc-42) or alias (e.g. mayor) to target one session, or
+--all to scan every running session. Use --dry-run to report parked sessions
+without submitting anything.
+
+```
+gc session unstick [session-id-or-alias] [flags]
+```
+
+**Example:**
+
+```
+gc session unstick mayor
+  gc session unstick --all
+  gc session unstick --all --dry-run
+```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--all` | bool |  | scan all running sessions instead of a single target |
+| `--dry-run` | bool |  | report parked sessions without submitting input |
+| `--json` | bool |  | emit JSONL result |
 
 ## gc session wait
 

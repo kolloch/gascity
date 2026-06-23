@@ -241,6 +241,20 @@ type DialogProvider interface {
 	DismissKnownDialogs(ctx context.Context, name string, timeout time.Duration) error
 }
 
+// ParkedInputProvider is an optional extension for runtimes that can detect
+// whether a session is idle while holding unsubmitted text in its input box
+// ("parked"). After a restart or resume, a session can come back alive but with
+// text left in its input box from before — the agent looks frozen because it
+// will not act until the input is submitted. A parked session is unstuck by
+// submitting the buffered input, which callers perform via [Provider.SendKeys]
+// with "Enter".
+type ParkedInputProvider interface {
+	// ParkedInput reports whether the named session appears idle while
+	// holding unsubmitted input. Best-effort and provider-specific; returns
+	// an error only when the session's pane state cannot be read.
+	ParkedInput(name string) (bool, error)
+}
+
 // TransportCapabilityProvider is an optional extension for providers that can
 // report whether they support starting sessions with a specific transport.
 //
