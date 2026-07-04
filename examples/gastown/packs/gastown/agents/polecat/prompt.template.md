@@ -17,8 +17,16 @@ gc bd list --assignee="$GC_SESSION_NAME" --status=in_progress
 gc bd ready --assignee="${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}polecat" --json
 ```
 
-If a bead is returned, claim it with `gc bd update <id> --claim` and follow
-the formula steps. If both come up empty, **never wait at the prompt** —
+If a bead is returned, claim it with `gc bd update <id> --claim`. **The claim
+is a compare-and-swap you can lose.** If another live session already owns the
+bead, `--claim` exits non-zero (`already claimed by …`) and the bead is **not
+yours** — do not work it. Working a bead whose claim failed is the
+duplicate-dispatch bug: two polecats grind one bead and one draft is thrown
+away. A failed claim is not a recovery signal; treat it exactly like an empty
+hook — re-run the work query for other claimable work, and if none is
+claimable, drain (below). Only a claim that **succeeds** (the bead is now
+`in_progress` under `$GC_SESSION_NAME`) authorizes you to follow the formula
+steps. If both come up empty, **never wait at the prompt** —
 file an informational FYI to the witness and drain. The mail is an audit
 notice (this session has already drained by the time the witness reads
 it), not a recovery request:
@@ -141,9 +149,13 @@ Your formula: `mol-polecat-work`
 # Step 1: Check for assigned work
 gc bd list --assignee="$GC_SESSION_NAME" --status=in_progress
 {{ .WorkQuery }}                                             # Find pool work
-gc bd update <id> --claim                                       # Atomic grab
+gc bd update <id> --claim                                       # Atomic grab (CAS)
+# ^ FAILED ("already claimed by …")? The bead is NOT yours — another live
+#   polecat won the race. Do NOT work it. Re-run the work query for other
+#   claimable work; if none, drain (empty-hook path above). Working a bead you
+#   did not win is the duplicate-dispatch bug.
 
-# Step 2: Work found? -> Follow formula steps. Nothing? -> Check mail
+# Step 2: Claim succeeded? -> Follow formula steps. Nothing claimable? -> Check mail
 gc mail inbox
 
 # Step 3: Execute — read formula steps and work through them in order
