@@ -77,6 +77,17 @@ const (
 	WorkerOperation                 = "worker.operation"
 	ProjectIdentityStamped          = "project.identity.stamped"
 	SupervisorFSPressureSkippedTick = "supervisor.fs_pressure.skipped_tick"
+	// PoolAssignmentReopened fires when the controller reopens an orphaned
+	// pool-routed work bead — clearing a stale assignee (dead session) or
+	// recovering an unassigned in-progress bead back to open so the pool can
+	// re-claim it. This is the reopen churn that precedes a duplicate-dispatch
+	// race (the ga-x9lr scenario: a stale-claim takeover re-pools a bead while
+	// a replacement session is spawned): the loser's `bd update --claim` is a
+	// compare-and-swap, so exactly one polecat wins, but without this signal
+	// the churn was only reconstructable from stderr after the fact. Emitted by
+	// the controller reconcile tick as a mechanism-only observation; the actor
+	// is the controller, not any user-configured role.
+	PoolAssignmentReopened = "pool.assignment_reopened"
 
 	// External messaging events.
 	ExtMsgBound          = "extmsg.bound"
@@ -115,6 +126,7 @@ var KnownEventTypes = []string{
 	CityCreated, CityUnregisterRequested,
 	OrderFired, OrderCompleted, OrderFailed,
 	ProviderSwapped, WorkerOperation, ProjectIdentityStamped, SupervisorFSPressureSkippedTick,
+	PoolAssignmentReopened,
 	ExtMsgBound, ExtMsgUnbound, ExtMsgGroupCreated,
 	ExtMsgAdapterAdded, ExtMsgAdapterRemoved,
 	ExtMsgInbound, ExtMsgOutbound,

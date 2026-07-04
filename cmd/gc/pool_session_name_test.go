@@ -1,10 +1,15 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
+	"strings"
 	"testing"
 
+	"github.com/gastownhall/gascity/internal/api"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/events"
 )
 
 func TestSessionBeadAssigneeIdentities(t *testing.T) {
@@ -1424,5 +1429,136 @@ func TestReleaseOrphanedPoolAssignments_PreservesNamedIdentityForSameStore(t *te
 	}
 	if got.Assignee != "reviewer" {
 		t.Fatalf("assignee = %q, want reviewer", got.Assignee)
+	}
+}
+
+// TestReleaseOrphanedPoolAssignments_CapturesPrevAssigneeAndRoute locks in that
+// the reopen record carries the stale claimant (PrevAssignee) and the pool
+// route so the pool.assignment_reopened event can report who lost the bead.
+func TestReleaseOrphanedPoolAssignments_CapturesPrevAssigneeAndRoute(t *testing.T) {
+	store := beads.NewMemStore()
+	work, err := store.Create(beads.Bead{
+		Title:    "stale-claimed pool work",
+		Assignee: "worker-dead",
+		Metadata: map[string]string{"gc.routed_to": "worker"},
+	})
+	if err != nil {
+		t.Fatalf("Create work bead: %v", err)
+	}
+	if err := store.Update(work.ID, beads.UpdateOpts{Status: stringPtr("in_progress")}); err != nil {
+		t.Fatalf("Set work status: %v", err)
+	}
+	work, err = store.Get(work.ID)
+	if err != nil {
+		t.Fatalf("Reload work bead: %v", err)
+	}
+
+	released := releaseOrphanedPoolAssignments(
+		store,
+		&config.City{Agents: []config.Agent{{Name: "worker", MinActiveSessions: intPtr(0), MaxActiveSessions: intPtr(2)}}},
+		"",
+		nil,
+		[]beads.Bead{work},
+		nil,
+		nil,
+		nil,
+	)
+	if len(released) != 1 {
+		t.Fatalf("released = %v, want 1 entry", released)
+	}
+	if released[0].ID != work.ID {
+		t.Fatalf("released[0].ID = %q, want %q", released[0].ID, work.ID)
+	}
+	if released[0].PrevAssignee != "worker-dead" {
+		t.Fatalf("released[0].PrevAssignee = %q, want %q", released[0].PrevAssignee, "worker-dead")
+	}
+	if released[0].Route != "worker" {
+		t.Fatalf("released[0].Route = %q, want %q", released[0].Route, "worker")
+	}
+}
+
+// TestPoolAssignmentReopenedEvent asserts the pure event builder produces a
+// typed pool.assignment_reopened envelope + payload with the right fields.
+func TestPoolAssignmentReopenedEvent(t *testing.T) {
+	ev := poolAssignmentReopenedEvent(releasedPoolAssignment{
+		ID:           "ga-42",
+		PrevAssignee: "gastown__polecat-pe-dead",
+		Route:        "gascity/gastown.polecat",
+	})
+	if ev.Type != events.PoolAssignmentReopened {
+		t.Fatalf("Type = %q, want %q", ev.Type, events.PoolAssignmentReopened)
+	}
+	if ev.Actor != "gc" {
+		t.Fatalf("Actor = %q, want gc (mechanism-only signal, no role name)", ev.Actor)
+	}
+	if ev.Subject != "ga-42" {
+		t.Fatalf("Subject = %q, want ga-42", ev.Subject)
+	}
+	var got api.PoolAssignmentReopenedPayload
+	if err := json.Unmarshal(ev.Payload, &got); err != nil {
+		t.Fatalf("Unmarshal payload: %v", err)
+	}
+	want := api.PoolAssignmentReopenedPayload{
+		BeadID:       "ga-42",
+		PrevAssignee: "gastown__polecat-pe-dead",
+		Template:     "gascity/gastown.polecat",
+		Reason:       poolAssignmentReopenedReason,
+	}
+	if got != want {
+		t.Fatalf("payload = %+v, want %+v", got, want)
+	}
+}
+
+// TestPoolAssignmentReopenedEvent_EmptyPrevAssignee covers the unassigned
+// in-progress recovery sub-case: prev_assignee is omitted from the wire form.
+func TestPoolAssignmentReopenedEvent_EmptyPrevAssignee(t *testing.T) {
+	ev := poolAssignmentReopenedEvent(releasedPoolAssignment{ID: "ga-7", Route: "worker"})
+	if !strings.Contains(string(ev.Payload), `"bead_id":"ga-7"`) {
+		t.Fatalf("payload %s missing bead_id", ev.Payload)
+	}
+	if strings.Contains(string(ev.Payload), "prev_assignee") {
+		t.Fatalf("payload %s should omit empty prev_assignee", ev.Payload)
+	}
+}
+
+// TestRecordReleasedPoolAssignments_EmitsPerBeadAndLogs asserts the shared sink
+// logs each reopen to stderr and emits exactly one typed event per bead.
+func TestRecordReleasedPoolAssignments_EmitsPerBeadAndLogs(t *testing.T) {
+	fake := events.NewFake()
+	var stderr bytes.Buffer
+	released := []releasedPoolAssignment{
+		{ID: "ga-1", PrevAssignee: "sess-a", Route: "worker"},
+		{ID: "ga-2", PrevAssignee: "", Route: "worker"},
+	}
+
+	recordReleasedPoolAssignments(fake, &stderr, released)
+
+	var got []events.Event
+	for _, e := range fake.Events {
+		if e.Type == events.PoolAssignmentReopened {
+			got = append(got, e)
+		}
+	}
+	if len(got) != 2 {
+		t.Fatalf("emitted %d pool.assignment_reopened events, want 2", len(got))
+	}
+	if got[0].Subject != "ga-1" || got[1].Subject != "ga-2" {
+		t.Fatalf("subjects = %q,%q, want ga-1,ga-2", got[0].Subject, got[1].Subject)
+	}
+	for _, id := range []string{"ga-1", "ga-2"} {
+		if !strings.Contains(stderr.String(), "released orphaned pool work: "+id) {
+			t.Fatalf("stderr %q missing log line for %s", stderr.String(), id)
+		}
+	}
+}
+
+// TestRecordReleasedPoolAssignments_NilRecorderStillLogs guards the callers
+// that may lack an event bus (e.g. a one-shot start with events.Discard): a
+// nil recorder must skip emission without panicking and still log to stderr.
+func TestRecordReleasedPoolAssignments_NilRecorderStillLogs(t *testing.T) {
+	var stderr bytes.Buffer
+	recordReleasedPoolAssignments(nil, &stderr, []releasedPoolAssignment{{ID: "ga-9", Route: "worker"}})
+	if !strings.Contains(stderr.String(), "released orphaned pool work: ga-9") {
+		t.Fatalf("stderr %q missing log line", stderr.String())
 	}
 }

@@ -399,6 +399,37 @@ func SessionDrainAckedWithAssignedWorkPayloadJSON(sessionID, beadID, template, b
 	return b
 }
 
+// PoolAssignmentReopenedPayload is the typed payload for
+// events.PoolAssignmentReopened. It carries which pool-routed bead the
+// controller reopened and who previously held it, so the reopen churn that
+// precedes a duplicate-dispatch race is queryable (via `gc events` / the SSE
+// stream) instead of only reconstructable from controller stderr after the
+// fact. PrevAssignee distinguishes the two reopen sub-cases: a non-empty value
+// is a stale-claim release (the dead session that had claimed the bead), while
+// an empty value is recovery of an unassigned in-progress bead.
+type PoolAssignmentReopenedPayload struct {
+	BeadID       string `json:"bead_id" doc:"ID of the pool-routed work bead reopened back to the pool."`
+	PrevAssignee string `json:"prev_assignee,omitempty" doc:"Assignee the bead carried before reopen — the stale (dead-session) claimant. Empty when recovering an unassigned in-progress bead."`
+	Template     string `json:"template,omitempty" doc:"Pool route (gc.routed_to) the bead re-enters for re-claiming."`
+	Reason       string `json:"reason,omitempty" doc:"Short diagnostic context. Today the single emission site passes 'orphaned_pool_assignment'."`
+}
+
+// IsEventPayload marks PoolAssignmentReopenedPayload as an events.Payload variant.
+func (PoolAssignmentReopenedPayload) IsEventPayload() {}
+
+// PoolAssignmentReopenedPayloadJSON builds the JSON wire form for attachment to
+// an events.Event.Payload field. PrevAssignee, Template, and Reason are emitted
+// only when non-empty.
+func PoolAssignmentReopenedPayloadJSON(beadID, prevAssignee, template, reason string) json.RawMessage {
+	b, _ := json.Marshal(PoolAssignmentReopenedPayload{
+		BeadID:       beadID,
+		PrevAssignee: prevAssignee,
+		Template:     template,
+		Reason:       reason,
+	})
+	return b
+}
+
 func init() {
 	// mail.* — all seven types share one payload shape.
 	events.RegisterPayload(events.MailSent, MailEventPayload{})
@@ -431,6 +462,7 @@ func init() {
 	events.RegisterPayload(events.SessionSuspended, events.NoPayload{})
 	events.RegisterPayload(events.SessionUpdated, events.NoPayload{})
 	events.RegisterPayload(events.SessionDrainAckedWithAssignedWork, SessionDrainAckedWithAssignedWorkPayload{})
+	events.RegisterPayload(events.PoolAssignmentReopened, PoolAssignmentReopenedPayload{})
 	events.RegisterPayload(events.ConvoyCreated, events.NoPayload{})
 	events.RegisterPayload(events.ConvoyClosed, events.NoPayload{})
 	events.RegisterPayload(events.ControllerStarted, events.NoPayload{})

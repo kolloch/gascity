@@ -1864,6 +1864,21 @@ type PendingInteraction struct {
 	RequestId string             `json:"request_id"`
 }
 
+// PoolAssignmentReopenedPayload defines model for PoolAssignmentReopenedPayload.
+type PoolAssignmentReopenedPayload struct {
+	// BeadId ID of the pool-routed work bead reopened back to the pool.
+	BeadId string `json:"bead_id"`
+
+	// PrevAssignee Assignee the bead carried before reopen — the stale (dead-session) claimant. Empty when recovering an unassigned in-progress bead.
+	PrevAssignee *string `json:"prev_assignee,omitempty"`
+
+	// Reason Short diagnostic context. Today the single emission site passes 'orphaned_pool_assignment'.
+	Reason *string `json:"reason,omitempty"`
+
+	// Template Pool route (gc.routed_to) the bead re-enters for re-claiming.
+	Template *string `json:"template,omitempty"`
+}
+
 // PoolOverride defines model for PoolOverride.
 type PoolOverride struct {
 	Check        *string `json:"Check"`
@@ -3151,6 +3166,18 @@ type TypedEventStreamEnvelopeOrderFired struct {
 	Workflow *WorkflowEventProjection `json:"workflow,omitempty"`
 }
 
+// TypedEventStreamEnvelopePoolAssignmentReopened defines model for TypedEventStreamEnvelopePoolAssignmentReopened.
+type TypedEventStreamEnvelopePoolAssignmentReopened struct {
+	Actor    string                        `json:"actor"`
+	Message  *string                       `json:"message,omitempty"`
+	Payload  PoolAssignmentReopenedPayload `json:"payload"`
+	Seq      int64                         `json:"seq"`
+	Subject  *string                       `json:"subject,omitempty"`
+	Ts       time.Time                     `json:"ts"`
+	Type     string                        `json:"type"`
+	Workflow *WorkflowEventProjection      `json:"workflow,omitempty"`
+}
+
 // TypedEventStreamEnvelopeProjectIdentityStamped defines model for TypedEventStreamEnvelopeProjectIdentityStamped.
 type TypedEventStreamEnvelopeProjectIdentityStamped struct {
 	Actor    string                        `json:"actor"`
@@ -3796,6 +3823,19 @@ type TypedTaggedEventStreamEnvelopeOrderFired struct {
 	Ts       time.Time                `json:"ts"`
 	Type     string                   `json:"type"`
 	Workflow *WorkflowEventProjection `json:"workflow,omitempty"`
+}
+
+// TypedTaggedEventStreamEnvelopePoolAssignmentReopened defines model for TypedTaggedEventStreamEnvelopePoolAssignmentReopened.
+type TypedTaggedEventStreamEnvelopePoolAssignmentReopened struct {
+	Actor    string                        `json:"actor"`
+	City     string                        `json:"city"`
+	Message  *string                       `json:"message,omitempty"`
+	Payload  PoolAssignmentReopenedPayload `json:"payload"`
+	Seq      int64                         `json:"seq"`
+	Subject  *string                       `json:"subject,omitempty"`
+	Ts       time.Time                     `json:"ts"`
+	Type     string                        `json:"type"`
+	Workflow *WorkflowEventProjection      `json:"workflow,omitempty"`
 }
 
 // TypedTaggedEventStreamEnvelopeProjectIdentityStamped defines model for TypedTaggedEventStreamEnvelopeProjectIdentityStamped.
@@ -5571,6 +5611,32 @@ func (t *EventPayload) MergeOutboundEventPayload(v OutboundEventPayload) error {
 	return err
 }
 
+// AsPoolAssignmentReopenedPayload returns the union data inside the EventPayload as a PoolAssignmentReopenedPayload
+func (t EventPayload) AsPoolAssignmentReopenedPayload() (PoolAssignmentReopenedPayload, error) {
+	var body PoolAssignmentReopenedPayload
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromPoolAssignmentReopenedPayload overwrites any union data inside the EventPayload as the provided PoolAssignmentReopenedPayload
+func (t *EventPayload) FromPoolAssignmentReopenedPayload(v PoolAssignmentReopenedPayload) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergePoolAssignmentReopenedPayload performs a merge with any union data inside the EventPayload, using the provided PoolAssignmentReopenedPayload
+func (t *EventPayload) MergePoolAssignmentReopenedPayload(v PoolAssignmentReopenedPayload) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
 // AsProjectIdentityStampedPayload returns the union data inside the EventPayload as a ProjectIdentityStampedPayload
 func (t EventPayload) AsProjectIdentityStampedPayload() (ProjectIdentityStampedPayload, error) {
 	var body ProjectIdentityStampedPayload
@@ -6767,6 +6833,34 @@ func (t *TypedEventStreamEnvelope) MergeTypedEventStreamEnvelopeOrderFired(v Typ
 	return err
 }
 
+// AsTypedEventStreamEnvelopePoolAssignmentReopened returns the union data inside the TypedEventStreamEnvelope as a TypedEventStreamEnvelopePoolAssignmentReopened
+func (t TypedEventStreamEnvelope) AsTypedEventStreamEnvelopePoolAssignmentReopened() (TypedEventStreamEnvelopePoolAssignmentReopened, error) {
+	var body TypedEventStreamEnvelopePoolAssignmentReopened
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromTypedEventStreamEnvelopePoolAssignmentReopened overwrites any union data inside the TypedEventStreamEnvelope as the provided TypedEventStreamEnvelopePoolAssignmentReopened
+func (t *TypedEventStreamEnvelope) FromTypedEventStreamEnvelopePoolAssignmentReopened(v TypedEventStreamEnvelopePoolAssignmentReopened) error {
+	v.Type = "pool.assignment_reopened"
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeTypedEventStreamEnvelopePoolAssignmentReopened performs a merge with any union data inside the TypedEventStreamEnvelope, using the provided TypedEventStreamEnvelopePoolAssignmentReopened
+func (t *TypedEventStreamEnvelope) MergeTypedEventStreamEnvelopePoolAssignmentReopened(v TypedEventStreamEnvelopePoolAssignmentReopened) error {
+	v.Type = "pool.assignment_reopened"
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
 // AsTypedEventStreamEnvelopeProjectIdentityStamped returns the union data inside the TypedEventStreamEnvelope as a TypedEventStreamEnvelopeProjectIdentityStamped
 func (t TypedEventStreamEnvelope) AsTypedEventStreamEnvelopeProjectIdentityStamped() (TypedEventStreamEnvelopeProjectIdentityStamped, error) {
 	var body TypedEventStreamEnvelopeProjectIdentityStamped
@@ -7457,6 +7551,8 @@ func (t TypedEventStreamEnvelope) ValueByDiscriminator() (interface{}, error) {
 		return t.AsTypedEventStreamEnvelopeOrderFailed()
 	case "order.fired":
 		return t.AsTypedEventStreamEnvelopeOrderFired()
+	case "pool.assignment_reopened":
+		return t.AsTypedEventStreamEnvelopePoolAssignmentReopened()
 	case "project.identity.stamped":
 		return t.AsTypedEventStreamEnvelopeProjectIdentityStamped()
 	case "provider.swapped":
@@ -8326,6 +8422,34 @@ func (t *TypedTaggedEventStreamEnvelope) MergeTypedTaggedEventStreamEnvelopeOrde
 	return err
 }
 
+// AsTypedTaggedEventStreamEnvelopePoolAssignmentReopened returns the union data inside the TypedTaggedEventStreamEnvelope as a TypedTaggedEventStreamEnvelopePoolAssignmentReopened
+func (t TypedTaggedEventStreamEnvelope) AsTypedTaggedEventStreamEnvelopePoolAssignmentReopened() (TypedTaggedEventStreamEnvelopePoolAssignmentReopened, error) {
+	var body TypedTaggedEventStreamEnvelopePoolAssignmentReopened
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromTypedTaggedEventStreamEnvelopePoolAssignmentReopened overwrites any union data inside the TypedTaggedEventStreamEnvelope as the provided TypedTaggedEventStreamEnvelopePoolAssignmentReopened
+func (t *TypedTaggedEventStreamEnvelope) FromTypedTaggedEventStreamEnvelopePoolAssignmentReopened(v TypedTaggedEventStreamEnvelopePoolAssignmentReopened) error {
+	v.Type = "pool.assignment_reopened"
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeTypedTaggedEventStreamEnvelopePoolAssignmentReopened performs a merge with any union data inside the TypedTaggedEventStreamEnvelope, using the provided TypedTaggedEventStreamEnvelopePoolAssignmentReopened
+func (t *TypedTaggedEventStreamEnvelope) MergeTypedTaggedEventStreamEnvelopePoolAssignmentReopened(v TypedTaggedEventStreamEnvelopePoolAssignmentReopened) error {
+	v.Type = "pool.assignment_reopened"
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
 // AsTypedTaggedEventStreamEnvelopeProjectIdentityStamped returns the union data inside the TypedTaggedEventStreamEnvelope as a TypedTaggedEventStreamEnvelopeProjectIdentityStamped
 func (t TypedTaggedEventStreamEnvelope) AsTypedTaggedEventStreamEnvelopeProjectIdentityStamped() (TypedTaggedEventStreamEnvelopeProjectIdentityStamped, error) {
 	var body TypedTaggedEventStreamEnvelopeProjectIdentityStamped
@@ -9016,6 +9140,8 @@ func (t TypedTaggedEventStreamEnvelope) ValueByDiscriminator() (interface{}, err
 		return t.AsTypedTaggedEventStreamEnvelopeOrderFailed()
 	case "order.fired":
 		return t.AsTypedTaggedEventStreamEnvelopeOrderFired()
+	case "pool.assignment_reopened":
+		return t.AsTypedTaggedEventStreamEnvelopePoolAssignmentReopened()
 	case "project.identity.stamped":
 		return t.AsTypedTaggedEventStreamEnvelopeProjectIdentityStamped()
 	case "provider.swapped":

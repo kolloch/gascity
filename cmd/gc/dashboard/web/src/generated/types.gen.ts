@@ -748,7 +748,7 @@ export type EventEmitRequest = {
     type: string;
 };
 
-export type EventPayload = AdapterEventPayload | BeadEventPayload | BoundEventPayload | CityCreateSucceededPayload | CityLifecyclePayload | CityUnregisterSucceededPayload | GroupCreatedEventPayload | InboundEventPayload | MailEventPayload | NoPayload | OutboundEventPayload | ProjectIdentityStampedPayload | RequestFailedPayload | RotatedPayload | SessionCreateSucceededPayload | SessionDrainAckedWithAssignedWorkPayload | SessionLifecyclePayload | SessionMessageSucceededPayload | SessionSubmitSucceededPayload | SupervisorFsPressureSkippedTickPayload | UnboundEventPayload | WorkerOperationEventPayload;
+export type EventPayload = AdapterEventPayload | BeadEventPayload | BoundEventPayload | CityCreateSucceededPayload | CityLifecyclePayload | CityUnregisterSucceededPayload | GroupCreatedEventPayload | InboundEventPayload | MailEventPayload | NoPayload | OutboundEventPayload | PoolAssignmentReopenedPayload | ProjectIdentityStampedPayload | RequestFailedPayload | RotatedPayload | SessionCreateSucceededPayload | SessionDrainAckedWithAssignedWorkPayload | SessionLifecyclePayload | SessionMessageSucceededPayload | SessionSubmitSucceededPayload | SupervisorFsPressureSkippedTickPayload | UnboundEventPayload | WorkerOperationEventPayload;
 
 export type EventRotateAnchor = {
     /**
@@ -1864,6 +1864,25 @@ export type PendingInteraction = {
     options?: Array<string> | null;
     prompt?: string;
     request_id: string;
+};
+
+export type PoolAssignmentReopenedPayload = {
+    /**
+     * ID of the pool-routed work bead reopened back to the pool.
+     */
+    bead_id: string;
+    /**
+     * Assignee the bead carried before reopen — the stale (dead-session) claimant. Empty when recovering an unassigned in-progress bead.
+     */
+    prev_assignee?: string;
+    /**
+     * Short diagnostic context. Today the single emission site passes 'orphaned_pool_assignment'.
+     */
+    reason?: string;
+    /**
+     * Pool route (gc.routed_to) the bead re-enters for re-claiming.
+     */
+    template?: string;
 };
 
 export type PoolOverride = {
@@ -3046,6 +3065,8 @@ export type TypedEventStreamEnvelope = ({
 } & TypedEventStreamEnvelopeOrderFailed) | ({
     type: 'order.fired';
 } & TypedEventStreamEnvelopeOrderFired) | ({
+    type: 'pool.assignment_reopened';
+} & TypedEventStreamEnvelopePoolAssignmentReopened) | ({
     type: 'project.identity.stamped';
 } & TypedEventStreamEnvelopeProjectIdentityStamped) | ({
     type: 'provider.swapped';
@@ -3512,6 +3533,20 @@ export type TypedEventStreamEnvelopeOrderFired = {
 };
 
 /**
+ * TypedEventStreamEnvelope pool.assignment_reopened
+ */
+export type TypedEventStreamEnvelopePoolAssignmentReopened = {
+    actor: string;
+    message?: string;
+    payload: PoolAssignmentReopenedPayload;
+    seq: number;
+    subject?: string;
+    ts: string;
+    type: 'pool.assignment_reopened';
+    workflow?: WorkflowEventProjection;
+};
+
+/**
  * TypedEventStreamEnvelope project.identity.stamped
  */
 export type TypedEventStreamEnvelopeProjectIdentityStamped = {
@@ -3869,6 +3904,8 @@ export type TypedTaggedEventStreamEnvelope = ({
 } & TypedTaggedEventStreamEnvelopeOrderFailed) | ({
     type: 'order.fired';
 } & TypedTaggedEventStreamEnvelopeOrderFired) | ({
+    type: 'pool.assignment_reopened';
+} & TypedTaggedEventStreamEnvelopePoolAssignmentReopened) | ({
     type: 'project.identity.stamped';
 } & TypedTaggedEventStreamEnvelopeProjectIdentityStamped) | ({
     type: 'provider.swapped';
@@ -4361,6 +4398,21 @@ export type TypedTaggedEventStreamEnvelopeOrderFired = {
     subject?: string;
     ts: string;
     type: 'order.fired';
+    workflow?: WorkflowEventProjection;
+};
+
+/**
+ * TypedTaggedEventStreamEnvelope pool.assignment_reopened
+ */
+export type TypedTaggedEventStreamEnvelopePoolAssignmentReopened = {
+    actor: string;
+    city: string;
+    message?: string;
+    payload: PoolAssignmentReopenedPayload;
+    seq: number;
+    subject?: string;
+    ts: string;
+    type: 'pool.assignment_reopened';
     workflow?: WorkflowEventProjection;
 };
 

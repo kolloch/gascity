@@ -864,9 +864,7 @@ func doStartStandalone(args []string, controllerMode bool, stdout, stderr io.Wri
 
 	open := sessionBeads.Open()
 	if released := releaseOrphanedPoolAssignmentsWhenSnapshotsComplete(oneShotStore, cfg, cityPath, open, dsResult, rigStores); len(released) > 0 {
-		for _, r := range released {
-			fmt.Fprintf(stderr, "released orphaned pool work: %s\n", r.ID) //nolint:errcheck
-		}
+		recordReleasedPoolAssignments(recorder, stderr, released)
 		// Standalone start has no follow-up patrol tick, so after reopening
 		// orphaned pool work we must immediately rebuild demand and sync once
 		// more so replacement session beads can be materialized in this run.

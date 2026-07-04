@@ -1,14 +1,18 @@
 package main
 
 import (
+	"fmt"
+	"io"
 	"log"
 	"path"
 	"strings"
 	"time"
 
 	"github.com/gastownhall/gascity/internal/agent"
+	"github.com/gastownhall/gascity/internal/api"
 	"github.com/gastownhall/gascity/internal/beads"
 	"github.com/gastownhall/gascity/internal/config"
+	"github.com/gastownhall/gascity/internal/events"
 	"github.com/gastownhall/gascity/internal/session"
 	"github.com/gastownhall/gascity/internal/sling"
 )
@@ -45,6 +49,12 @@ func sessionBeadAssigneeIdentities(sb beads.Bead) []string {
 type releasedPoolAssignment struct {
 	ID    string
 	Index int
+	// PrevAssignee is the assignee the bead carried before reopen — the stale
+	// (dead-session) claimant, or empty when recovering an unassigned
+	// in-progress bead. Route is the bead's gc.routed_to pool template. Both
+	// feed the pool.assignment_reopened observability event.
+	PrevAssignee string
+	Route        string
 }
 
 // PoolSessionName derives the tmux session name for a pool worker session.
@@ -185,7 +195,7 @@ func releaseOrphanedPoolAssignments(
 		if !releaseOrphanedPoolAssignment(ownerStore, wb.ID) {
 			continue
 		}
-		released = append(released, releasedPoolAssignment{ID: wb.ID, Index: i})
+		released = append(released, releasedPoolAssignment{ID: wb.ID, Index: i, PrevAssignee: assignee, Route: template})
 	}
 	return released
 }
@@ -284,6 +294,38 @@ func releaseOrphanedPoolAssignment(store beads.Store, id string) bool {
 		Status:   stringPtr("open"),
 	}
 	return store.Update(id, opts) == nil
+}
+
+// poolAssignmentReopenedReason is the diagnostic tag carried by every
+// pool.assignment_reopened event emitted from the orphan-release path.
+const poolAssignmentReopenedReason = "orphaned_pool_assignment"
+
+// poolAssignmentReopenedEvent builds the typed observability event for a single
+// reopened pool assignment. Kept pure (no recorder, no I/O) so the event shape
+// is unit-testable independently of the reconcile tick that emits it.
+func poolAssignmentReopenedEvent(r releasedPoolAssignment) events.Event {
+	return events.Event{
+		Type:    events.PoolAssignmentReopened,
+		Actor:   "gc",
+		Subject: r.ID,
+		Message: "reopened orphaned pool work",
+		Payload: api.PoolAssignmentReopenedPayloadJSON(r.ID, r.PrevAssignee, r.Route, poolAssignmentReopenedReason),
+	}
+}
+
+// recordReleasedPoolAssignments logs each reopened pool assignment to stderr
+// (preserving the operator-facing line) and emits a typed
+// pool.assignment_reopened event per bead, so the reopen churn that precedes a
+// duplicate-dispatch race is observable via `gc events` / the SSE stream rather
+// than only reconstructable from stderr after the fact. A nil recorder skips
+// emission but still logs, so callers without an event bus stay functional.
+func recordReleasedPoolAssignments(rec events.Recorder, stderr io.Writer, released []releasedPoolAssignment) {
+	for _, r := range released {
+		fmt.Fprintf(stderr, "released orphaned pool work: %s\n", r.ID) //nolint:errcheck // best-effort stderr
+		if rec != nil {
+			rec.Record(poolAssignmentReopenedEvent(r))
+		}
+	}
 }
 
 func liveOpenSessionAssignmentExists(store beads.Store, assignee string) bool {

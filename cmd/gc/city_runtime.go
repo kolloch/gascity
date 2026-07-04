@@ -1786,9 +1786,7 @@ func (cr *CityRuntime) beadReconcileTick(ctx context.Context, result DesiredStat
 		"released_count": len(released),
 	})
 	if len(released) > 0 {
-		for _, r := range released {
-			fmt.Fprintf(cr.stderr, "released orphaned pool work: %s\n", r.ID) //nolint:errcheck
-		}
+		recordReleasedPoolAssignments(cr.rec, cr.stderr, released)
 		assignedWorkBeads, assignedWorkStoreRefs = filterReleasedAssignedWorkSnapshot(assignedWorkBeads, assignedWorkStoreRefs, released)
 	}
 	// poolDesired determines how many sessions should be AWAKE. Uses the
