@@ -179,6 +179,7 @@ func computePoolDesiredStates(
 		}
 	}
 	inFlightNewRequests := poolInFlightNewRequests(cfg, sessionBeads, resumeSessionBeadIDs)
+	awakeIdleRequests := awakeIdleLivePoolRequests(cfg, sessionBeads, resumeSessionBeadIDs)
 	wakableAsleepRequests := wakableAsleepPoolRequests(cfg, sessionBeads, resumeSessionBeadIDs)
 
 	// Merge scale_check demand. In bead-backed reconciliation, scale_check is
@@ -186,9 +187,22 @@ func computePoolDesiredStates(
 	// are calculated independently from assigned work and must not be deducted
 	// from that count. Pool-created sessions that have not claimed work yet
 	// represent already-spent new demand, so they occupy the first new-demand
-	// slots explicitly before anonymous creates are materialized. Wakable
-	// asleep ephemeral pool beads fill the next slots so the scaler reuses
-	// existing worktrees instead of spawning fresh ones (ga-htl).
+	// slots explicitly before anonymous creates are materialized. The fill
+	// order attributes one reuse slot per existing pre-claim/idle worker before
+	// any fresh spawn:
+	//
+	//  1. in-flight (creating/pending_create) — a worker mid-creation.
+	//  2. awake-idle (state active/awake, unclaimed) — the active-state
+	//     continuation of the same pre-claim worker; it will claim on its next
+	//     work_query poll, so a second fresh spawn for that bead is redundant
+	//     (ga-50hw). Chosen before asleep because it is already awake — waking
+	//     an asleep sibling for a bead an awake worker will claim is the exact
+	//     redundant spawn this tier removes.
+	//  3. wakable asleep — reuses an existing worktree instead of a fresh one
+	//     (ga-htl).
+	//
+	// Drained workers (done-sequence, about to exit) are excluded from tiers 2
+	// and 3, so an about-to-drain worker never masks real demand.
 	if len(scaleCheckCounts) > 0 {
 		for i := range cfg.Agents {
 			agent := &cfg.Agents[i]
@@ -203,20 +217,29 @@ func computePoolDesiredStates(
 			newCount := capNewDemandCount(limits, usage, agent, scaleCount)
 			inFlight := inFlightNewRequests[template]
 			inFlightCount := minInt(len(inFlight), newCount)
+			awakeIdle := awakeIdleRequests[template]
+			awakeIdleCount := minInt(len(awakeIdle), newCount-inFlightCount)
 			asleep := wakableAsleepRequests[template]
-			asleepCount := minInt(len(asleep), newCount-inFlightCount)
-			if scaleCount > 0 && trace != nil && (len(inFlight) > 0 || len(asleep) > 0) {
+			asleepCount := minInt(len(asleep), newCount-inFlightCount-awakeIdleCount)
+			if scaleCount > 0 && trace != nil && (len(inFlight) > 0 || len(awakeIdle) > 0 || len(asleep) > 0) {
 				trace.recordDecision(string(TraceSitePoolInFlightReuse), template, "", string(TraceReasonInFlightReuse), "accepted", traceRecordPayload{
 					"scale_check":   scaleCount,
 					"in_flight":     len(inFlight),
 					"reused":        inFlightCount,
+					"awake_idle":    len(awakeIdle),
+					"awake_reused":  awakeIdleCount,
 					"asleep":        len(asleep),
 					"woken":         asleepCount,
-					"anonymous_new": newCount - inFlightCount - asleepCount,
+					"anonymous_new": newCount - inFlightCount - awakeIdleCount - asleepCount,
 				}, nil, "")
 			}
 			for j := 0; j < inFlightCount; j++ {
 				req := inFlight[j]
+				allRequests = append(allRequests, req)
+				usage.accept(req, limits)
+			}
+			for j := 0; j < awakeIdleCount; j++ {
+				req := awakeIdle[j]
 				allRequests = append(allRequests, req)
 				usage.accept(req, limits)
 			}
@@ -225,7 +248,7 @@ func computePoolDesiredStates(
 				allRequests = append(allRequests, req)
 				usage.accept(req, limits)
 			}
-			for j := inFlightCount + asleepCount; j < newCount; j++ {
+			for j := inFlightCount + awakeIdleCount + asleepCount; j < newCount; j++ {
 				req := SessionRequest{
 					Template: template,
 					Tier:     "new",
@@ -288,6 +311,95 @@ func poolSessionConsumesNewDemand(session beads.Bead) bool {
 	// still represent already-spent new demand; lifecycle code owns stale
 	// creating recovery with its clock-aware predicate.
 	return strings.TrimSpace(session.Metadata["state"]) == "creating"
+}
+
+// awakeIdleLivePoolRequests returns per-template SessionRequests for awake,
+// idle, live ephemeral pool beads — sessions that have started (state active
+// or awake) but have not yet claimed work. Such a session will claim a routed
+// pool bead on its next work_query poll, so counting it as already-spent new
+// demand prevents the scaler from spawning a redundant fresh session for a bead
+// an existing worker is about to claim (e.g. a reopened pool bead whose spawned
+// worker has advanced creating->active but has not yet claimed). This is the
+// active-state continuation of poolInFlightNewRequests, which covers the same
+// worker while it is still creating/pending_create; ordering the two tiers
+// adjacently attributes both pre-claim lifecycle stages of one worker to the
+// demand it already satisfies (ga-50hw).
+//
+// The state active/awake requirement is the under-provisioning guard: a worker
+// that has run `gc runtime drain-ack` lands in state=drained (or asleep+
+// sleep_reason=drained) and is about to EXIT, not about to claim — neither is
+// active/awake, so a drained worker never masks demand and the reopened bead
+// still spawns fresh. The one residual window is a worker that has reassigned
+// its bead to the refinery but not yet drain-acked: it is briefly active with
+// no assigned work and would absorb a demand slot. That is self-healing, not a
+// strand — it drains within the same done-sequence, and the next reconcile tick
+// re-evaluates without it and spawns fresh, matching the transient semantics of
+// the asleep tier. poolSessionConsumesNewDemand beads (pending_create_claim race) are
+// excluded to avoid double-counting the same worker in the in-flight tier;
+// resume-set, named, manual, and non-pool-managed beads are excluded for the
+// same reasons as the in-flight and asleep tiers. Beads are sorted oldest-first
+// by created_at to match those tiers for deterministic selection.
+func awakeIdleLivePoolRequests(cfg *config.City, sessionBeads []beads.Bead, resumeSessionBeadIDs map[string]struct{}) map[string][]SessionRequest {
+	requests := make(map[string][]SessionRequest)
+	sortedSessionBeads := append([]beads.Bead(nil), sessionBeads...)
+	sort.SliceStable(sortedSessionBeads, func(i, j int) bool {
+		if !sortedSessionBeads[i].CreatedAt.Equal(sortedSessionBeads[j].CreatedAt) {
+			return sortedSessionBeads[i].CreatedAt.Before(sortedSessionBeads[j].CreatedAt)
+		}
+		return sortedSessionBeads[i].ID < sortedSessionBeads[j].ID
+	})
+	for i := range cfg.Agents {
+		agent := &cfg.Agents[i]
+		if agent.Suspended || !agent.SupportsGenericEphemeralSessions() {
+			continue
+		}
+		// Canonical-singleton agents (max_active_sessions=1) never have the
+		// multi-worker redundant-spawn problem this offset addresses, and their
+		// reuse/dedup — including preferring the canonical identity over a stale
+		// "-N" duplicate — is owned by realizePoolDesiredSessions'
+		// findReusableCanonicalNonExpandingPoolSessionBead path. Emitting a
+		// specific SessionBeadID here could pin a stale duplicate ahead of the
+		// canonical, so leave singleton reuse to that path.
+		if agent.UsesCanonicalSingletonPoolIdentity() {
+			continue
+		}
+		template := agent.QualifiedName()
+		for _, sb := range sortedSessionBeads {
+			if sb.ID == "" || sb.Status == "closed" {
+				continue
+			}
+			if _, ok := resumeSessionBeadIDs[sb.ID]; ok {
+				continue
+			}
+			if !isEphemeralSessionBeadForAgent(sb, agent) || !isPoolManagedSessionBead(sb) {
+				continue
+			}
+			if isNamedSessionBead(sb) || isManualSessionBeadForAgent(sb, agent) {
+				continue
+			}
+			if normalizedSessionTemplate(sb, cfg) != template {
+				continue
+			}
+			// Only sessions that are awake and free to claim. Creating/pending
+			// beads belong to the in-flight tier; asleep beads to the wake
+			// tier; drained beads are about to exit. active/awake selects
+			// exactly the started-but-unclaimed workers and excludes all three.
+			if state := strings.TrimSpace(sb.Metadata["state"]); state != "active" && state != "awake" {
+				continue
+			}
+			if poolSessionConsumesNewDemand(sb) {
+				// Pending-create race (pending_create_claim still set) —
+				// already counted by the in-flight tier.
+				continue
+			}
+			requests[template] = append(requests[template], SessionRequest{
+				Template:      template,
+				Tier:          "new",
+				SessionBeadID: sb.ID,
+			})
+		}
+	}
+	return requests
 }
 
 // wakableAsleepPoolRequests returns per-template SessionRequests for asleep
