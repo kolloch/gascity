@@ -4312,7 +4312,7 @@ func runEffectiveScaleCheck(t *testing.T, a Agent, env map[string]string, bdScri
 	return string(out)
 }
 
-func runLifecycleHookCommand(t *testing.T, command string, env map[string]string, bdScript string) string {
+func runLifecycleHookCommand(t *testing.T, command string, bdScript string) string {
 	t.Helper()
 
 	tmp := t.TempDir()
@@ -4326,9 +4326,6 @@ func runLifecycleHookCommand(t *testing.T, command string, env map[string]string
 	cmd.Env = []string{
 		"PATH=" + tmp + ":" + os.Getenv("PATH"),
 		"BD_LOG=" + logPath,
-	}
-	for k, v := range env {
-		cmd.Env = append(cmd.Env, k+"="+v)
 	}
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("run lifecycle hook: %v\n%s", err, out)
@@ -4748,42 +4745,41 @@ func TestEffectiveOnDeathFixedAgent(t *testing.T) {
 	}
 }
 
-func TestEffectiveOnDeathBackfillsMissingRouteOnReopen(t *testing.T) {
-	a := Agent{
-		Name:              "dog-1",
-		Dir:               "hello-world",
-		MinActiveSessions: ptrInt(0), MaxActiveSessions: ptrInt(5),
-		PoolName: "hello-world/dog",
-	}
-
-	log := runLifecycleHookCommand(t, a.EffectiveOnDeath(), nil, `#!/bin/sh
+// bracketArgsUpdateBD is a fake `bd` whose `update` subcommand records each
+// argument wrapped in brackets, so an explicitly-cleared assignee ("") is
+// visible as `[--assignee] []` instead of collapsing into whitespace the way
+// `"$*"` would. The `list` output is substituted in for the @@LIST@@ token.
+const bracketArgsUpdateBD = `#!/bin/sh
 set -eu
 case "$1" in
   list)
-    printf '[{"id":"ga-missing","metadata":{}}]'
+    printf '%s' '@@LIST@@'
     ;;
   update)
-    printf '%s\n' "$*" >> "$BD_LOG"
+    shift
+    out=""
+    for arg in "$@"; do out="$out[$arg] "; done
+    printf '%s\n' "$out" >> "$BD_LOG"
     ;;
   *)
     exit 1
     ;;
 esac
-`)
-	if !strings.Contains(log, "--status open") {
-		t.Fatalf("hook log = %q, want reopened status", log)
-	}
-	if !strings.Contains(log, "--set-metadata gc.routed_to=hello-world/dog") {
-		t.Fatalf("hook log = %q, want fallback route for ownerless reopened work", log)
-	}
-	// ga-wv45: routeless work is re-parked on the agent's fallback route, not
-	// cleared to an empty assignee.
-	if !strings.Contains(log, "--assignee hello-world/dog") {
-		t.Fatalf("hook log = %q, want work re-parked on the fallback route", log)
-	}
+`
+
+// bracketArgsBD returns bracketArgsUpdateBD with the fake `bd list` JSON output
+// substituted for the @@LIST@@ token.
+func bracketArgsBD(listJSON string) string {
+	return strings.Replace(bracketArgsUpdateBD, "@@LIST@@", listJSON, 1)
 }
 
-func TestEffectiveOnDeathPreservesExistingRouteOnReopen(t *testing.T) {
+func TestEffectiveOnDeathBackfillsMissingRouteAndClearsAssigneeForPool(t *testing.T) {
+	// A pool instance (PoolName set) that finds routeless in-progress work on
+	// death backfills the pool route AND clears the assignee, so an ephemeral
+	// replacement re-claims it via Tier 3a (routed + --unassigned) and the
+	// --claim CAS. Re-parking on the pool name would strand the bead as
+	// discoverable-but-unclaimable and perpetually re-counted as scaler demand
+	// (ga-k6re).
 	a := Agent{
 		Name:              "dog-1",
 		Dir:               "hello-world",
@@ -4791,7 +4787,65 @@ func TestEffectiveOnDeathPreservesExistingRouteOnReopen(t *testing.T) {
 		PoolName: "hello-world/dog",
 	}
 
-	log := runLifecycleHookCommand(t, a.EffectiveOnDeath(), nil, `#!/bin/sh
+	bd := bracketArgsBD(`[{"id":"ga-missing","metadata":{}}]`)
+	log := runLifecycleHookCommand(t, a.EffectiveOnDeath(), bd)
+	if !strings.Contains(log, "[--status] [open]") {
+		t.Fatalf("hook log = %q, want reopened status", log)
+	}
+	if !strings.Contains(log, "[--set-metadata] [gc.routed_to=hello-world/dog]") {
+		t.Fatalf("hook log = %q, want fallback route backfilled for ownerless reopened work", log)
+	}
+	// ga-k6re: the assignee is cleared to empty (Tier-3a claimable), never
+	// re-parked on the pool name.
+	if !strings.Contains(log, "[--assignee] []") {
+		t.Fatalf("hook log = %q, want assignee cleared to empty for pool work", log)
+	}
+	if strings.Contains(log, "[--assignee] [hello-world/dog]") {
+		t.Fatalf("hook log = %q, must not re-park pool work on the unclaimable pool name", log)
+	}
+}
+
+func TestEffectiveOnDeathPoolClearsAssigneeForOwnRoute(t *testing.T) {
+	// Core ga-k6re fix: a pool instance whose in-progress work is routed to its
+	// own pool clears the assignee (open + unassigned) so an ephemeral
+	// replacement re-claims it via Tier 3a — instead of re-parking on the pool
+	// name, which is discoverable-but-unclaimable and perpetually re-counted as
+	// scaler demand.
+	a := Agent{
+		Name:              "dog-1",
+		Dir:               "hello-world",
+		MinActiveSessions: ptrInt(0), MaxActiveSessions: ptrInt(5),
+		PoolName: "hello-world/dog",
+	}
+
+	bd := bracketArgsBD(`[{"id":"ga-pool","metadata":{"gc.routed_to":"hello-world/dog"}}]`)
+	log := runLifecycleHookCommand(t, a.EffectiveOnDeath(), bd)
+	if !strings.Contains(log, "[--assignee] [] [--status] [open]") {
+		t.Fatalf("hook log = %q, want assignee cleared to empty + reopened for pool work on its own route", log)
+	}
+	// The pool route is already correct, so it is not rewritten.
+	if strings.Contains(log, "[--set-metadata]") {
+		t.Fatalf("hook log = %q, want existing pool route preserved without overwrite", log)
+	}
+	// Never re-park on the pool name (the ga-k6re wedge).
+	if strings.Contains(log, "[--assignee] [hello-world/dog]") {
+		t.Fatalf("hook log = %q, must not re-park pool work on the unclaimable pool name", log)
+	}
+}
+
+func TestEffectiveOnDeathPreservesExistingRouteOnReopen(t *testing.T) {
+	// ga-k6re/ga-wv45 guard: a pool instance whose work is routed to a FOREIGN
+	// route (not its own pool) re-parks on that route rather than clearing the
+	// assignee — clearing would strand a named-session route (Tier 3 only fires
+	// for ephemeral sessions). Only work on the pool's own route is cleared.
+	a := Agent{
+		Name:              "dog-1",
+		Dir:               "hello-world",
+		MinActiveSessions: ptrInt(0), MaxActiveSessions: ptrInt(5),
+		PoolName: "hello-world/dog",
+	}
+
+	log := runLifecycleHookCommand(t, a.EffectiveOnDeath(), `#!/bin/sh
 set -eu
 case "$1" in
   list)
@@ -4819,13 +4873,17 @@ esac
 }
 
 func TestEffectiveOnDeathReparksWorkOnRouteForNamedSessionReclaim(t *testing.T) {
-	// Regression for ga-wv45: when a worker dies, its in-progress work must be
-	// re-parked on its gc.routed_to route (assignee=route), not cleared to an
-	// empty assignee. A cleared assignee relies on the work_query's Tier 3
-	// routed queue (gc.routed_to + --unassigned), which only fires for
-	// ephemeral sessions — a named-session route would never re-discover the
-	// work. assignee=route lets a named session re-claim via Tier 2
-	// (ready+assignee) and a pool via the Tier-3b placeholder.
+	// Regression for ga-wv45: when a worker dies, its in-progress work routed to
+	// a named session must be re-parked on that gc.routed_to route
+	// (assignee=route), not cleared to an empty assignee. A cleared assignee
+	// relies on the work_query's Tier 3 routed queue (gc.routed_to +
+	// --unassigned), which only fires for ephemeral sessions — a named-session
+	// route would never re-discover the work. assignee=route lets a named
+	// session re-claim via Tier 2 (ready+assignee). This holds even for a pool
+	// instance (PoolName set) that happens to hold work routed elsewhere: the
+	// ga-k6re clear only applies to the pool's own route (see
+	// TestEffectiveOnDeathPoolClearsAssigneeForOwnRoute), foreign routes stay
+	// re-parked.
 	a := Agent{
 		Name:              "dog-1",
 		Dir:               "hello-world",
@@ -4833,7 +4891,7 @@ func TestEffectiveOnDeathReparksWorkOnRouteForNamedSessionReclaim(t *testing.T) 
 		PoolName: "hello-world/dog",
 	}
 
-	log := runLifecycleHookCommand(t, a.EffectiveOnDeath(), nil, `#!/bin/sh
+	log := runLifecycleHookCommand(t, a.EffectiveOnDeath(), `#!/bin/sh
 set -eu
 case "$1" in
   list)

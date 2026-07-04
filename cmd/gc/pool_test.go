@@ -979,6 +979,66 @@ func TestDeepCopyAgentSetsPoolName(t *testing.T) {
 	}
 }
 
+func TestPoolInstanceOnDeathHookClearsAssigneeSoWorkIsClaimable(t *testing.T) {
+	// End-to-end at the controller's pool-expansion boundary (ga-k6re): the
+	// death handler for a pool instance is built from deepCopyAgent (see
+	// computePoolDeathHandlers in cmd_start.go), which stamps PoolName. The
+	// resulting on_death hook must CLEAR the assignee of the instance's
+	// pool-routed work — leaving it open + unassigned, which the --claim CAS
+	// (assignee IN ('', NULL, actor)) and Tier-3a discovery
+	// (gc.routed_to=<pool> + --unassigned) require — never re-park it on the
+	// pool name, which is discoverable-but-unclaimable and perpetually
+	// re-counted as scaler demand.
+	src := &config.Agent{
+		Name:              "dog",
+		Dir:               "hello-world",
+		MinActiveSessions: intPtr(0), MaxActiveSessions: intPtr(3),
+	}
+	inst := deepCopyAgent(src, "dog-1", "hello-world")
+
+	tmp := t.TempDir()
+	logPath := filepath.Join(tmp, "bd.log")
+	// Fake `bd`: list returns one in-progress bead routed to the pool; update
+	// records each argument bracketed so an explicitly-cleared assignee is
+	// visible as `[--assignee] []` rather than collapsing into whitespace.
+	bdScript := `#!/bin/sh
+set -eu
+case "$1" in
+  list)
+    printf '%s' '[{"id":"ga-pool","metadata":{"gc.routed_to":"hello-world/dog"}}]'
+    ;;
+  update)
+    shift
+    out=""
+    for arg in "$@"; do out="$out[$arg] "; done
+    printf '%s\n' "$out" >> "$BD_LOG"
+    ;;
+  *)
+    exit 1
+    ;;
+esac
+`
+	if err := os.WriteFile(filepath.Join(tmp, "bd"), []byte(bdScript), 0o755); err != nil {
+		t.Fatalf("write fake bd: %v", err)
+	}
+	cmd := exec.Command("sh", "-c", inst.EffectiveOnDeath())
+	cmd.Env = []string{"PATH=" + tmp + ":" + os.Getenv("PATH"), "BD_LOG=" + logPath}
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("run on_death hook: %v\n%s", err, out)
+	}
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read bd.log: %v", err)
+	}
+	log := string(data)
+	if !strings.Contains(log, "[--assignee] [] [--status] [open]") {
+		t.Fatalf("on_death log = %q, want pool work cleared to empty + reopened (claimable)", log)
+	}
+	if strings.Contains(log, "[--assignee] [hello-world/dog]") {
+		t.Fatalf("on_death log = %q, must not re-park pool work on the unclaimable pool name", log)
+	}
+}
+
 func TestRunPoolOnBoot(t *testing.T) {
 	var ran []string
 	runner := func(cmd, _ string, _ map[string]string) (string, error) {

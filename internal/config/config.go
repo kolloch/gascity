@@ -2904,32 +2904,62 @@ func (a *Agent) ResolvedMaxActiveSessions(cfg *City) *int {
 
 // EffectiveOnDeath returns the on_death command for this agent.
 // If OnDeath is set, returns it. Otherwise returns the default recovery hook
-// that unclaims in-progress work assigned to this concrete agent identity.
+// that reopens in-progress work assigned to this concrete agent identity so a
+// replacement session can re-claim it. A pool agent (PoolName set) clears the
+// assignee for the pool's own route — an ephemeral replacement re-discovers and
+// claims it via Tier 3a (routed + --unassigned); a named/fixed agent re-parks
+// on the route so the same identity re-claims via Tier 2 (see ga-k6re, ga-wv45).
 func (a *Agent) EffectiveOnDeath() string {
 	if a.OnDeath != "" {
 		return a.OnDeath
 	}
-	route := a.QualifiedName()
-	if a.PoolName != "" {
-		route = a.PoolName
-	}
-	// Re-park work on its route instead of clearing the assignee. A cleared
-	// assignee relies on the work_query's Tier 3 routed queue (gc.routed_to +
-	// --unassigned), but Tier 3 only fires for ephemeral sessions: work routed
-	// to a named-session target would never be re-discovered (ga-wv45). Setting
-	// assignee=route lets the route's own canonical work-finding re-claim it —
-	// a pool via the Tier-3b placeholder (assignee=route), a named session via
-	// Tier 2 (ready+assignee). Reset status to open so the bead re-enters the
-	// ready queue. If the bead carries no route, backfill the agent's route and
-	// park on it. This hook runs for a live, configured agent that respawns and
-	// re-claims its own work, so re-parking on the agent's identity is safe
-	// (unlike the removed-session path in unclaimWorkAssignedToRetiredSessionBead,
-	// where the identity is gone — see ga-wv45).
-	return `bd list --assignee=` + a.QualifiedName() +
+	// Both branches stream this identity's in-progress work as
+	// (id, current gc.routed_to) pairs into a shell while-loop; they differ
+	// only in how each bead is re-parked.
+	listWork := `bd list --assignee=` + a.QualifiedName() +
 		` --status=in_progress --json 2>/dev/null | ` +
 		`jq -r '.[] | [.id, (.metadata["gc.routed_to"] // "")] | @tsv' 2>/dev/null | ` +
 		`while IFS="$(printf '\t')" read -r id current_route; do ` +
-		`[ -z "$id" ] && continue; ` +
+		`[ -z "$id" ] && continue; `
+
+	if a.PoolName != "" {
+		// Pool agent: the replacement is an ephemeral session that re-discovers
+		// and claims work via the work_query's Tier-3a routed queue
+		// (gc.routed_to=<pool> + --unassigned) and the --claim CAS, whose
+		// predicate is assignee IN ('', NULL, <actor-session-name>). Re-parking
+		// on the pool name would set assignee=<pool-name> — neither empty nor a
+		// session name — so every Tier-3b discoverer finds the bead but fails the
+		// claim, while the scaler keeps counting assignee=<pool-name> as demand
+		// and spawning workers that discover-but-cannot-claim it (ga-k6re). Clear
+		// the assignee for the pool's own route instead, mirroring the
+		// controller's releaseOrphanedPoolAssignment; backfill the route when the
+		// bead carries none. Work routed elsewhere (a named session, or another
+		// pool) is left re-parked on that foreign route so its own owner reclaims
+		// it via Tier 2 — never cleared, preserving ga-wv45.
+		pool := a.PoolName
+		return listWork +
+			`if [ -z "$current_route" ]; then ` +
+			`bd update "$id" --assignee "" --status open --set-metadata gc.routed_to=` + pool + ` 2>/dev/null; ` +
+			`elif [ "$current_route" = "` + pool + `" ]; then ` +
+			`bd update "$id" --assignee "" --status open 2>/dev/null; ` +
+			`else bd update "$id" --assignee "$current_route" --status open 2>/dev/null; ` +
+			`fi; ` +
+			`done`
+	}
+
+	// Named/fixed agent: the same identity respawns and re-claims its own work
+	// via Tier 2 (ready + assignee=route), so re-park on the route instead of
+	// clearing the assignee. A cleared assignee relies on the work_query's
+	// Tier 3 routed queue, which only fires for ephemeral sessions — a
+	// named-session route would never be re-discovered (ga-wv45). Reset status
+	// to open so the bead re-enters the ready queue. If the bead carries no
+	// route, backfill the agent's route and park on it. This hook runs for a
+	// live, configured agent that respawns and re-claims its own work, so
+	// re-parking on the agent's identity is safe (unlike the removed-session
+	// path in unclaimWorkAssignedToRetiredSessionBead, where the identity is
+	// gone — see ga-wv45).
+	route := a.QualifiedName()
+	return listWork +
 		`if [ -n "$current_route" ]; then ` +
 		`bd update "$id" --assignee "$current_route" --status open 2>/dev/null; ` +
 		`else bd update "$id" --assignee "` + route + `" --status open --set-metadata gc.routed_to=` + route + ` 2>/dev/null; ` +

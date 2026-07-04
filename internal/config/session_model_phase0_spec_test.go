@@ -127,6 +127,34 @@ func TestPhase0ConfigDefaults_OnDeathUnclaimsAssignedWorkByDefault(t *testing.T)
 	}
 }
 
+func TestPhase0ConfigDefaults_OnDeathClearsPoolAssigneeByDefault(t *testing.T) {
+	// A pool instance (PoolName set, as stamped by the controller's pool
+	// expansion) clears the assignee for its OWN route on death, so an
+	// ephemeral replacement re-claims via Tier 3a (routed + --unassigned) and
+	// the --claim CAS. Re-parking on the pool name yields a
+	// discoverable-but-unclaimable bead the scaler perpetually re-counts as
+	// demand (ga-k6re). Named-session (foreign) routes stay re-parked.
+	a := Agent{Name: "worker-1", Dir: "myrig", PoolName: "myrig/worker"}
+
+	got := a.EffectiveOnDeath()
+	for _, want := range []string{
+		"bd list --assignee=myrig/worker-1",
+		"--status=in_progress",
+		`elif [ "$current_route" = "myrig/worker" ]`,
+		`--assignee "" --status open`,
+		"--set-metadata gc.routed_to=myrig/worker",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("EffectiveOnDeath() = %q, want %q", got, want)
+		}
+	}
+	// Must never re-park pool work on the unclaimable pool name (the ga-k6re
+	// wedge).
+	if strings.Contains(got, `--assignee "myrig/worker" --status open`) {
+		t.Fatalf("EffectiveOnDeath() = %q, must not re-park pool work on the unclaimable pool name", got)
+	}
+}
+
 func TestPhase0NamedSessionConfig_DuplicateExplicitNamesRejectedAcrossTemplates(t *testing.T) {
 	cityPath := filepath.Join(t.TempDir(), "city.toml")
 	configText := `[workspace]
