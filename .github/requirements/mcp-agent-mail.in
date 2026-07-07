@@ -8,6 +8,12 @@ mcp-agent-mail @ https://github.com/Dicklesworthstone/mcp_agent_mail/archive/327
 # line once mcp-agent-mail upstream pins GitPython>=3.1.50 itself.
 gitpython>=3.1.50
 
+# Security floor: CVE-2026-49852 (HIGH, HS256/HS384/HS512 verify accepts an
+# empty/nil HMAC key — cross-language sibling of CVE-2026-45363) in joserfc
+# < 1.6.8. joserfc arrives transitively via authlib; pin the floor until
+# authlib's transitive constraint carries the patched version itself.
+joserfc>=1.6.8
+
 # Authlib and FastMCP security floors live in
 # .github/requirements/mcp-agent-mail.overrides.txt because mcp-agent-mail
 # v0.3.2 still caps Authlib below the fixed release.
