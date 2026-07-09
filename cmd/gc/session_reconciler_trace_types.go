@@ -191,6 +191,15 @@ const (
 	// current FingerprintVersion (older or future binary). No drain, no
 	// event.
 	TraceOutcomeRebaselinedVersionMismatch TraceOutcomeCode = "rebaselined_version_mismatch"
+
+	// TraceOutcomeSkippedLivenessError marks a destructive reconciler action
+	// (pending-create rollback, failed-create close, drain-ack finalize, or
+	// orphan close) skipped this tick because the runtime liveness probe
+	// returned an observation error. providerAlive=false then means
+	// "observation unavailable", not "confirmed dead", so the level-triggered
+	// loop fails closed and re-observes next tick rather than orphaning a
+	// possibly-live session (#3872-family).
+	TraceOutcomeSkippedLivenessError TraceOutcomeCode = "skipped_liveness_error"
 )
 
 type TraceCompletionStatus string
@@ -689,7 +698,8 @@ func normalizeTraceOutcomeCode(raw string) (TraceOutcomeCode, string) {
 		TraceOutcomeStop,
 		TraceOutcomeStartCandidate,
 		TraceOutcomeRetry,
-		TraceOutcomeCancel:
+		TraceOutcomeCancel,
+		TraceOutcomeSkippedLivenessError:
 		return TraceOutcomeCode(strings.TrimSpace(raw)), ""
 	default:
 		return TraceOutcomeUnknown, strings.TrimSpace(raw)

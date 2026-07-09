@@ -1819,6 +1819,157 @@ func TestReconcileSessionBeads_CloseGateLiveStoreErrorKeepsSlot(t *testing.T) {
 	}
 }
 
+// livenessProbeGetErrStore fails the SECOND Get of one session bead so the
+// reconciler's runtime liveness probe returns an observation error
+// (livenessErr != nil) for that session, without disturbing any other store
+// access. The probe reads the bead twice: once during handle resolution
+// (ResolveSessionBeadByExactID) and once during observation (the manager.Get
+// re-read inside SessionHandle.LiveObservation). Our fork's handle construction
+// falls through to a non-erroring RuntimeHandle when the FIRST (resolution) Get
+// fails, so a blanket Get failure would not surface a liveness error — failing
+// only the observation re-read models the real per-session store re-read blip
+// the S16 guard defends against. The top-level list query is passed separately
+// (storeQueryPartial=false), so this is orthogonal to the storeQueryPartial gate.
+type livenessProbeGetErrStore struct {
+	beads.Store
+	target string
+	err    error
+	gets   int
+}
+
+func (s *livenessProbeGetErrStore) Get(id string) (beads.Bead, error) {
+	if id == s.target {
+		s.gets++
+		if s.gets == 2 {
+			return beads.Bead{}, s.err
+		}
+	}
+	return s.Store.Get(id)
+}
+
+// TestReconcileOrphanCloseFailsClosedOnLivenessError proves the S16 fail-closed
+// gate fires end to end in the running reconciler. A healthy liveness
+// observation closes the undesired, dead orphan (baseline). But when the
+// liveness probe errors — providerAlive=false then means "observation
+// unavailable", not "confirmed dead" — the destructive orphan CLOSE is skipped
+// this tick and the bead is kept open for re-observation, rather than orphaning
+// a session that may still be alive on a transient blip (#3872-family). The
+// only variable between the two runs is the injected liveness error, so the
+// close→keep-open flip (plus the guard's stderr line) isolates the guard.
+func TestReconcileOrphanCloseFailsClosedOnLivenessError(t *testing.T) {
+	run := func(t *testing.T, injectLivenessErr bool) (status, stderr string) {
+		t.Helper()
+		env := newReconcilerTestEnv()
+		env.cfg = &config.City{}
+		// An asleep, undesired session with a dead runtime is the plain
+		// orphan-close case: createSessionBead defaults state=asleep and an empty
+		// desiredState makes it undesired.
+		session := env.createSessionBead("worker", "worker")
+
+		store := env.store
+		if injectLivenessErr {
+			store = &livenessProbeGetErrStore{
+				Store:  env.store,
+				target: session.ID,
+				err:    errors.New("tmux observation unavailable"),
+			}
+		}
+
+		reconcileSessionBeadsAtPath(
+			context.Background(), "", []beads.Bead{session}, env.desiredState,
+			nil, env.cfg, env.sp, store, nil, nil, nil, nil, env.dt, nil, false,
+			nil, "", nil, env.clk, env.rec, 0, 0, &env.stdout, &env.stderr,
+		)
+
+		got, err := env.store.Get(session.ID)
+		if err != nil {
+			t.Fatalf("Get(%s): %v", session.ID, err)
+		}
+		return got.Status, env.stderr.String()
+	}
+
+	t.Run("healthy observation closes the orphan", func(t *testing.T) {
+		status, _ := run(t, false)
+		if status != "closed" {
+			t.Fatalf("status = %q, want closed — a healthy dead-orphan observation must close the bead", status)
+		}
+	})
+
+	t.Run("liveness error keeps the orphan open", func(t *testing.T) {
+		status, stderr := run(t, true)
+		if status == "closed" {
+			t.Fatalf("status = %q, want open — a liveness observation error must fail closed (skip the destructive close) so a possibly-live session is not orphaned", status)
+		}
+		if !strings.Contains(stderr, "skipping close of 'worker': liveness observation failed") {
+			t.Fatalf("stderr = %q, want the orphan-close fail-closed guard line", stderr)
+		}
+	})
+}
+
+// TestReconcilePendingCreateRollbackFailsClosedOnLivenessError is the sibling
+// assertion for the pending-create rollback path (one of the three
+// !providerAlive destructive sites S16's F2 follow-up extended the guard to).
+// An undesired, never-started pending-create bead with an expired lease and a
+// dead runtime rolls back on a healthy observation, but a liveness observation
+// error must skip the destructive rollback this tick and keep the bead open.
+func TestReconcilePendingCreateRollbackFailsClosedOnLivenessError(t *testing.T) {
+	run := func(t *testing.T, injectLivenessErr bool) (status, state, stderr string) {
+		t.Helper()
+		env := newReconcilerTestEnv()
+		env.cfg = &config.City{}
+		session := env.createSessionBead("s-gc-late", "worker")
+		startedAt := env.clk.Now().Add(-(pendingCreateNeverStartedTimeout + time.Second))
+		env.setSessionMetadata(&session, map[string]string{
+			"state":                     "creating",
+			"pending_create_claim":      "true",
+			"pending_create_started_at": pendingCreateStartedAtNow(startedAt),
+			// last_woke_at deliberately empty — never-started lease, now expired.
+		})
+		session.CreatedAt = env.clk.Now().Add(-24 * time.Hour)
+
+		store := env.store
+		if injectLivenessErr {
+			store = &livenessProbeGetErrStore{
+				Store:  env.store,
+				target: session.ID,
+				err:    errors.New("tmux observation unavailable"),
+			}
+		}
+
+		reconcileSessionBeadsAtPath(
+			context.Background(), "", []beads.Bead{session}, env.desiredState,
+			nil, env.cfg, env.sp, store, nil, nil, nil, nil, env.dt, nil, false,
+			nil, "", nil, env.clk, env.rec, 0, 0, &env.stdout, &env.stderr,
+		)
+
+		got, err := env.store.Get(session.ID)
+		if err != nil {
+			t.Fatalf("Get(%s): %v", session.ID, err)
+		}
+		return got.Status, got.Metadata["state"], env.stderr.String()
+	}
+
+	t.Run("healthy observation rolls back the expired pending-create", func(t *testing.T) {
+		_, _, stderr := run(t, false)
+		if !strings.Contains(stderr, "rolling back pending create s-gc-late") {
+			t.Fatalf("stderr = %q, want the pending-create rollback to fire on a healthy observation", stderr)
+		}
+	})
+
+	t.Run("liveness error keeps the pending-create bead open", func(t *testing.T) {
+		status, state, stderr := run(t, true)
+		if status == "closed" {
+			t.Fatalf("status = %q, want open — a liveness observation error must skip the destructive pending-create rollback", status)
+		}
+		if state != "creating" {
+			t.Fatalf("state = %q, want creating — the pending-create bead must be left untouched for re-observation", state)
+		}
+		if !strings.Contains(stderr, "skipping pending-create rollback of 's-gc-late': liveness observation failed") {
+			t.Fatalf("stderr = %q, want the pending-create rollback fail-closed guard line", stderr)
+		}
+	})
+}
+
 // TestReconcileSessionBeads_CloseGateIgnoresUnreachableRigAssignedWork
 // verifies that the close gate's live ownership check only considers the
 // store scope the session's configured agent can query and claim from. A

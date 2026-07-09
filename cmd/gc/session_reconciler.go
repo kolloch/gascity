@@ -967,8 +967,17 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 		// Handle BEFORE heal/stability to avoid false crash detection —
 		// a running session that leaves the desired set is not a crash.
 		if !desired {
-			providerAlive, err := workerSessionTargetRunningWithConfig(cityPath, store, sp, cfg, session.ID)
-			if err != nil {
+			// Keep the liveness-probe error: providerAlive=false on a non-nil
+			// livenessErr means "observation unavailable" (handle construction
+			// or the per-session store re-read in manager.Get failed), NOT
+			// "confirmed dead". storeQueryPartial does not cover this — it
+			// derives from the top-level bead-LIST query, whereas livenessErr is
+			// the per-session probe. Each !providerAlive DESTRUCTIVE site below
+			// fails CLOSED on a non-nil livenessErr (skip this tick; the
+			// level-triggered loop re-observes next tick) rather than orphaning a
+			// possibly-live session on a transient tmux/store blip (#3872-family).
+			providerAlive, livenessErr := workerSessionTargetRunningWithConfig(cityPath, store, sp, cfg, session.ID)
+			if livenessErr != nil {
 				providerAlive = false
 			}
 			// Run this before configured named-session preservation. A stale
@@ -983,6 +992,21 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 					template := normalizedSessionTemplate(*session, cfg)
 					if template == "" {
 						template = session.Metadata["template"]
+					}
+					if livenessErr != nil {
+						// Fail CLOSED: providerAlive=false here is "observation
+						// unavailable", not "confirmed dead". Rolling back this
+						// pending-create bead when its session may still be alive on
+						// a transient tmux/store blip would orphan it
+						// (#3872-family). Skip the destructive rollback this tick;
+						// the level-triggered loop re-observes next tick.
+						fmt.Fprintf(stderr, "session reconciler: skipping pending-create rollback of '%s': liveness observation failed: %v\n", name, livenessErr) //nolint:errcheck
+						if trace != nil {
+							trace.recordDecision("reconciler.session.rollback_pending_create", template, name, "pending_create_lease_expired", string(TraceOutcomeSkippedLivenessError), traceRecordPayload{
+								"liveness_error": livenessErr.Error(),
+							}, nil, "")
+						}
+						continue
 					}
 					peek := cachedSessionPeek(cityPath, store, sp, cfg, session.ID, nil)
 					rateLimitHit, rateLimitErr := checkRateLimitStability(session, cfg, providerAlive, dt, store, clk, peek)
@@ -1042,6 +1066,21 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 					continue
 				}
 				if !providerAlive {
+					if livenessErr != nil {
+						// Fail CLOSED: providerAlive=false here is "observation
+						// unavailable", not "confirmed dead". Closing this
+						// failed-create bead when its session may still be alive on
+						// a transient tmux/store blip would orphan it
+						// (#3872-family). Skip the destructive close this tick; the
+						// level-triggered loop re-observes next tick.
+						fmt.Fprintf(stderr, "session reconciler: skipping failed-create close of '%s': liveness observation failed: %v\n", name, livenessErr) //nolint:errcheck
+						if trace != nil {
+							trace.recordDecision("reconciler.session.close_failed_create", template, name, string(sessionpkg.StateFailedCreate), string(TraceOutcomeSkippedLivenessError), traceRecordPayload{
+								"liveness_error": livenessErr.Error(),
+							}, nil, "")
+						}
+						continue
+					}
 					if trace != nil {
 						trace.recordDecision("reconciler.session.close_failed_create", template, name, string(sessionpkg.StateFailedCreate), "closed", nil, nil, "")
 					}
@@ -1151,6 +1190,22 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 						if template == "" {
 							template = session.Metadata["template"]
 						}
+						if livenessErr != nil {
+							// Fail CLOSED: providerAlive=false here is "observation
+							// unavailable", not "confirmed dead". Finalizing
+							// (closing) this drain-acked session when its runtime
+							// may still be alive on a transient tmux/store blip
+							// would orphan it (#3872-family). Skip the destructive
+							// finalize this tick; the level-triggered loop
+							// re-observes next tick.
+							fmt.Fprintf(stderr, "session reconciler: skipping drain-ack finalize of '%s': liveness observation failed: %v\n", name, livenessErr) //nolint:errcheck
+							if trace != nil {
+								trace.recordDecision("reconciler.session.drain_ack", template, name, "orphaned", string(TraceOutcomeSkippedLivenessError), traceRecordPayload{
+									"liveness_error": livenessErr.Error(),
+								}, nil, "")
+							}
+							continue
+						}
 						finalizeDrainAckStoppedSession(
 							cityPath, cfg, store, rigStores, session, template,
 							true, dops, dt, clk, rec, stderr,
@@ -1214,6 +1269,25 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 					template := normalizedSessionTemplate(*session, cfg)
 					if template == "" {
 						template = session.Metadata["template"]
+					}
+					if livenessErr != nil {
+						// Fail CLOSED: the runtime liveness probe errored, so
+						// providerAlive=false is "observation unavailable", not
+						// "confirmed dead". Closing here would orphan a bead whose
+						// session may still be alive on a transient tmux/store blip
+						// (#3872-family). Skip the destructive close this tick; the
+						// level-triggered loop re-observes next tick. (The plain
+						// Ctrl-C drain path above only runs when providerAlive, so
+						// it is unaffected. The other !providerAlive destructive
+						// paths — pending-create rollback, failed-create close, and
+						// drain-ack finalize — carry the same fail-closed guard.)
+						fmt.Fprintf(stderr, "session reconciler: skipping close of '%s': liveness observation failed: %v\n", name, livenessErr) //nolint:errcheck
+						if trace != nil {
+							trace.recordDecision("reconciler.session.close_orphan", template, name, reason, string(TraceOutcomeSkippedLivenessError), traceRecordPayload{
+								"liveness_error": livenessErr.Error(),
+							}, nil, "")
+						}
+						continue
 					}
 					if trace != nil {
 						trace.recordDecision("reconciler.session.close_orphan", template, name, reason, "closed", nil, nil, "")

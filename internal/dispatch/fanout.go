@@ -293,7 +293,10 @@ func routeFanoutFragmentSteps(fragment *formula.FragmentRecipe, control beads.Be
 		return
 	}
 	executionRoute := strings.TrimSpace(control.Metadata["gc.execution_routed_to"])
-	routeCfg := loadAttemptRouteConfig(opts.CityPath)
+	routeCfg, routeCfgErr := loadAttemptRouteConfigE(opts.CityPath)
+	if routeCfgErr != nil {
+		opts.tracef("attempt-route config load failed cityPath=%s err=%v — falling back to metadata-only routing", opts.CityPath, routeCfgErr)
+	}
 	for i := range fragment.Steps {
 		step := &fragment.Steps[i]
 		if step.Metadata["gc.kind"] == "spec" {

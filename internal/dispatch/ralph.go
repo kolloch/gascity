@@ -304,7 +304,10 @@ func appendRalphRetry(store beads.Store, logicalID string, prevSubject, prevChec
 		}
 		return existing, nil
 	}
-	cfg := loadAttemptRouteConfig(opts.CityPath)
+	cfg, cfgErr := loadAttemptRouteConfigE(opts.CityPath)
+	if cfgErr != nil {
+		opts.tracef("attempt-route config load failed cityPath=%s err=%v — falling back to metadata-only routing", opts.CityPath, cfgErr)
+	}
 	if molecule.IsGraphApplyEnabled() {
 		if applier, ok := store.(beads.GraphApplyStore); ok {
 			return appendRalphRetryViaGraphApply(store, applier, logicalID, prevSubject, prevCheck, attemptSet, oldAttempt, nextAttempt, oldScopeRef, newScopeRef, cfg, opts)
@@ -569,10 +572,6 @@ func buildRalphRetryGraphNode(old beads.Bead, logicalID, oldScopeRef, newScopeRe
 		ParentKey:         parentKey,
 		ParentID:          parentID,
 	}
-}
-
-func retryPreservedAssignee(bead beads.Bead, cityPath string) string {
-	return retryPreservedAssigneeWithConfig(bead, loadAttemptRouteConfig(cityPath))
 }
 
 func retryPreservedAssigneeWithConfig(bead beads.Bead, cfg *config.City) string {

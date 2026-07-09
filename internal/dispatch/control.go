@@ -62,7 +62,7 @@ func processRetryControl(store beads.Store, bead beads.Bead, opts ProcessOptions
 
 	attemptNum, _ := strconv.Atoi(attempt.Metadata["gc.attempt"])
 	result := classifyRetryAttempt(attempt)
-	attemptLog, err := appendAttemptLogValue(bead.Metadata["gc.attempt_log"], attemptNum, result.Outcome, result.Reason)
+	attemptLog, err := appendAttemptLogValue(bead.Metadata["gc.attempt_log"], attemptNum, result.Outcome, result.Reason, opts.tracef)
 	if err != nil {
 		return ControlResult{}, fmt.Errorf("%s: recording attempt log: %w", bead.ID, err)
 	}
@@ -203,7 +203,7 @@ func processRalphControl(store beads.Store, bead beads.Bead, opts ProcessOptions
 		return ControlResult{}, fmt.Errorf("%s: running check: %w", bead.ID, err)
 	}
 
-	attemptLog, err := appendAttemptLogValue(bead.Metadata["gc.attempt_log"], iterationNum, checkResult.Outcome, checkResult.Stderr)
+	attemptLog, err := appendAttemptLogValue(bead.Metadata["gc.attempt_log"], iterationNum, checkResult.Outcome, checkResult.Stderr, opts.tracef)
 	if err != nil {
 		return ControlResult{}, fmt.Errorf("%s: recording attempt log: %w", bead.ID, err)
 	}
@@ -303,18 +303,26 @@ func markControllerSpawnError(store beads.Store, beadID string, err error, opts 
 	if IsTransientControllerError(err) && !isPartialAttemptAttachError(err) {
 		metadata["gc.controller_error_class"] = "transient"
 		metadata["gc.controller_retryable"] = "true"
-		_ = store.SetMetadataBatch(beadID, metadata)
+		if writeErr := store.SetMetadataBatch(beadID, metadata); writeErr != nil {
+			opts.tracef("controller-spawn-error bead=%s recording transient failure metadata failed err=%v", beadID, writeErr)
+		}
 		return true
 	}
 
 	metadata["gc.controller_error_class"] = "hard"
 	metadata["gc.controller_retryable"] = ""
 	metadata["gc.final_disposition"] = "controller_error"
-	_ = store.SetMetadataBatch(beadID, metadata)
-	_ = setOutcomeAndClose(store, beadID, "fail")
+	if writeErr := store.SetMetadataBatch(beadID, metadata); writeErr != nil {
+		opts.tracef("controller-spawn-error bead=%s recording hard failure metadata failed err=%v", beadID, writeErr)
+	}
+	if closeErr := setOutcomeAndClose(store, beadID, "fail"); closeErr != nil {
+		opts.tracef("controller-spawn-error bead=%s closing failed bead failed err=%v", beadID, closeErr)
+	}
 	// Reconcile any enclosing scope so a controller_error terminal closure
 	// does not leave the scope body stalled.
-	_, _ = reconcileClosedScopeMemberWithOptions(store, beadID, opts)
+	if _, scopeErr := reconcileClosedScopeMemberWithOptions(store, beadID, opts); scopeErr != nil {
+		opts.tracef("controller-spawn-error bead=%s reconciling enclosing scope failed err=%v", beadID, scopeErr)
+	}
 	return false
 }
 
@@ -418,7 +426,10 @@ func spawnNextAttempt(ctx context.Context, store beads.Store, control beads.Bead
 	// execution lane restored manually. Prefer each step's explicit target when
 	// available, and only inherit the parent execution lane as a fallback.
 	executionRoute := strings.TrimSpace(control.Metadata["gc.execution_routed_to"])
-	routeCfg := loadAttemptRouteConfig(opts.CityPath)
+	routeCfg, routeCfgErr := loadAttemptRouteConfigE(opts.CityPath)
+	if routeCfgErr != nil {
+		opts.tracef("attempt-route config load failed cityPath=%s err=%v — falling back to metadata-only routing", opts.CityPath, routeCfgErr)
+	}
 	for i := range recipe.Steps {
 		if recipe.Steps[i].Metadata["gc.kind"] == "spec" {
 			continue
@@ -826,15 +837,20 @@ func attemptRecipeStepNeedsScopeCheck(step formula.RecipeStep) bool {
 	}
 }
 
-func loadAttemptRouteConfig(cityPath string) *config.City {
+// loadAttemptRouteConfigE loads the city.toml used for attempt-time routing.
+// An empty cityPath yields (nil, nil) — routing legitimately runs
+// metadata-only when no city config is present. A genuine parse failure is
+// returned rather than swallowed so callers can surface it (trace) instead of
+// silently falling back to metadata-only routing (a mis-route).
+func loadAttemptRouteConfigE(cityPath string) (*config.City, error) {
 	if strings.TrimSpace(cityPath) == "" {
-		return nil
+		return nil, nil
 	}
 	cfg, _, err := config.LoadWithIncludes(fsys.OSFS{}, filepath.Join(cityPath, "city.toml"))
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("loading attempt-route config from %s: %w", cityPath, err)
 	}
-	return cfg
+	return cfg, nil
 }
 
 func applyAttemptStepRoute(step *formula.RecipeStep, target string, cfg *config.City, store beads.Store) {
@@ -1019,10 +1035,6 @@ func isAttemptMultiSessionTarget(target string, cfg *config.City) bool {
 	}
 	agentCfg := config.FindAgent(cfg, target)
 	return agentCfg != nil && agentCfg.SupportsInstanceExpansion()
-}
-
-func beadUsesMetadataPoolRoute(bead beads.Bead, cityPath string) bool {
-	return beadUsesMetadataPoolRouteWithConfig(bead, loadAttemptRouteConfig(cityPath))
 }
 
 func beadUsesMetadataPoolRouteWithConfig(bead beads.Bead, cfg *config.City) bool {
@@ -1339,17 +1351,24 @@ func appendAttemptLog(store beads.Store, controlID string, attempt int, outcome,
 	if err != nil {
 		return err
 	}
-	logJSON, err := appendAttemptLogValue(control.Metadata["gc.attempt_log"], attempt, outcome, reason)
+	logJSON, err := appendAttemptLogValue(control.Metadata["gc.attempt_log"], attempt, outcome, reason, nil)
 	if err != nil {
 		return err
 	}
 	return store.SetMetadata(controlID, "gc.attempt_log", logJSON)
 }
 
-func appendAttemptLogValue(existing string, attempt int, outcome, reason string) (string, error) {
+func appendAttemptLogValue(existing string, attempt int, outcome, reason string, tracef func(string, ...any)) (string, error) {
 	var log []map[string]string
 	if existing != "" {
-		_ = json.Unmarshal([]byte(existing), &log)
+		if err := json.Unmarshal([]byte(existing), &log); err != nil {
+			// A corrupt audit history cannot be recovered, so we start fresh —
+			// but surface the reset instead of silently discarding the log.
+			if tracef != nil {
+				tracef("attempt-log corrupt, resetting history existing=%q err=%v", existing, err)
+			}
+			log = nil
+		}
 	}
 
 	entry := map[string]string{
@@ -1409,5 +1428,5 @@ func updateMetadataAndClose(store beads.Store, beadID string, metadata map[strin
 }
 
 // Note: listByWorkflowRoot, setOutcomeAndClose, propagateRetrySubjectMetadata,
-// classifyRetryAttempt, retryPreservedAssignee, and runRalphCheck are defined
-// in runtime.go, retry.go, and ralph.go respectively.
+// classifyRetryAttempt, retryPreservedAssigneeWithConfig, and runRalphCheck are
+// defined in runtime.go, retry.go, and ralph.go respectively.

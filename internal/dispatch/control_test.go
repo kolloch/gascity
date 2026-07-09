@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -2703,6 +2705,104 @@ func TestFindSpecBeadPrefersRefOverStepID(t *testing.T) {
 	if got.ID != wantSpec.ID {
 		t.Fatalf("findSpecBead returned %s (%s), want %s (%s)",
 			got.ID, got.Title, wantSpec.ID, wantSpec.Title)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// S16 swallowed-error surfacing tests
+// ---------------------------------------------------------------------------
+
+// TestAppendAttemptLogValueCorruptHistoryResetsAndTraces proves a corrupt
+// attempt-log audit history is reset to a fresh entry AND the reset is
+// surfaced via tracef, rather than silently discarded by a swallowed
+// json.Unmarshal error.
+func TestAppendAttemptLogValueCorruptHistoryResetsAndTraces(t *testing.T) {
+	t.Parallel()
+	var traced []string
+	tracef := func(format string, args ...any) {
+		traced = append(traced, fmt.Sprintf(format, args...))
+	}
+
+	out, err := appendAttemptLogValue("not-valid-json{", 3, "pass", "done", tracef)
+	if err != nil {
+		t.Fatalf("appendAttemptLogValue: %v", err)
+	}
+	if len(traced) != 1 || !strings.Contains(traced[0], "attempt-log corrupt, resetting history") {
+		t.Fatalf("traced = %v, want exactly one 'attempt-log corrupt' trace line", traced)
+	}
+
+	var log []map[string]string
+	if err := json.Unmarshal([]byte(out), &log); err != nil {
+		t.Fatalf("unmarshal reset log: %v", err)
+	}
+	if len(log) != 1 || log[0]["attempt"] != "3" || log[0]["outcome"] != "pass" {
+		t.Fatalf("reset log = %v, want a single fresh entry attempt:3 outcome:pass", log)
+	}
+}
+
+// TestAppendAttemptLogValueValidHistoryDoesNotTrace confirms the corruption
+// trace only fires on a genuine parse failure — a valid history appends
+// cleanly and silently.
+func TestAppendAttemptLogValueValidHistoryDoesNotTrace(t *testing.T) {
+	t.Parallel()
+	traced := false
+	tracef := func(string, ...any) { traced = true }
+
+	existing := `[{"attempt":"1","outcome":"transient","action":"retry"}]`
+	out, err := appendAttemptLogValue(existing, 2, "pass", "", tracef)
+	if err != nil {
+		t.Fatalf("appendAttemptLogValue: %v", err)
+	}
+	if traced {
+		t.Fatalf("tracef fired for a valid history — want no reset trace")
+	}
+
+	var log []map[string]string
+	if err := json.Unmarshal([]byte(out), &log); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if len(log) != 2 {
+		t.Fatalf("log entries = %d, want 2 (existing + appended)", len(log))
+	}
+}
+
+// TestAppendAttemptLogValueNilTracefTolerated confirms the corrupt-history
+// branch is nil-safe: the store-writing appendAttemptLog wrapper passes a nil
+// tracef, so a corrupt history must reset without panicking.
+func TestAppendAttemptLogValueNilTracefTolerated(t *testing.T) {
+	t.Parallel()
+	out, err := appendAttemptLogValue("not-valid-json{", 1, "hard", "auth_error", nil)
+	if err != nil {
+		t.Fatalf("appendAttemptLogValue with nil tracef: %v", err)
+	}
+	var log []map[string]string
+	if err := json.Unmarshal([]byte(out), &log); err != nil {
+		t.Fatalf("unmarshal reset log: %v", err)
+	}
+	if len(log) != 1 {
+		t.Fatalf("reset log entries = %d, want 1", len(log))
+	}
+}
+
+// TestLoadAttemptRouteConfigE proves the route-config load distinguishes
+// "legitimate metadata-only routing" (empty cityPath → nil,nil) from a genuine
+// city.toml parse failure (returned as an error, not swallowed to nil — which
+// would silently degrade routing to metadata-only, a mis-route).
+func TestLoadAttemptRouteConfigE(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := loadAttemptRouteConfigE("")
+	if cfg != nil || err != nil {
+		t.Fatalf("loadAttemptRouteConfigE(\"\") = (%v, %v), want (nil, nil) for metadata-only routing", cfg, err)
+	}
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "city.toml"), []byte("this is = not [valid toml"), 0o644); err != nil {
+		t.Fatalf("write malformed city.toml: %v", err)
+	}
+	cfg, err = loadAttemptRouteConfigE(dir)
+	if err == nil {
+		t.Fatalf("loadAttemptRouteConfigE(malformed) err = nil, want a surfaced parse error (cfg=%v)", cfg)
 	}
 }
 
