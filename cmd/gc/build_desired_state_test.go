@@ -142,10 +142,12 @@ func (s *demandListCountingStore) List(query beads.ListQuery) ([]beads.Bead, err
 type demandRefreshFailStore struct {
 	beads.Store
 	failNextGet         bool
+	getCalls            int
 	liveInProgressLists int
 }
 
 func (s *demandRefreshFailStore) Get(id string) (beads.Bead, error) {
+	s.getCalls++
 	if s.failNextGet {
 		s.failNextGet = false
 		return beads.Bead{}, errors.New("transient get failure")
@@ -299,7 +301,7 @@ func TestCollectAssignedWorkBeadsUsesCachedInProgressReadModel(t *testing.T) {
 	}
 }
 
-func TestCollectAssignedWorkBeadsFallsBackLiveWhenCachedInProgressDirty(t *testing.T) {
+func TestCollectAssignedWorkBeadsRefreshesDirtyInProgressViaOverlay(t *testing.T) {
 	backing := &demandRefreshFailStore{Store: beads.NewMemStore()}
 	work, err := backing.Create(beads.Bead{
 		Title: "handoff becomes active",
@@ -313,6 +315,9 @@ func TestCollectAssignedWorkBeadsFallsBackLiveWhenCachedInProgressDirty(t *testi
 		t.Fatalf("PrimeActive: %v", err)
 	}
 
+	// The active bead flips to in_progress in the backing, but the post-update
+	// refresh Get fails, so the cache holds a stale (open, unassigned) copy
+	// marked dirty.
 	status := "in_progress"
 	assignee := "repo/refinery"
 	backing.failNextGet = true
@@ -320,15 +325,23 @@ func TestCollectAssignedWorkBeadsFallsBackLiveWhenCachedInProgressDirty(t *testi
 		t.Fatalf("Update(active): %v", err)
 	}
 
+	getsBefore := backing.getCalls
 	got, partial := collectAssignedWorkBeads(&config.City{}, cache)
 	if partial {
-		t.Fatal("collectAssignedWorkBeads reported partial with successful live fallback")
+		t.Fatal("collectAssignedWorkBeads reported partial with a successful dirty-overlay refresh")
 	}
 	if len(got) != 1 || got[0].ID != work.ID || got[0].Status != "in_progress" || got[0].Assignee != "repo/refinery" {
-		t.Fatalf("collectAssignedWorkBeads returned %#v, want live in-progress %s", got, work.ID)
+		t.Fatalf("collectAssignedWorkBeads returned %#v, want fresh in-progress %s", got, work.ID)
 	}
-	if backing.liveInProgressLists != 1 {
-		t.Fatalf("live in_progress list calls = %d, want dirty cache fallback", backing.liveInProgressLists)
+	// The bounded per-bead dirty overlay refreshes the single dirty row via
+	// backing.Get and serves it from cache — it no longer declines the whole
+	// cache to a live in_progress List full scan (the #2987 amplifier this
+	// change removes).
+	if backing.getCalls != getsBefore+1 {
+		t.Fatalf("backing.Get calls during collect = %d, want 1 (per-bead overlay refresh)", backing.getCalls-getsBefore)
+	}
+	if backing.liveInProgressLists != 0 {
+		t.Fatalf("live in_progress list calls = %d, want 0 (overlay serves from cache, no full-scan fallback)", backing.liveInProgressLists)
 	}
 }
 
