@@ -115,13 +115,16 @@ func preflight(opts SlingOpts, deps SlingDeps, querier BeadQuerier) (SlingResult
 		result.BeadWarnings = append(result.BeadWarnings, check.Warnings...)
 	}
 
-	// Reassign: clear any existing human assignee before routing so the
-	// target pool/agent can claim the bead. Without this, beads claimed
-	// by `bd update --claim` stay invisible to the pool's claim filter
-	// even after sling sets gc.routed_to. See gastownhall/gascity#1007.
+	// Reassign: make the bead claimable by the target pool/agent before
+	// routing — clear any existing assignee and reopen it if a prior actor
+	// left it in_progress. Without this, a bead claimed by `bd update --claim`
+	// (status=in_progress, assignee=<actor>) stays invisible to the pool's
+	// claim filter even after sling sets gc.routed_to: clearing the assignee
+	// alone is not enough because the Ready filter requires status=open. See
+	// gastownhall/gascity#1007 (assignee) and #3231 (status).
 	if opts.Reassign && !opts.DryRun {
-		if err := clearHumanAssignee(opts.BeadOrFormula, deps); err != nil {
-			return result, fmt.Errorf("clearing assignee for %s: %w", opts.BeadOrFormula, err)
+		if err := reopenForReassign(opts.BeadOrFormula, deps); err != nil {
+			return result, fmt.Errorf("reopening %s for reassign: %w", opts.BeadOrFormula, err)
 		}
 	}
 
@@ -1217,23 +1220,40 @@ func selectedStoreContainer(opts SlingOpts, deps SlingDeps) (beads.Bead, bool) {
 	return b, b.Type == "epic" || beads.IsContainerType(b.Type)
 }
 
-// clearHumanAssignee unsets the bead's assignee if non-empty. No-op when
-// the bead is missing, the assignee is already empty, or the store is
-// unavailable. Errors only on a real store-Update failure with a
-// non-empty assignee. See SlingOpts.Reassign and #1007.
-func clearHumanAssignee(beadID string, deps SlingDeps) error {
+// reopenForReassign makes a bead claimable by a target pool/agent before
+// routing: it clears any existing assignee and, when a prior actor left the
+// bead in_progress, resets its status to open in the same store update. The
+// status reset is what makes the handed-off bead a Ready candidate again —
+// the Ready filter requires status=open, so clearing the assignee alone
+// leaves the bead routed-but-unclaimable (gastownhall/gascity#3231). The
+// reset is gated on in_progress only; blocked and closed statuses are left
+// intact. Actor-agnostic: no role names.
+//
+// No-op when the bead is missing, the store is unavailable, or the bead is
+// already open and unassigned (no spurious store write). Errors only on a
+// real store-Update failure. See SlingOpts.Reassign, #1007 (assignee), and
+// #3231 (status).
+func reopenForReassign(beadID string, deps SlingDeps) error {
 	if deps.Store == nil {
 		return nil
 	}
 	b, err := deps.Store.Get(beadID)
 	if err != nil {
 		// Bead may not exist locally yet (e.g. with --force routing
-		// against an absent bead). Nothing to clear.
+		// against an absent bead). Nothing to change.
 		return nil
 	}
-	if strings.TrimSpace(b.Assignee) == "" {
+	var update beads.UpdateOpts
+	if strings.TrimSpace(b.Assignee) != "" {
+		empty := ""
+		update.Assignee = &empty
+	}
+	if b.Status == "in_progress" {
+		open := "open"
+		update.Status = &open
+	}
+	if update.Assignee == nil && update.Status == nil {
 		return nil
 	}
-	empty := ""
-	return deps.Store.Update(beadID, beads.UpdateOpts{Assignee: &empty})
+	return deps.Store.Update(beadID, update)
 }
