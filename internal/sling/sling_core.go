@@ -1229,20 +1229,63 @@ func selectedStoreContainer(opts SlingOpts, deps SlingDeps) (beads.Bead, bool) {
 // reset is gated on in_progress only; blocked and closed statuses are left
 // intact. Actor-agnostic: no role names.
 //
-// No-op when the bead is missing, the store is unavailable, or the bead is
-// already open and unassigned (no spurious store write). Errors only on a
-// real store-Update failure. See SlingOpts.Reassign, #1007 (assignee), and
-// #3231 (status).
+// It checks the city primary store (deps.Store) first; if the bead is not
+// there it sweeps the source-workflow stores (deps.SourceWorkflowStores) so
+// rig-prefixed beads — whose record lives in a rig store, not deps.Store — are
+// still reopened. Mirrors the multi-store pattern in sourceWorkflowRootByID,
+// which likewise consults the workflow stores when deps.Store lacks the bead
+// (gastownhall/gascity#3408).
+//
+// No-op when the bead is absent from every store, no store is available, or the
+// bead is already open and unassigned (no spurious store write). Errors on a
+// real primary-store read failure, a store-Update failure, or a
+// SourceWorkflowStores listing/read failure — a real read failure must not be
+// swallowed as a not-found miss. See SlingOpts.Reassign, #1007 (assignee),
+// #3231 (status), and #3408 (multi-store).
 func reopenForReassign(beadID string, deps SlingDeps) error {
-	if deps.Store == nil {
+	if deps.Store != nil {
+		b, err := deps.Store.Get(beadID)
+		if err == nil {
+			return reopenForReassignInStore(deps.Store, beadID, b)
+		}
+		if !errors.Is(err, beads.ErrNotFound) {
+			return fmt.Errorf("reading %s from primary store to reopen for reassign: %w", beadID, err)
+		}
+		// ErrNotFound: the record is not in the city primary store. For
+		// rig-prefixed beads it lives in a rig store, so fall through to the
+		// source-workflow sweep below.
+	}
+	if deps.SourceWorkflowStores == nil {
 		return nil
 	}
-	b, err := deps.Store.Get(beadID)
+	stores, err := deps.SourceWorkflowStores()
 	if err != nil {
-		// Bead may not exist locally yet (e.g. with --force routing
-		// against an absent bead). Nothing to change.
-		return nil
+		return fmt.Errorf("listing source-workflow stores to reopen %s for reassign: %w", beadID, err)
 	}
+	for _, info := range stores {
+		if info.Store == nil {
+			continue
+		}
+		b, err := info.Store.Get(beadID)
+		if err != nil {
+			if errors.Is(err, beads.ErrNotFound) {
+				continue
+			}
+			return fmt.Errorf("reading %s from store %q to reopen for reassign: %w", beadID, strings.TrimSpace(info.StoreRef), err)
+		}
+		return reopenForReassignInStore(info.Store, beadID, b)
+	}
+	return nil
+}
+
+// reopenForReassignInStore clears b's assignee and resets an in_progress
+// status back to open in a single update, returning nil without writing when
+// the bead is already open and unassigned so no spurious store write occurs.
+// The status reset is what makes a bead that an order or human previously
+// claimed (status=in_progress) claimable again — the Ready filter requires
+// status=open, so clearing the assignee alone leaves it routed-but-unclaimable
+// (gastownhall/gascity#3231).
+func reopenForReassignInStore(store beads.Store, beadID string, b beads.Bead) error {
 	var update beads.UpdateOpts
 	if strings.TrimSpace(b.Assignee) != "" {
 		empty := ""
@@ -1255,5 +1298,5 @@ func reopenForReassign(beadID string, deps SlingDeps) error {
 	if update.Assignee == nil && update.Status == nil {
 		return nil
 	}
-	return deps.Store.Update(beadID, update)
+	return store.Update(beadID, update)
 }
