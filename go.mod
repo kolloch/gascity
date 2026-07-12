@@ -2,6 +2,8 @@ module github.com/gastownhall/gascity
 
 go 1.25.10
 
+toolchain go1.26.5
+
 require (
 	github.com/BurntSushi/toml v1.6.0
 	github.com/danielgtaylor/huma/v2 v2.37.3
