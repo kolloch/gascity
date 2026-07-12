@@ -82,6 +82,7 @@ func clearDrainTrackerForStopPending(session *beads.Bead, dt *drainTracker) {
 		return
 	}
 	dt.clearIdleProbe(session.ID)
+	dt.clearLivenessUnknown(session.ID)
 	dt.remove(session.ID)
 }
 
@@ -748,6 +749,54 @@ func reconcileSessionBeadsTraced(
 	)
 }
 
+// skipLivenessUnknown records a destructive reconcile action (pending-create
+// rollback, failed-create close, drain-ack finalize, or orphan close) skipped
+// this tick because the runtime liveness probe errored — providerAlive=false
+// then means "observation unavailable", not "confirmed dead", so the loop fails
+// closed (#3872-family). It replaces the previously-inlined per-site block at
+// all four sites and adds two behaviors the raw block lacked:
+//
+//   - Throttling: the per-session skip warning is written at most once per
+//     livenessUnknownLogCooldown instead of every patrol tick, so a
+//     persistently-unprobeable session no longer spams stderr.
+//   - Escalation: after livenessUnknownEscalateThreshold consecutive failures
+//     the session is surfaced as a probable stall via a distinct trace outcome
+//     (TraceOutcomeEscalatedLivenessUnknown, which also auto-arms detailed
+//     tracing) plus a single un-throttled warning — instead of being silently
+//     skipped forever, the invisible-infra-stall failure mode.
+//
+// The consecutive run resets on the next successful observation (see the
+// clearLivenessUnknown call at the observation site). siteCode/state describe
+// the specific skipped action for the trace record; action is the human noun
+// for the stderr line (e.g. "orphan close").
+func skipLivenessUnknown(
+	dt *drainTracker,
+	trace *sessionReconcilerTraceCycle,
+	stderr io.Writer,
+	now time.Time,
+	beadID, siteCode, template, name, state, action string,
+	livenessErr error,
+) {
+	logNow, escalate, consecutive := dt.observeLivenessUnknown(beadID, now, livenessUnknownLogCooldown, livenessUnknownEscalateThreshold)
+	switch {
+	case escalate:
+		// Un-throttled: escalation fires once per stuck episode.
+		fmt.Fprintf(stderr, "session reconciler: ESCALATION: session '%s' unprobeable for %d consecutive reconcile ticks; %s skipped fail-closed — possible stuck session (last error: %v)\n", name, consecutive, action, livenessErr) //nolint:errcheck
+	case logNow:
+		fmt.Fprintf(stderr, "session reconciler: skipping %s of '%s': liveness observation failed (consecutive=%d): %v\n", action, name, consecutive, livenessErr) //nolint:errcheck
+	}
+	if trace != nil {
+		outcome := TraceOutcomeSkippedLivenessError
+		if escalate {
+			outcome = TraceOutcomeEscalatedLivenessUnknown
+		}
+		trace.recordDecision(siteCode, template, name, state, string(outcome), traceRecordPayload{
+			"liveness_error":      livenessErr.Error(),
+			"consecutive_unknown": consecutive,
+		}, nil, "")
+	}
+}
+
 func reconcileSessionBeadsTracedWithNamedDemand(
 	ctx context.Context,
 	cityPath string,
@@ -956,7 +1005,7 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 			fmt.Fprintf(stderr, "session reconciler: skipping %s with unknown state %q\n", //nolint:errcheck // best-effort stderr
 				session.Metadata["session_name"], session.Metadata["state"])
 			if trace != nil {
-				trace.recordDecision("reconciler.session.unknown_state", session.Metadata["template"], session.Metadata["session_name"], "unknown_state_skipped", "skipped", traceRecordPayload{
+				trace.recordDecision("reconciler.session.unknown_state", session.Metadata["template"], session.Metadata["session_name"], string(TraceReasonUnknownStateSkipped), string(TraceOutcomeSkipped), traceRecordPayload{
 					"state": session.Metadata["state"],
 				}, nil, "")
 			}
@@ -979,6 +1028,11 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 			providerAlive, livenessErr := workerSessionTargetRunningWithConfig(cityPath, store, sp, cfg, session.ID)
 			if livenessErr != nil {
 				providerAlive = false
+			} else {
+				// A successful observation ends any liveness-unknown run for
+				// this session, so a later transient blip restarts the
+				// throttle/escalation cycle from scratch.
+				dt.clearLivenessUnknown(session.ID)
 			}
 			// Run this before configured named-session preservation. A stale
 			// state=creating bead with an expired pending-create lease would
@@ -1000,12 +1054,8 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 						// a transient tmux/store blip would orphan it
 						// (#3872-family). Skip the destructive rollback this tick;
 						// the level-triggered loop re-observes next tick.
-						fmt.Fprintf(stderr, "session reconciler: skipping pending-create rollback of '%s': liveness observation failed: %v\n", name, livenessErr) //nolint:errcheck
-						if trace != nil {
-							trace.recordDecision("reconciler.session.rollback_pending_create", template, name, "pending_create_lease_expired", string(TraceOutcomeSkippedLivenessError), traceRecordPayload{
-								"liveness_error": livenessErr.Error(),
-							}, nil, "")
-						}
+						skipLivenessUnknown(dt, trace, stderr, clk.Now(), session.ID,
+							"reconciler.session.rollback_pending_create", template, name, "pending_create_lease_expired", "pending-create rollback", livenessErr)
 						continue
 					}
 					peek := cachedSessionPeek(cityPath, store, sp, cfg, session.ID, nil)
@@ -1073,12 +1123,8 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 						// a transient tmux/store blip would orphan it
 						// (#3872-family). Skip the destructive close this tick; the
 						// level-triggered loop re-observes next tick.
-						fmt.Fprintf(stderr, "session reconciler: skipping failed-create close of '%s': liveness observation failed: %v\n", name, livenessErr) //nolint:errcheck
-						if trace != nil {
-							trace.recordDecision("reconciler.session.close_failed_create", template, name, string(sessionpkg.StateFailedCreate), string(TraceOutcomeSkippedLivenessError), traceRecordPayload{
-								"liveness_error": livenessErr.Error(),
-							}, nil, "")
-						}
+						skipLivenessUnknown(dt, trace, stderr, clk.Now(), session.ID,
+							"reconciler.session.close_failed_create", template, name, string(sessionpkg.StateFailedCreate), "failed-create close", livenessErr)
 						continue
 					}
 					if trace != nil {
@@ -1198,12 +1244,8 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 							// would orphan it (#3872-family). Skip the destructive
 							// finalize this tick; the level-triggered loop
 							// re-observes next tick.
-							fmt.Fprintf(stderr, "session reconciler: skipping drain-ack finalize of '%s': liveness observation failed: %v\n", name, livenessErr) //nolint:errcheck
-							if trace != nil {
-								trace.recordDecision("reconciler.session.drain_ack", template, name, "orphaned", string(TraceOutcomeSkippedLivenessError), traceRecordPayload{
-									"liveness_error": livenessErr.Error(),
-								}, nil, "")
-							}
+							skipLivenessUnknown(dt, trace, stderr, clk.Now(), session.ID,
+								"reconciler.session.drain_ack", template, name, "orphaned", "drain-ack finalize", livenessErr)
 							continue
 						}
 						finalizeDrainAckStoppedSession(
@@ -1281,12 +1323,8 @@ func reconcileSessionBeadsTracedWithNamedDemand(
 						// it is unaffected. The other !providerAlive destructive
 						// paths — pending-create rollback, failed-create close, and
 						// drain-ack finalize — carry the same fail-closed guard.)
-						fmt.Fprintf(stderr, "session reconciler: skipping close of '%s': liveness observation failed: %v\n", name, livenessErr) //nolint:errcheck
-						if trace != nil {
-							trace.recordDecision("reconciler.session.close_orphan", template, name, reason, string(TraceOutcomeSkippedLivenessError), traceRecordPayload{
-								"liveness_error": livenessErr.Error(),
-							}, nil, "")
-						}
+						skipLivenessUnknown(dt, trace, stderr, clk.Now(), session.ID,
+							"reconciler.session.close_orphan", template, name, reason, "orphan close", livenessErr)
 						continue
 					}
 					if trace != nil {

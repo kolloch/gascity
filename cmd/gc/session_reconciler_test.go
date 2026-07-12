@@ -1900,7 +1900,7 @@ func TestReconcileOrphanCloseFailsClosedOnLivenessError(t *testing.T) {
 		if status == "closed" {
 			t.Fatalf("status = %q, want open — a liveness observation error must fail closed (skip the destructive close) so a possibly-live session is not orphaned", status)
 		}
-		if !strings.Contains(stderr, "skipping close of 'worker': liveness observation failed") {
+		if !strings.Contains(stderr, "skipping orphan close of 'worker': liveness observation failed") {
 			t.Fatalf("stderr = %q, want the orphan-close fail-closed guard line", stderr)
 		}
 	})
@@ -1968,6 +1968,59 @@ func TestReconcilePendingCreateRollbackFailsClosedOnLivenessError(t *testing.T) 
 			t.Fatalf("stderr = %q, want the pending-create rollback fail-closed guard line", stderr)
 		}
 	})
+}
+
+// TestReconcileOrphanCloseThrottlesAndEscalatesLivenessUnknown drives the
+// orphan-close fail-closed guard across many ticks with a persistent liveness
+// observation error and asserts the two behaviors ga-cmw0 added on top of the
+// bare skip: the per-session skip warning is throttled (written once, not every
+// tick) and, after livenessUnknownEscalateThreshold consecutive failures, the
+// session is escalated exactly once as a probable stall — instead of being
+// silently skipped forever. The bead must stay open the whole time (the guard
+// still fails closed).
+func TestReconcileOrphanCloseThrottlesAndEscalatesLivenessUnknown(t *testing.T) {
+	env := newReconcilerTestEnv()
+	env.cfg = &config.City{}
+	session := env.createSessionBead("worker", "worker")
+
+	// Reconcile once per simulated patrol tick. livenessProbeGetErrStore fails
+	// the second Get of the target within a tick (the liveness probe), so a
+	// fresh wrapper per tick reproduces the single-tick fail-closed skip every
+	// tick — the persistently-unprobeable session the escalation exists for. The
+	// 30s spacing is shorter than livenessUnknownLogCooldown (5m), so only the
+	// first tick logs the skip line while the count climbs to the threshold.
+	const ticks = livenessUnknownEscalateThreshold + 2
+	for i := 0; i < ticks; i++ {
+		store := &livenessProbeGetErrStore{
+			Store:  env.store,
+			target: session.ID,
+			err:    errors.New("tmux observation unavailable"),
+		}
+		reconcileSessionBeadsAtPath(
+			context.Background(), "", []beads.Bead{session}, env.desiredState,
+			nil, env.cfg, env.sp, store, nil, nil, nil, nil, env.dt, nil, false,
+			nil, "", nil, env.clk, env.rec, 0, 0, &env.stdout, &env.stderr,
+		)
+		got, err := env.store.Get(session.ID)
+		if err != nil {
+			t.Fatalf("Get(%s): %v", session.ID, err)
+		}
+		if got.Status == "closed" {
+			t.Fatalf("tick %d: status = closed, want open — the guard must fail closed every tick", i)
+		}
+		env.clk.Advance(30 * time.Second)
+	}
+
+	stderr := env.stderr.String()
+	if got := strings.Count(stderr, "skipping orphan close of 'worker'"); got != 1 {
+		t.Errorf("skip-warning count = %d, want 1 (throttled across %d ticks); stderr:\n%s", got, ticks, stderr)
+	}
+	if got := strings.Count(stderr, "ESCALATION: session 'worker' unprobeable"); got != 1 {
+		t.Errorf("escalation count = %d, want exactly 1; stderr:\n%s", got, stderr)
+	}
+	if !strings.Contains(stderr, fmt.Sprintf("%d consecutive reconcile ticks", livenessUnknownEscalateThreshold)) {
+		t.Errorf("escalation line missing the consecutive-tick count %d; stderr:\n%s", livenessUnknownEscalateThreshold, stderr)
+	}
 }
 
 // TestReconcileSessionBeads_CloseGateIgnoresUnreachableRigAssignedWork

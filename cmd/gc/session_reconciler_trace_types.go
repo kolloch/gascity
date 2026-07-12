@@ -200,6 +200,15 @@ const (
 	// loop fails closed and re-observes next tick rather than orphaning a
 	// possibly-live session (#3872-family).
 	TraceOutcomeSkippedLivenessError TraceOutcomeCode = "skipped_liveness_error"
+
+	// TraceOutcomeEscalatedLivenessUnknown marks the tick on which a session
+	// crossed livenessUnknownEscalateThreshold consecutive liveness-observation
+	// failures. The destructive action is still skipped fail-closed (as with
+	// TraceOutcomeSkippedLivenessError), but the distinct outcome surfaces a
+	// persistently-unprobeable session as a probable stall instead of letting
+	// it be silently skipped forever — an otherwise invisible infra stall. It
+	// fires once per stuck episode; the run resets on a successful observation.
+	TraceOutcomeEscalatedLivenessUnknown TraceOutcomeCode = "escalated_liveness_unknown"
 )
 
 type TraceCompletionStatus string
@@ -699,7 +708,8 @@ func normalizeTraceOutcomeCode(raw string) (TraceOutcomeCode, string) {
 		TraceOutcomeStartCandidate,
 		TraceOutcomeRetry,
 		TraceOutcomeCancel,
-		TraceOutcomeSkippedLivenessError:
+		TraceOutcomeSkippedLivenessError,
+		TraceOutcomeEscalatedLivenessUnknown:
 		return TraceOutcomeCode(strings.TrimSpace(raw)), ""
 	default:
 		return TraceOutcomeUnknown, strings.TrimSpace(raw)

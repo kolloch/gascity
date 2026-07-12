@@ -857,7 +857,8 @@ func shouldAutoArmForTrace(reason TraceReasonCode, outcome TraceOutcomeCode) boo
 		return true
 	}
 	switch outcome {
-	case TraceOutcomeFailed, TraceOutcomeProviderError, TraceOutcomeDeadlineExceeded:
+	case TraceOutcomeFailed, TraceOutcomeProviderError, TraceOutcomeDeadlineExceeded,
+		TraceOutcomeEscalatedLivenessUnknown:
 		return true
 	}
 	return false

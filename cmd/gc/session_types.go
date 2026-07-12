@@ -69,18 +69,32 @@ type idleProbeState struct {
 	completedAt time.Time
 }
 
+// livenessUnknownState tracks consecutive liveness-observation failures for a
+// single session so the reconciler can throttle the repeated fail-closed skip
+// log and escalate a persistently-unprobeable session instead of silently
+// skipping it every tick. Ephemeral (in-memory only); lost on controller
+// crash — safe because the level-triggered reconcile loop rebuilds it from
+// re-observation, and NDI reconverges.
+type livenessUnknownState struct {
+	consecutive  int       // consecutive reconcile ticks with a liveness-observation error
+	lastLoggedAt time.Time // last time a throttled skip/escalation line was written to stderr
+	escalated    bool      // true once the consecutive-failure escalation fired, so it fires once per stuck episode
+}
+
 // drainTracker manages in-memory drain states for all sessions.
 type drainTracker struct {
 	mu              sync.Mutex
-	drains          map[string]*drainState     // session bead ID -> drain state
-	idleProbes      map[string]*idleProbeState // session bead ID -> async idle probe
+	drains          map[string]*drainState           // session bead ID -> drain state
+	idleProbes      map[string]*idleProbeState       // session bead ID -> async idle probe
+	livenessUnknown map[string]*livenessUnknownState // session bead ID -> consecutive liveness-observation failures
 	idleProbeCursor int
 }
 
 func newDrainTracker() *drainTracker {
 	return &drainTracker{
-		drains:     make(map[string]*drainState),
-		idleProbes: make(map[string]*idleProbeState),
+		drains:          make(map[string]*drainState),
+		idleProbes:      make(map[string]*idleProbeState),
+		livenessUnknown: make(map[string]*livenessUnknownState),
 	}
 }
 
@@ -172,6 +186,58 @@ func (dt *drainTracker) finishIdleProbe(beadID string, probe *idleProbeState, su
 	current.completedAt = completedAt
 }
 
+// observeLivenessUnknown records one liveness-observation failure for a session
+// (a destructive reconcile action skipped fail-closed because the runtime probe
+// errored) and reports whether the caller should write the throttled skip line
+// this tick and whether the session has just crossed the consecutive-failure
+// escalation threshold. logNow is true on the first failure and then at most
+// once per cooldown window, so a persistently-unprobeable session no longer
+// spams stderr every tick. escalate is true only on the tick the threshold is
+// first crossed, so escalation fires once per stuck episode rather than every
+// tick. The returned consecutive count is the post-increment run length. When
+// dt is nil it degrades to the pre-throttle behavior (always log, never
+// escalate) so call sites stay safe without a tracker.
+func (dt *drainTracker) observeLivenessUnknown(beadID string, now time.Time, cooldown time.Duration, threshold int) (logNow, escalate bool, consecutive int) {
+	if dt == nil {
+		return true, false, 0
+	}
+	dt.mu.Lock()
+	defer dt.mu.Unlock()
+	st := dt.livenessUnknown[beadID]
+	if st == nil {
+		st = &livenessUnknownState{}
+		dt.livenessUnknown[beadID] = st
+	}
+	st.consecutive++
+	if threshold > 0 && st.consecutive >= threshold && !st.escalated {
+		escalate = true
+		st.escalated = true
+	}
+	if st.lastLoggedAt.IsZero() || now.Sub(st.lastLoggedAt) >= cooldown {
+		logNow = true
+	}
+	// Any stderr line this tick (throttled skip or escalation) resets the
+	// cooldown so the next skip line waits a full window instead of firing on
+	// the tick right after an escalation.
+	if logNow || escalate {
+		st.lastLoggedAt = now
+	}
+	return logNow, escalate, st.consecutive
+}
+
+// clearLivenessUnknown resets a session's consecutive liveness-observation
+// failure tracking after a successful observation (or when the session bead is
+// gone), so a later transient blip starts a fresh throttle/escalation cycle
+// rather than inheriting a stale run length.
+func (dt *drainTracker) clearLivenessUnknown(beadID string) {
+	if dt == nil {
+		return
+	}
+	dt.mu.Lock()
+	defer dt.mu.Unlock()
+	delete(dt.livenessUnknown, beadID)
+}
+
 func (dt *drainTracker) clearIdleProbe(beadID string) {
 	if dt == nil {
 		return
@@ -239,4 +305,22 @@ const (
 	// wake→die cycles before quarantine. Three cycles means the session
 	// failed to be productive three times in a row.
 	defaultMaxChurnCycles = 3
+
+	// livenessUnknownLogCooldown throttles the repeated per-session
+	// "skipping ... liveness observation failed" stderr warning emitted when a
+	// destructive reconcile action fails closed on a probe error. A
+	// persistently-unprobeable session would otherwise write one line every
+	// patrol tick (~30s default). Larger than the tick interval so the log
+	// meaningfully throttles; aligned with defaultQuarantineDuration.
+	livenessUnknownLogCooldown = 5 * time.Minute
+
+	// livenessUnknownEscalateThreshold is how many consecutive
+	// liveness-observation failures for one session before the reconciler
+	// escalates it as a probable stuck session (a distinct trace outcome plus
+	// an un-throttled warning) rather than silently failing closed forever. At
+	// the 30s default patrol interval five consecutive failures is ~2.5min of
+	// continuous unprobeable-ness — well past the transient tmux/store blips
+	// (#3872-family) the fail-closed guard exists to survive. Mirrors
+	// defaultMaxWakeAttempts.
+	livenessUnknownEscalateThreshold = 5
 )
