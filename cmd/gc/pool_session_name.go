@@ -293,7 +293,40 @@ func releaseOrphanedPoolAssignment(store beads.Store, id string) bool {
 		Assignee: stringPtr(""),
 		Status:   stringPtr("open"),
 	}
-	return store.Update(id, opts) == nil
+	if store.Update(id, opts) != nil {
+		return false
+	}
+	verifyReleasedPoolAssignment(store, id, "")
+	return true
+}
+
+// verifyReleasedPoolAssignment reads a pool work bead back immediately after
+// releaseOrphanedPoolAssignment's release write and logs loudly when a
+// concurrent claim raced in and set a foreign, non-empty assignee after the
+// release. expectedAssignee is the assignee the release write installed (the
+// empty string for the unconditional release path); a read-back that is
+// non-empty and differs from it means a re-claim landed after our write.
+//
+// This makes the claim-AFTER-release ordering observable. The
+// claim-BETWEEN-recheck-and-write ordering — a re-claim landing after
+// liveWorkAssignmentStillReleasable but before the release write, which our
+// write then clobbers — reads back empty and stays undetectable here without a
+// store-level conditional-release (CAS) verb the fork does not yet have. This
+// is observability only: it never changes the release decision.
+func verifyReleasedPoolAssignment(store beads.Store, id, expectedAssignee string) {
+	if store == nil || id == "" {
+		return
+	}
+	sb, err := store.Get(id)
+	if err != nil {
+		log.Printf("releaseOrphanedPoolAssignments: verify-after read failed for %q: %v", id, err)
+		return
+	}
+	observed := strings.TrimSpace(sb.Assignee)
+	expected := strings.TrimSpace(expectedAssignee)
+	if observed != "" && observed != expected {
+		log.Printf("releaseOrphanedPoolAssignments: RELEASE RACE on %s: observed assignee %q after release write (expected %q); a concurrent claim raced the orphan release", id, observed, expected)
+	}
 }
 
 // poolAssignmentReopenedReason is the diagnostic tag carried by every

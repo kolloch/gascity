@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"log"
 	"strings"
 	"testing"
 
@@ -1561,4 +1563,158 @@ func TestRecordReleasedPoolAssignments_NilRecorderStillLogs(t *testing.T) {
 	if !strings.Contains(stderr.String(), "released orphaned pool work: ga-9") {
 		t.Fatalf("stderr %q missing log line", stderr.String())
 	}
+}
+
+// releaseGetStub is a minimal beads.Store that returns a fixed bead (or error)
+// from Get, so verifyReleasedPoolAssignment can be exercised against a
+// controlled read-back. Only Get is called; the embedded nil Store makes the
+// remaining interface methods compile but they must never run.
+type releaseGetStub struct {
+	beads.Store
+	bead beads.Bead
+	err  error
+}
+
+func (s releaseGetStub) Get(string) (beads.Bead, error) { return s.bead, s.err }
+
+// reclaimRaceStore backs Update against a real store but rewrites the Get
+// read-back to a foreign assignee, simulating a concurrent re-claim that lands
+// in the window after releaseOrphanedPoolAssignment's release write.
+type reclaimRaceStore struct {
+	beads.Store
+	reclaimAssignee string
+}
+
+func (s reclaimRaceStore) Get(id string) (beads.Bead, error) {
+	b, err := s.Store.Get(id)
+	if err != nil {
+		return b, err
+	}
+	b.Assignee = s.reclaimAssignee
+	return b, nil
+}
+
+// withCapturedLog captures everything written to the standard logger while fn
+// runs and returns it, restoring the prior writer and flags afterward. Callers
+// must not add t.Parallel(): it mutates process-global logger state.
+func withCapturedLog(t *testing.T, fn func()) string {
+	t.Helper()
+	var buf bytes.Buffer
+	prevWriter := log.Writer()
+	prevFlags := log.Flags()
+	log.SetOutput(&buf)
+	log.SetFlags(0)
+	defer func() {
+		log.SetOutput(prevWriter)
+		log.SetFlags(prevFlags)
+	}()
+	fn()
+	return buf.String()
+}
+
+// TestVerifyReleasedPoolAssignment_LogsForeignReclaim asserts the verify-after
+// read logs a loud RELEASE-RACE line only when the bead reads back with a
+// foreign, non-empty assignee (a concurrent claim that raced the release
+// write). An empty read-back (uncontended release) or a read-back equal to the
+// expected assignee stays quiet.
+func TestVerifyReleasedPoolAssignment_LogsForeignReclaim(t *testing.T) {
+	tests := []struct {
+		name     string
+		observed string
+		expected string
+		wantRace bool
+	}{
+		{name: "foreign reclaim after release", observed: "worker-fresh", expected: "", wantRace: true},
+		{name: "uncontended release reads back empty", observed: "", expected: "", wantRace: false},
+		{name: "read-back equals expected stays quiet", observed: "worker-held", expected: "worker-held", wantRace: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			store := releaseGetStub{bead: beads.Bead{ID: "ga-42", Assignee: tc.observed}}
+			out := withCapturedLog(t, func() {
+				verifyReleasedPoolAssignment(store, "ga-42", tc.expected)
+			})
+			gotRace := strings.Contains(out, "RELEASE RACE on ga-42")
+			if gotRace != tc.wantRace {
+				t.Fatalf("RELEASE RACE logged = %v, want %v (log: %q)", gotRace, tc.wantRace, out)
+			}
+			if tc.wantRace && !strings.Contains(out, tc.observed) {
+				t.Fatalf("race log %q missing observed assignee %q", out, tc.observed)
+			}
+		})
+	}
+}
+
+// TestVerifyReleasedPoolAssignment_LogsReadFailure asserts a failed verify-after
+// read is surfaced (not swallowed) and does not masquerade as a release race.
+func TestVerifyReleasedPoolAssignment_LogsReadFailure(t *testing.T) {
+	store := releaseGetStub{err: errors.New("boom")}
+	out := withCapturedLog(t, func() {
+		verifyReleasedPoolAssignment(store, "ga-42", "")
+	})
+	if !strings.Contains(out, `verify-after read failed for "ga-42"`) {
+		t.Fatalf("log %q missing read-failure diagnostic", out)
+	}
+	if strings.Contains(out, "RELEASE RACE") {
+		t.Fatalf("read failure must not be logged as a release race: %q", out)
+	}
+}
+
+// TestReleaseOrphanedPoolAssignment_ObservesRacedReclaim asserts the release
+// helper wires the verify-after read: a foreign read-back emits the RELEASE-RACE
+// log while the release still reports success, and an uncontended release stays
+// quiet and leaves the bead open+unassigned. Observability only — the release
+// decision (return value) is unchanged.
+func TestReleaseOrphanedPoolAssignment_ObservesRacedReclaim(t *testing.T) {
+	newInProgressWork := func(t *testing.T, mem beads.Store) beads.Bead {
+		t.Helper()
+		work, err := mem.Create(beads.Bead{Title: "orphaned pool work", Assignee: "worker-dead"})
+		if err != nil {
+			t.Fatalf("Create work bead: %v", err)
+		}
+		if err := mem.Update(work.ID, beads.UpdateOpts{Status: stringPtr("in_progress")}); err != nil {
+			t.Fatalf("Set work status: %v", err)
+		}
+		return work
+	}
+
+	t.Run("raced reclaim is observed", func(t *testing.T) {
+		mem := beads.NewMemStore()
+		work := newInProgressWork(t, mem)
+		store := reclaimRaceStore{Store: mem, reclaimAssignee: "worker-fresh"}
+
+		var ok bool
+		out := withCapturedLog(t, func() {
+			ok = releaseOrphanedPoolAssignment(store, work.ID)
+		})
+		if !ok {
+			t.Fatalf("releaseOrphanedPoolAssignment = false, want true (release decision must be unchanged)")
+		}
+		if !strings.Contains(out, "RELEASE RACE on "+work.ID) || !strings.Contains(out, "worker-fresh") {
+			t.Fatalf("expected RELEASE RACE log naming worker-fresh, got %q", out)
+		}
+	})
+
+	t.Run("uncontended release stays quiet", func(t *testing.T) {
+		mem := beads.NewMemStore()
+		work := newInProgressWork(t, mem)
+
+		var ok bool
+		out := withCapturedLog(t, func() {
+			ok = releaseOrphanedPoolAssignment(mem, work.ID)
+		})
+		if !ok {
+			t.Fatalf("releaseOrphanedPoolAssignment = false, want true")
+		}
+		if strings.Contains(out, "RELEASE RACE") {
+			t.Fatalf("uncontended release must stay quiet, got %q", out)
+		}
+		got, err := mem.Get(work.ID)
+		if err != nil {
+			t.Fatalf("Get work bead: %v", err)
+		}
+		if got.Assignee != "" || got.Status != "open" {
+			t.Fatalf("post-release bead = {assignee:%q status:%q}, want {assignee:'' status:open}", got.Assignee, got.Status)
+		}
+	})
 }
