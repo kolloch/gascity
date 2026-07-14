@@ -3,6 +3,7 @@ package events
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -412,34 +413,84 @@ func (r *FileRecorder) LatestSeq() (uint64, error) {
 	return seq, nil
 }
 
-// Watch returns a Watcher that polls the event file for new events.
-// The watcher detects rotation (inode change between polls) and resets
-// its byte offset to the start of the new active file so the
-// events.rotated anchor and any post-rotation events are yielded
-// without gap (designer §8.1). Already-yielded events are deduped via
-// the afterSeq cursor.
+// Watch returns a Watcher that yields every retained event with
+// Seq > afterSeq exactly once, in seq order, and then tails the active
+// log for new events. It is archive-aware in two directions:
+//
+//   - Resume backfill. When afterSeq is below the live tail, events with
+//     Seq > afterSeq may have been rotated out of the active file into a
+//     .gz archive (or a rotating-* file mid-gzip). Watch enumerates those
+//     windows and the returned watcher replays them, in seq order, before
+//     tailing the active file — so an SSE/Last-Event-ID or exporter-cursor
+//     reconnect below a rotation boundary no longer loses the gap.
+//
+//   - Mid-watch rotation. Watch captures a read fd to the current active
+//     inode under the recorder lock. Holding that fd keeps the old inode
+//     readable to true EOF even after a later rotation renames and gzips
+//     it away, so the tail appended between the watcher's last read and
+//     the rename is delivered before the watcher switches to the new
+//     active file. Pinning the inode also prevents the new active file
+//     from reusing its inode number, so rotation stays detectable by
+//     inode comparison.
+//
+// Already-yielded events are deduped via the afterSeq cursor, so an
+// overlap between an archive and its transient rotating sibling, or
+// between the backfill and the live tail, never double-delivers.
 func (r *FileRecorder) Watch(ctx context.Context, afterSeq uint64) (Watcher, error) {
-	var offset int64
-	var inode uint64
 	r.mu.Lock()
-	if afterSeq >= r.seq {
-		if info, err := r.file.Stat(); err == nil {
+	// Capture the active inode's fd, offset, and (via the fd) identity
+	// under the lock, so they are all consistent with r.seq and no
+	// rotation can interpose between the snapshot and the watcher's first
+	// read.
+	curr, currInode := openActiveForRead(r.path)
+	var offset int64
+	if curr != nil && afterSeq >= r.seq {
+		// Caller is already current — tail only appends past the live EOF.
+		if info, err := curr.Stat(); err == nil {
 			offset = info.Size()
 		}
 	}
-	if info, err := os.Stat(r.path); err == nil {
-		inode = inodeOf(info)
+	var legs []backfillLeg
+	if afterSeq < r.seq {
+		// Caller is resuming below the live tail: rotated windows may hold
+		// events with Seq > afterSeq that no longer live in the active
+		// file. Replay them before tailing from the active file's start.
+		legs = collectBackfillLegs(filepath.Dir(r.path), afterSeq)
 	}
 	r.mu.Unlock()
+
+	var backfill *backfillReader
+	if len(legs) > 0 {
+		backfill = &backfillReader{dir: filepath.Dir(r.path), legs: legs, stderr: r.stderr}
+	}
 	return &fileWatcher{
-		path:     r.path,
-		afterSeq: afterSeq,
-		ctx:      ctx,
-		poll:     250 * time.Millisecond,
-		offset:   offset,
-		inode:    inode,
-		done:     make(chan struct{}),
+		path:      r.path,
+		afterSeq:  afterSeq,
+		ctx:       ctx,
+		poll:      250 * time.Millisecond,
+		stderr:    r.stderr,
+		curr:      curr,
+		currInode: currInode,
+		offset:    offset,
+		backfill:  backfill,
+		done:      make(chan struct{}),
 	}, nil
+}
+
+// openActiveForRead opens a read-only fd to the active log and returns it
+// with its inode. On any error — including a path momentarily absent
+// during a concurrent rotation — it returns (nil, 0); the watcher then
+// opens the active file lazily on a later poll.
+func openActiveForRead(path string) (*os.File, uint64) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, 0
+	}
+	var inode uint64
+	if info, err := f.Stat(); err == nil {
+		inode = inodeOf(info)
+	}
+	return f, inode
 }
 
 // Close closes the underlying file. It is safe to call multiple times;
@@ -479,88 +530,201 @@ func (r *FileRecorder) WaitForRotations() {
 	r.rotations.Wait()
 }
 
-// fileWatcher polls a JSONL file for new events. It tracks the file's
-// inode in addition to the byte offset so a rotation (rename + fresh
-// re-open) is detected and the offset is reset to 0 against the new
-// active file. The afterSeq cursor dedupes against already-yielded
-// events.
+// errWatcherClosed is returned by Next once the watcher has been closed.
+var errWatcherClosed = errors.New("watcher closed")
+
+// fileWatcher yields events with Seq > afterSeq in seq order. It first
+// replays any rotated backfill legs (archives + rotating-* files whose
+// window sits above afterSeq), then tails the active log via an fd it
+// holds open across rotations. Holding the fd keeps the old active inode
+// readable to true EOF after a rotation renames it away, so the mid-watch
+// tail is not lost; rotation is detected by comparing the path's inode
+// against the held fd's inode, and the fd pins the old inode so its number
+// cannot be reused by the new active file. The afterSeq cursor dedupes
+// against already-yielded events across every seam.
 type fileWatcher struct {
-	path      string
-	afterSeq  uint64
-	ctx       context.Context
-	poll      time.Duration
-	offset    int64
-	inode     uint64
-	buf       []Event // buffered events from last poll
+	path     string
+	afterSeq uint64
+	ctx      context.Context
+	poll     time.Duration
+	stderr   io.Writer // for re-armed backfill diagnostics on multi-rotation
+
+	mu        sync.Mutex // guards backfill, curr, currInode, offset, buf, closed
+	backfill  *backfillReader
+	curr      *os.File // read fd to the inode currently being tailed
+	currInode uint64   // identity of curr (0 = unknown / not yet opened)
+	offset    int64    // read position within curr
+	buf       []Event  // decoded events awaiting delivery
+	closed    bool
+
 	done      chan struct{}
 	closeOnce sync.Once
 }
 
-// Next blocks until the next event is available or the context is canceled.
+// Next blocks until the next event is available, the context is canceled,
+// or the watcher is closed.
 func (w *fileWatcher) Next() (Event, error) {
 	for {
-		// Drain buffer first.
-		if len(w.buf) > 0 {
-			e := w.buf[0]
-			w.buf = w.buf[1:]
-			return e, nil
-		}
-
-		// Check context and close.
-		select {
-		case <-w.ctx.Done():
-			return Event{}, w.ctx.Err()
-		case <-w.done:
-			return Event{}, fmt.Errorf("watcher closed")
-		default:
-		}
-
-		// Detect rotation by inode change. On rotation, ReadFrom would
-		// otherwise seek past EOF in the new (smaller) file and skip
-		// the events.rotated anchor; resetting offset to 0 lets the
-		// watcher rescan the new active file from the top while
-		// afterSeq prevents re-yielding already-seen events.
-		if info, err := os.Stat(w.path); err == nil {
-			if curr := inodeOf(info); curr != 0 {
-				if w.inode != 0 && curr != w.inode {
-					w.offset = 0
-				}
-				w.inode = curr
-			}
-		}
-
-		// Poll for new events.
-		evts, newOffset, err := ReadFrom(w.path, w.offset)
+		e, ok, err := w.fill()
 		if err != nil {
 			return Event{}, err
 		}
-		w.offset = newOffset
-
-		// Filter to events after our cursor.
-		for _, e := range evts {
-			if e.Seq > w.afterSeq {
-				w.afterSeq = e.Seq
-				w.buf = append(w.buf, e)
-			}
+		if ok {
+			return e, nil
 		}
-
-		if len(w.buf) > 0 {
-			continue // drain buffer on next iteration
-		}
-
-		// No new events — wait and retry.
+		// Nothing available yet — wait for new data, close, or cancel.
 		select {
 		case <-w.ctx.Done():
 			return Event{}, w.ctx.Err()
 		case <-w.done:
-			return Event{}, fmt.Errorf("watcher closed")
+			return Event{}, errWatcherClosed
 		case <-time.After(w.poll):
 		}
 	}
 }
 
-// Close unblocks any pending Next call.
+// fill advances the watcher until it can return one event or determines
+// that no data is currently available (ok=false, err=nil), in which case
+// Next waits before calling again. It runs entirely under w.mu so a
+// concurrent Close cannot close the fd mid-read.
+func (w *fileWatcher) fill() (Event, bool, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	for {
+		if w.closed {
+			return Event{}, false, errWatcherClosed
+		}
+		if len(w.buf) > 0 {
+			e := w.buf[0]
+			w.buf = w.buf[1:]
+			return e, true, nil
+		}
+		// Honor cancellation promptly, even under a continuous event
+		// stream where the reads below never yield an empty poll. Buffered
+		// events are drained first (above) so a cancel does not discard
+		// already-decoded events.
+		select {
+		case <-w.ctx.Done():
+			return Event{}, false, w.ctx.Err()
+		default:
+		}
+
+		// Phase 1: replay rotated backfill legs before the live tail.
+		if w.backfill != nil {
+			e, ok, err := w.backfill.next()
+			if err != nil {
+				return Event{}, false, err
+			}
+			if ok {
+				if e.Seq > w.afterSeq {
+					w.afterSeq = e.Seq
+					w.buf = append(w.buf, e)
+				}
+				continue
+			}
+			w.backfill.close()
+			w.backfill = nil
+			continue
+		}
+
+		// Phase 2: tail the active inode through the held fd.
+		if w.curr == nil {
+			f, inode := openActiveForRead(w.path)
+			if f == nil {
+				// Active file momentarily absent (mid-rotation) — wait.
+				return Event{}, false, nil
+			}
+			w.curr = f
+			w.currInode = inode
+			w.offset = 0
+		}
+
+		evts, newOffset, err := readFromOpenFile(w.curr, w.offset)
+		if err != nil {
+			return Event{}, false, err
+		}
+		w.offset = newOffset
+		buffered := false
+		for _, e := range evts {
+			if e.Seq > w.afterSeq {
+				w.afterSeq = e.Seq
+				w.buf = append(w.buf, e)
+				buffered = true
+			}
+		}
+		if buffered {
+			continue // deliver from buf on the next loop
+		}
+		if len(evts) > 0 {
+			// Read events, but all were at/below afterSeq (already
+			// delivered, e.g. re-reading the active file after backfill).
+			// Keep scanning forward without waiting.
+			continue
+		}
+
+		// curr is at EOF. Detect rotation: if the path now points to a
+		// different inode, rotateLocked has already closed the old inode's
+		// writer (the rename happens after that close), so the tail we
+		// hold is final. Drain it once more to capture anything appended
+		// between our last read and the rename, then switch to the new
+		// active inode.
+		if w.currInode != 0 {
+			if info, statErr := os.Stat(w.path); statErr == nil {
+				if pathInode := inodeOf(info); pathInode != 0 && pathInode != w.currInode {
+					tail, tailOffset, err := readFromOpenFile(w.curr, w.offset)
+					if err != nil {
+						return Event{}, false, err
+					}
+					w.offset = tailOffset
+					for _, e := range tail {
+						if e.Seq > w.afterSeq {
+							w.afterSeq = e.Seq
+							w.buf = append(w.buf, e)
+						}
+					}
+					_ = w.curr.Close()
+					w.curr = nil
+					w.currInode = 0
+					w.offset = 0
+					// If more than one rotation elapsed since our last read,
+					// the intermediate active inodes we never held have been
+					// archived. Re-arm backfill for every window now above
+					// the cursor so those are replayed before we tail the
+					// current active file. afterSeq (advanced by the drain
+					// above) excludes the inode we just finished. A single
+					// rotation yields no such windows, so this is a no-op in
+					// the common case.
+					if legs := collectBackfillLegs(filepath.Dir(w.path), w.afterSeq); len(legs) > 0 {
+						w.backfill = &backfillReader{dir: filepath.Dir(w.path), legs: legs, stderr: w.stderr}
+					}
+					continue // drain any re-armed backfill, then reopen active
+				}
+			}
+		}
+
+		// No new data and no rotation — ask Next to wait.
+		return Event{}, false, nil
+	}
+}
+
+// Close stops the watcher, unblocks any pending Next call, and releases
+// the held fd and any open backfill leg. Safe to call concurrently with
+// Next and safe to call multiple times.
 func (w *fileWatcher) Close() error {
-	w.closeOnce.Do(func() { close(w.done) })
+	w.closeOnce.Do(func() {
+		w.mu.Lock()
+		w.closed = true
+		if w.curr != nil {
+			_ = w.curr.Close()
+			w.curr = nil
+		}
+		if w.backfill != nil {
+			w.backfill.close()
+			w.backfill = nil
+		}
+		w.mu.Unlock()
+		close(w.done)
+	})
 	return nil
 }

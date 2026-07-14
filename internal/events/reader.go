@@ -411,6 +411,20 @@ func ReadFrom(path string, offset int64) ([]Event, int64, error) {
 	}
 	defer f.Close() //nolint:errcheck // read-only file
 
+	return readFromOpenFile(f, offset)
+}
+
+// readFromOpenFile reads events from an already-open file starting at the
+// given byte offset. It returns the events read, the byte offset after the
+// last complete line, and any error. A trailing partial line (no newline)
+// does not advance the offset, so a later call re-reads it once complete;
+// malformed complete lines are skipped. The file is left seeked to the
+// returned offset.
+//
+// The event watcher uses this to tail an fd it holds open across a
+// rotation: because the fd pins the old active inode, its tail stays
+// readable to true EOF even after the inode is renamed and gzipped away.
+func readFromOpenFile(f *os.File, offset int64) ([]Event, int64, error) {
 	if _, err := f.Seek(offset, io.SeekStart); err != nil {
 		return nil, offset, fmt.Errorf("seeking events: %w", err)
 	}
@@ -435,7 +449,7 @@ func ReadFrom(path string, offset int64) ([]Event, int64, error) {
 				// skip malformed lines (partial writes)
 			}
 			// Partial line (no trailing \n): don't advance offset.
-			// The next ReadFrom call will re-read it once complete.
+			// The next read call will re-read it once complete.
 		}
 		if err != nil {
 			if err == io.EOF {
