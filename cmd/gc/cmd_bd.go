@@ -303,8 +303,36 @@ func extractRigFlag(args []string) (string, []string) {
 	return rigName, rest
 }
 
+// extractBdDirectoryFlag returns the value of bd's -C / --directory flag from
+// the bd passthrough args, or "" if the flag is absent (or trails with no
+// value). It recognizes the space-separated (`-C dir`, `--directory dir`),
+// equals (`-C=dir`, `--directory=dir`), and attached-short (`-Cdir`) forms
+// that bd's cobra flag accepts. The flag is intentionally left in args so bd
+// itself still changes directory — this only mirrors the scope decision gc
+// must make before exec so the bead lands in the store -C names.
+func extractBdDirectoryFlag(args []string) string {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch {
+		case arg == "-C" || arg == "--directory":
+			if i+1 < len(args) {
+				return args[i+1]
+			}
+			return ""
+		case strings.HasPrefix(arg, "--directory="):
+			return strings.TrimPrefix(arg, "--directory=")
+		case strings.HasPrefix(arg, "-C="):
+			return strings.TrimPrefix(arg, "-C=")
+		case strings.HasPrefix(arg, "-C") && len(arg) > 2:
+			return arg[len("-C"):]
+		}
+	}
+	return ""
+}
+
 // resolveBdScopeTarget determines the canonical scope root for a bd command.
-// Priority: explicit rig name > bead prefix auto-detection > enclosing rig > city root.
+// Priority: explicit rig name > bead prefix auto-detection > -C/--directory rig
+// match > enclosing rig > city root.
 func resolveBdScopeTarget(cfg *config.City, cityPath, rigName string, args []string) (execStoreTarget, error) {
 	resolveRigPaths(cityPath, cfg.Rigs)
 	if rigName != "" {
@@ -347,6 +375,23 @@ func resolveBdScopeTarget(cfg *config.City, cityPath, rigName string, args []str
 			if bdBeadExists(cityPath, target, arg) {
 				return target, nil
 			}
+		}
+	}
+
+	// Honor bd's -C / --directory flag before the enclosing-rig (cwd) fallback:
+	// if it names a directory that maps to a registered rig, route there. An
+	// explicit -C must win over the directory the command happens to run from,
+	// otherwise `gc bd create -C <rig> ...` invoked from a polecat worktree
+	// would land the bead in the worktree's rig instead of the one -C names.
+	// resolveRigForDir absolutizes relative -C values against cwd, matching
+	// bd's own -C semantics.
+	if cdDir := extractBdDirectoryFlag(args); cdDir != "" {
+		if rig, ok, err := resolveRigForDir(cfg, cityPath, cdDir); err != nil {
+			return execStoreTarget{}, err
+		} else if ok {
+			// resolveRigForDir already skips unbound rigs, so rig.Path is
+			// guaranteed non-empty here.
+			return bdRigScopeTarget(cityPath, rig), nil
 		}
 	}
 

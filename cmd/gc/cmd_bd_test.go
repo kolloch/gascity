@@ -140,6 +140,32 @@ func TestExtractBdScopeFlags(t *testing.T) {
 	}
 }
 
+func TestExtractBdDirectoryFlag(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{name: "absent", args: []string{"list", "--json"}, want: ""},
+		{name: "short space-separated", args: []string{"-C", "/path/to/rig", "list"}, want: "/path/to/rig"},
+		{name: "short equals", args: []string{"-C=/path/to/rig", "list"}, want: "/path/to/rig"},
+		{name: "short attached", args: []string{"-C/path/to/rig", "list"}, want: "/path/to/rig"},
+		{name: "long space-separated", args: []string{"--directory", "/path/to/rig", "list"}, want: "/path/to/rig"},
+		{name: "long equals", args: []string{"--directory=/path/to/rig", "list"}, want: "/path/to/rig"},
+		{name: "after subcommand", args: []string{"create", "title", "-C", "/rig"}, want: "/rig"},
+		{name: "trailing short flag without value", args: []string{"list", "-C"}, want: ""},
+		{name: "trailing long flag without value", args: []string{"list", "--directory"}, want: ""},
+		{name: "first occurrence wins", args: []string{"-C", "/first", "-C", "/second"}, want: "/first"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := extractBdDirectoryFlag(tt.args); got != tt.want {
+				t.Fatalf("extractBdDirectoryFlag(%v) = %q, want %q", tt.args, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestResolveBdScopeTarget(t *testing.T) {
 	origProbe := bdBeadExists
 	defer func() { bdBeadExists = origProbe }()
@@ -1604,6 +1630,50 @@ func TestResolveBdScopeTargetUsesEnclosingRig(t *testing.T) {
 		ScopeKind: "rig",
 		Prefix:    "fr",
 		RigName:   "frontend",
+	}
+	if got != want {
+		t.Fatalf("resolveBdScopeTarget() = %#v, want %#v", got, want)
+	}
+}
+
+// TestResolveBdScopeTargetHonorsDirectoryFlag verifies that bd's -C /
+// --directory flag routes the command to the rig containing that directory,
+// overriding the enclosing-rig (cwd) fallback. Without this, `gc bd create -C
+// <rig> ...` run from a different rig's worktree would land the bead in the
+// worktree's rig rather than the one -C names.
+func TestResolveBdScopeTargetHonorsDirectoryFlag(t *testing.T) {
+	origProbe := bdBeadExists
+	defer func() { bdBeadExists = origProbe }()
+	bdBeadExists = func(string, execStoreTarget, string) bool { return false }
+
+	cityDir := filepath.Join(t.TempDir(), "city")
+	frontendDir := filepath.Join(cityDir, "frontend")
+	backendDir := filepath.Join(cityDir, "backend")
+	if err := os.MkdirAll(filepath.Join(frontendDir, "nested"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(backendDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.City{
+		Workspace: config.Workspace{Name: "demo"},
+		Rigs: []config.Rig{
+			{Name: "frontend", Path: "frontend", Prefix: "fr"},
+			{Name: "backend", Path: "backend", Prefix: "be"},
+		},
+	}
+	// cwd is inside frontend; -C names backend. -C must win.
+	setCwd(t, filepath.Join(frontendDir, "nested"))
+
+	got, err := resolveBdScopeTarget(cfg, cityDir, "", []string{"list", "-C", backendDir})
+	if err != nil {
+		t.Fatalf("resolveBdScopeTarget() error = %v", err)
+	}
+	want := execStoreTarget{
+		ScopeRoot: backendDir,
+		ScopeKind: "rig",
+		Prefix:    "be",
+		RigName:   "backend",
 	}
 	if got != want {
 		t.Fatalf("resolveBdScopeTarget() = %#v, want %#v", got, want)
