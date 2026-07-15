@@ -923,3 +923,73 @@ func TestDoHookNormalizesSingleObjectOutputToArray(t *testing.T) {
 		t.Fatalf("stdout = %q, want normalized JSON array", got)
 	}
 }
+
+// TestFilterUnreadyHookCandidatesExcludesClosedBeads covers the Dolt
+// status secondary-index drift guard: a `--status=open` query can return a
+// row whose primary status is closed. Dispatching such a row acts on
+// completed work, so filterUnreadyHookCandidates must drop it (ga-mtur).
+func TestFilterUnreadyHookCandidatesExcludesClosedBeads(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	input := `[{"id":"hw-closed","status":"closed"}]`
+
+	got := filterUnreadyHookCandidates(input, now)
+
+	if strings.Contains(got, "hw-closed") {
+		t.Fatalf("filterUnreadyHookCandidates kept a closed bead: %s", got)
+	}
+}
+
+// TestFilterUnreadyHookCandidatesKeepsOpenBeads guards against
+// over-filtering: an open row with no defer or blocking dep must survive so
+// real work keeps flowing.
+func TestFilterUnreadyHookCandidatesKeepsOpenBeads(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	input := `[{"id":"hw-open","status":"open"}]`
+
+	got := filterUnreadyHookCandidates(input, now)
+
+	if !strings.Contains(got, "hw-open") {
+		t.Fatalf("filterUnreadyHookCandidates dropped a ready open bead: %s", got)
+	}
+}
+
+// TestFilterUnreadyHookCandidatesExcludesClosedBeadsCaseInsensitive covers
+// the trimmed, case-insensitive match — Dolt can echo status casing and
+// padding that differs from the canonical "closed".
+func TestFilterUnreadyHookCandidatesExcludesClosedBeadsCaseInsensitive(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	input := `[{"id":"hw-a","status":"open"},{"id":"hw-b","status":" CLOSED "}]`
+
+	got := filterUnreadyHookCandidates(input, now)
+
+	if strings.Contains(got, "hw-b") {
+		t.Fatalf("filterUnreadyHookCandidates kept a padded/upper CLOSED bead: %s", got)
+	}
+	if !strings.Contains(got, "hw-a") {
+		t.Fatalf("filterUnreadyHookCandidates dropped the sibling open bead: %s", got)
+	}
+}
+
+// TestIsClosedHookCandidate exercises the helper directly across the field
+// shapes a work_query row can present.
+func TestIsClosedHookCandidate(t *testing.T) {
+	cases := []struct {
+		name string
+		item map[string]any
+		want bool
+	}{
+		{"closed", map[string]any{"status": "closed"}, true},
+		{"closed-upper-padded", map[string]any{"status": " Closed "}, true},
+		{"open", map[string]any{"status": "open"}, false},
+		{"in_progress", map[string]any{"status": "in_progress"}, false},
+		{"missing-status", map[string]any{"id": "hw-x"}, false},
+		{"non-string-status", map[string]any{"status": 3}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isClosedHookCandidate(tc.item); got != tc.want {
+				t.Fatalf("isClosedHookCandidate(%v) = %v, want %v", tc.item, got, tc.want)
+			}
+		})
+	}
+}

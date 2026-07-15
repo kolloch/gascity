@@ -496,10 +496,13 @@ func workQueryHasReadyWork(output string) bool {
 }
 
 // filterUnreadyHookCandidates strips beads from work_query output that fail
-// bd ready semantics: future defer_until, or any open blocking dep in the
-// row's blocked_by array. The work_query is expected to gate these, but
-// defensive filtering here prevents a single broken query from cascading
-// into agent action on a bead it cannot progress.
+// bd ready semantics: a closed primary status, future defer_until, or any
+// open blocking dep in the row's blocked_by array. The work_query is
+// expected to gate these, but defensive filtering here prevents a single
+// broken query from cascading into agent action on a bead it cannot
+// progress. The closed-status guard specifically defends against Dolt
+// status secondary-index drift, where a stale index can make
+// `bd list --status=open` return a row whose primary status is closed.
 // Pure function over JSON; takes time.Time so tests stay deterministic.
 func filterUnreadyHookCandidates(output string, now time.Time) string {
 	if output == "" {
@@ -520,6 +523,9 @@ func filterUnreadyHookCandidates(output string, now time.Time) string {
 			filtered = append(filtered, item)
 			continue
 		}
+		if isClosedHookCandidate(obj) {
+			continue
+		}
 		if isFutureDeferredHookCandidate(obj, now) {
 			continue
 		}
@@ -533,6 +539,16 @@ func filterUnreadyHookCandidates(output string, now time.Time) string {
 		return output
 	}
 	return string(reencoded)
+}
+
+// isClosedHookCandidate reports whether a work_query row carries a primary
+// status of "closed" (case-insensitive, trimmed). Dolt status secondary-index
+// drift can make a `--status=open` query surface a row whose primary row is
+// already closed; dispatching such a row acts on completed work. This guard
+// drops it defensively.
+func isClosedHookCandidate(item map[string]any) bool {
+	status, ok := item["status"].(string)
+	return ok && strings.EqualFold(strings.TrimSpace(status), "closed")
 }
 
 func isFutureDeferredHookCandidate(item map[string]any, now time.Time) bool {
