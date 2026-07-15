@@ -42,9 +42,25 @@ type Provider struct {
 	dir      string                  // socket/meta file directory
 	procs    map[string]*sessionConn // in-process tracking
 	workDirs map[string]string       // session name → workDir (for CopyTo)
+	ops      providerOps
 }
 
-const socketPathLimit = 100
+// providerOps holds injectable process operations so tests can verify that
+// hostile socket-directory pre-creation fails closed before a child is ever
+// spawned. Production always uses the real (*exec.Cmd).Start.
+type providerOps struct {
+	start func(*exec.Cmd) error
+}
+
+const (
+	socketPathLimit       = 100
+	fallbackSocketDirName = "gascity-subprocess"
+	shortSocketTempRoot   = "/tmp"
+	// nativeSocketPathLimit is the platform's real AF_UNIX sun_path capacity
+	// (107 on Linux, 103 on Darwin). Paths that bind natively must not be
+	// needlessly pushed into the private EUID-scoped fallback.
+	nativeSocketPathLimit = len(syscall.RawSockaddrUnix{}.Path) - 1
+)
 
 // sessionConn tracks a running child process and its control socket.
 type sessionConn struct {
@@ -54,21 +70,36 @@ type sessionConn struct {
 }
 
 // Compile-time check.
-var _ runtime.Provider = (*Provider)(nil)
+var (
+	errPrivateSocketDirValidation                  = errors.New("private socket directory validation failed")
+	_                             runtime.Provider = (*Provider)(nil)
+)
 
 // NewProvider returns a subprocess [Provider] that stores socket files in
 // a default temporary directory. Suitable for production use.
 func NewProvider() *Provider {
 	dir := filepath.Join(os.TempDir(), "gc-subprocess")
 	_ = os.MkdirAll(dir, 0o755)
-	return &Provider{dir: dir, procs: make(map[string]*sessionConn), workDirs: make(map[string]string)}
+	return newProvider(dir)
 }
 
 // NewProviderWithDir returns a subprocess [Provider] that stores socket files
 // in the given directory. Useful for tests that need isolated state.
 func NewProviderWithDir(dir string) *Provider {
 	_ = os.MkdirAll(dir, 0o755)
-	return &Provider{dir: dir, procs: make(map[string]*sessionConn), workDirs: make(map[string]string)}
+	return newProvider(dir)
+}
+
+// newProvider constructs a Provider wired with the real process-start op.
+func newProvider(dir string) *Provider {
+	return &Provider{
+		dir:      dir,
+		procs:    make(map[string]*sessionConn),
+		workDirs: make(map[string]string),
+		ops: providerOps{
+			start: (*exec.Cmd).Start,
+		},
+	}
 }
 
 // Start spawns a child process for the given session name and config.
@@ -78,6 +109,7 @@ func NewProviderWithDir(dir string) *Provider {
 func (p *Provider) Start(_ context.Context, name string, cfg runtime.Config) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	euid := os.Geteuid()
 
 	// Check in-memory tracking first.
 	if existing, ok := p.procs[name]; ok {
@@ -88,7 +120,7 @@ func (p *Provider) Start(_ context.Context, name string, cfg runtime.Config) err
 	}
 
 	// Check socket for cross-process case.
-	if p.socketAlive(name) {
+	if p.socketAliveAt(name, euid) {
 		return fmt.Errorf("%w: session %q", runtime.ErrSessionExists, name)
 	}
 
@@ -142,7 +174,15 @@ func (p *Provider) Start(_ context.Context, name string, cfg runtime.Config) err
 	}
 	cmd.Env = env
 
-	if err := cmd.Start(); err != nil {
+	// Validate immediately before process creation so hostile pre-creation
+	// fails without spawning a child or touching stale socket artifacts.
+	socketDir := p.socketDirForEUID(euid)
+	if err := p.ensureSocketDir(socketDir, euid); err != nil {
+		_ = nullFile.Close()
+		clearWorkDir()
+		return fmt.Errorf("preparing control socket for %q: %w", name, err)
+	}
+	if err := p.ops.start(cmd); err != nil {
 		_ = nullFile.Close()
 		clearWorkDir()
 		return fmt.Errorf("starting session %q: %w", name, err)
@@ -151,7 +191,7 @@ func (p *Provider) Start(_ context.Context, name string, cfg runtime.Config) err
 
 	// Create control socket for cross-process discovery.
 	done := make(chan struct{})
-	lis, err := p.startControlSocket(name, cmd, done)
+	lis, err := p.startControlSocket(name, cmd, done, socketDir, euid)
 	if err != nil {
 		// Socket creation failed — kill the process and bail.
 		_ = cmd.Process.Kill()
@@ -161,8 +201,7 @@ func (p *Provider) Start(_ context.Context, name string, cfg runtime.Config) err
 	}
 	if err := p.persistStartMetadata(name, cfg.Env); err != nil {
 		lis.Close() //nolint:errcheck
-		_ = os.Remove(p.sockPath(name))
-		_ = os.Remove(p.sockNamePath(name))
+		_ = p.removeSocketArtifactsAt(name, socketDir, euid)
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
 		clearWorkDir()
@@ -173,9 +212,8 @@ func (p *Provider) Start(_ context.Context, name string, cfg runtime.Config) err
 		_ = cmd.Wait()
 		// Clean up socket before signaling done so ListRunning
 		// never sees a stale socket after Stop returns.
-		lis.Close()                 //nolint:errcheck
-		os.Remove(p.sockPath(name)) //nolint:errcheck
-		_ = os.Remove(p.sockNamePath(name))
+		lis.Close() //nolint:errcheck
+		_ = p.removeSocketArtifactsAt(name, socketDir, euid)
 		p.clearSessionMeta(name)
 		close(done)
 	}()
@@ -187,6 +225,7 @@ func (p *Provider) Start(_ context.Context, name string, cfg runtime.Config) err
 // Stop terminates the named session. Returns nil if it doesn't exist
 // (idempotent). Sends SIGTERM first, then SIGKILL after a grace period.
 func (p *Provider) Stop(name string) error {
+	euid := os.Geteuid()
 	p.mu.Lock()
 	sc, ok := p.procs[name]
 	if ok {
@@ -203,12 +242,13 @@ func (p *Provider) Stop(name string) error {
 	}
 
 	// Fall back to socket (cross-process case: gc stop after gc start).
-	return p.stopBySocket(name)
+	return p.stopBySocketAt(name, euid)
 }
 
 // Interrupt sends SIGINT to the named session's process.
 // Best-effort: returns nil if the session doesn't exist.
 func (p *Provider) Interrupt(name string) error {
+	euid := os.Geteuid()
 	p.mu.Lock()
 	sc, ok := p.procs[name]
 	p.mu.Unlock()
@@ -216,18 +256,18 @@ func (p *Provider) Interrupt(name string) error {
 		return runtime.SignalProcessGroup(sc.cmd, syscall.SIGINT)
 	}
 
-	// Fall back to socket (cross-process case).
-	// Swallow connection errors — if the socket doesn't exist the session
-	// is dead, which is the same as "interrupt succeeded" (idempotent).
-	err := p.sendSocketCommand(name, "interrupt", 2*time.Second)
-	if err != nil {
-		return nil // session not running — best-effort
+	// Fall back to socket (cross-process case). A missing socket is the same
+	// as "interrupt succeeded"; validation failures must remain visible.
+	err := p.sendSocketCommandAt(name, "interrupt", 2*time.Second, euid)
+	if errors.Is(err, errPrivateSocketDirValidation) {
+		return err
 	}
 	return nil
 }
 
 // IsRunning reports whether the named session has a live process.
 func (p *Provider) IsRunning(name string) bool {
+	euid := os.Geteuid()
 	p.mu.Lock()
 	sc, ok := p.procs[name]
 	p.mu.Unlock()
@@ -237,7 +277,7 @@ func (p *Provider) IsRunning(name string) bool {
 	}
 
 	// Fall back to socket liveness check.
-	return p.socketAlive(name)
+	return p.socketAliveAt(name, euid)
 }
 
 // IsAttached always returns false — subprocess has no terminal concept.
@@ -354,13 +394,20 @@ func (p *Provider) CopyTo(name, src, relDst string) error {
 // ListRunning returns the names of all running sessions whose names
 // match the given prefix, discovered via socket files.
 func (p *Provider) ListRunning(prefix string) ([]string, error) {
+	euid := os.Geteuid()
 	dirs := []string{p.dir}
-	if fallback := p.fallbackDir(); fallback != p.dir {
+	if fallback := p.fallbackDirForEUID(euid); fallback != p.dir {
 		dirs = append(dirs, fallback)
 	}
 	seen := make(map[string]bool)
 	var names []string
 	for _, dir := range dirs {
+		if err := p.validateSocketDir(dir, euid); err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return nil, err
+		}
 		entries, err := os.ReadDir(dir)
 		if err != nil {
 			if os.IsNotExist(err) {
@@ -377,7 +424,7 @@ func (p *Provider) ListRunning(prefix string) ([]string, error) {
 			if !strings.HasPrefix(sn, prefix) || seen[sn] {
 				continue
 			}
-			if p.socketAlive(sn) {
+			if p.socketAliveAt(sn, euid) {
 				seen[sn] = true
 				names = append(names, sn)
 			}
@@ -421,16 +468,113 @@ func (p *Provider) sockKey(name string) string {
 }
 
 func (p *Provider) fallbackDir() string {
+	return p.fallbackDirForEUID(os.Geteuid())
+}
+
+// fallbackDirForEUID resolves the overlong-path socket directory. The historical
+// shared TMPDIR location is preserved as long as its socket path binds natively;
+// genuinely unbindable paths relocate to a private EUID-scoped tree.
+func (p *Provider) fallbackDirForEUID(euid int) string {
+	legacy := filepath.Join(os.TempDir(), fallbackSocketDirName, p.fallbackLeaf())
+	probe := filepath.Join(legacy, p.sockKey("probe")+".sock")
+	if len(probe) <= nativeSocketPathLimit {
+		return legacy
+	}
+	return p.privateFallbackDir(euid)
+}
+
+// fallbackLeaf is the per-provider-dir hashed leaf name shared by both the legacy
+// and private fallback locations.
+func (p *Provider) fallbackLeaf() string {
 	sum := sha256.Sum256([]byte(filepath.Clean(p.dir)))
-	return filepath.Join(os.TempDir(), "gascity-subprocess", hex.EncodeToString(sum[:8]))
+	return hex.EncodeToString(sum[:8])
+}
+
+// privateFallbackRoot is the per-EUID private root for relocated sockets. Being
+// EUID-scoped keeps another user's tree from colliding with ours.
+func privateFallbackRoot(euid int) string {
+	return filepath.Join(shortSocketTempRoot, fmt.Sprintf("%s-%d", fallbackSocketDirName, euid))
+}
+
+func (p *Provider) privateFallbackDir(euid int) string {
+	return filepath.Join(privateFallbackRoot(euid), p.fallbackLeaf())
+}
+
+func (p *Provider) isPrivateFallbackDir(dir string, euid int) bool {
+	return dir == p.privateFallbackDir(euid)
+}
+
+// validatePrivateSocketDir fails closed unless path is a real directory owned by
+// euid with exactly 0700 permissions and no special mode bits. Uses Lstat so a
+// hostile symlink is rejected rather than followed.
+func validatePrivateSocketDir(path string, euid int) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("private socket directory %q is not a directory", path)
+	}
+	if got := info.Mode().Perm(); got != 0o700 {
+		return fmt.Errorf("private socket directory %q has mode %04o, want 0700", path, got)
+	}
+	if special := info.Mode() & (os.ModeSetuid | os.ModeSetgid | os.ModeSticky); special != 0 {
+		return fmt.Errorf("private socket directory %q has special mode bits %v", path, special)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Errorf("private socket directory %q has unsupported ownership metadata", path)
+	}
+	if got, want := stat.Uid, uint32(euid); got != want {
+		return fmt.Errorf("private socket directory %q is owned by uid %d, want %d", path, got, want)
+	}
+	return nil
+}
+
+// ensurePrivateSocketDir creates path as a 0700 directory (idempotent) and then
+// validates it, so a pre-created hostile directory fails closed.
+func ensurePrivateSocketDir(path string, euid int) error {
+	if err := os.Mkdir(path, 0o700); err != nil && !os.IsExist(err) {
+		return fmt.Errorf("creating private socket directory %q: %w", path, err)
+	}
+	return validatePrivateSocketDir(path, euid)
+}
+
+// ensureSocketDir prepares dir for socket binding. Caller-owned and legacy TMPDIR
+// directories keep their historical 0755 creation; the private fallback root and
+// leaf are created and validated as EUID-owned 0700 directories.
+func (p *Provider) ensureSocketDir(dir string, euid int) error {
+	if !p.isPrivateFallbackDir(dir, euid) {
+		return os.MkdirAll(dir, 0o755)
+	}
+	if err := ensurePrivateSocketDir(filepath.Dir(dir), euid); err != nil {
+		return err
+	}
+	return ensurePrivateSocketDir(dir, euid)
+}
+
+// validateSocketDir re-checks the private fallback root and leaf before any read
+// or control operation. Non-private directories need no validation.
+func (p *Provider) validateSocketDir(dir string, euid int) error {
+	if !p.isPrivateFallbackDir(dir, euid) {
+		return nil
+	}
+	if err := validatePrivateSocketDir(filepath.Dir(dir), euid); err != nil {
+		return err
+	}
+	return validatePrivateSocketDir(dir, euid)
 }
 
 func (p *Provider) socketDir() string {
+	return p.socketDirForEUID(os.Geteuid())
+}
+
+func (p *Provider) socketDirForEUID(euid int) string {
 	candidate := filepath.Join(p.dir, p.sockKey("probe")+".sock")
 	if len(candidate) <= socketPathLimit {
 		return p.dir
 	}
-	return p.fallbackDir()
+	return p.fallbackDirForEUID(euid)
 }
 
 func (p *Provider) sockPath(name string) string {
@@ -439,6 +583,22 @@ func (p *Provider) sockPath(name string) string {
 
 func (p *Provider) sockNamePath(name string) string {
 	return filepath.Join(p.socketDir(), p.sockKey(name)+".name")
+}
+
+// removeSocketArtifactsAt removes a session's socket and name files from dir,
+// but only after validating a private fallback dir so we never unlink through a
+// hostile symlink. A missing directory is treated as already clean.
+func (p *Provider) removeSocketArtifactsAt(name, dir string, euid int) error {
+	if err := p.validateSocketDir(dir, euid); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	key := p.sockKey(name)
+	_ = os.Remove(filepath.Join(dir, key+".sock"))
+	_ = os.Remove(filepath.Join(dir, key+".name"))
+	return nil
 }
 
 func (p *Provider) socketNameForEntry(dir, key string) string {
@@ -459,12 +619,13 @@ func (p *Provider) socketNameForEntry(dir, key string) string {
 //   - "interrupt" — SIGINT to the whole session process group; replies "ok"
 //   - "ping" — replies "ok"
 //   - "pid" — replies with the PID (diagnostics)
-func (p *Provider) startControlSocket(name string, cmd *exec.Cmd, done <-chan struct{}) (net.Listener, error) {
-	sp := p.sockPath(name)
-	namePath := p.sockNamePath(name)
-	if err := os.MkdirAll(filepath.Dir(sp), 0o755); err != nil {
+func (p *Provider) startControlSocket(name string, cmd *exec.Cmd, done <-chan struct{}, dir string, euid int) (net.Listener, error) {
+	if err := p.ensureSocketDir(dir, euid); err != nil {
 		return nil, err
 	}
+	key := p.sockKey(name)
+	sp := filepath.Join(dir, key+".sock")
+	namePath := filepath.Join(dir, key+".name")
 	// Remove stale socket from a previous crash.
 	os.Remove(sp) //nolint:errcheck
 	_ = os.Remove(namePath)
@@ -473,7 +634,7 @@ func (p *Provider) startControlSocket(name string, cmd *exec.Cmd, done <-chan st
 	}
 	lis, err := net.Listen("unix", sp)
 	if err != nil {
-		os.Remove(namePath) //nolint:errcheck
+		_ = os.Remove(namePath)
 		return nil, err
 	}
 	go func() {
@@ -512,17 +673,45 @@ func handleSessionConn(conn net.Conn, cmd *exec.Cmd, done <-chan struct{}) {
 
 // socketAlive checks if a session is alive by pinging its control socket.
 func (p *Provider) socketAlive(name string) bool {
-	return p.sendSocketCommand(name, "ping", 500*time.Millisecond) == nil
+	return p.socketAliveAt(name, os.Geteuid())
+}
+
+func (p *Provider) socketAliveAt(name string, euid int) bool {
+	return p.sendSocketCommandAt(name, "ping", 500*time.Millisecond, euid) == nil
 }
 
 // sendSocketCommand connects to the session's control socket, sends a
 // command, and waits for "ok". Returns nil on success.
 func (p *Provider) sendSocketCommand(name, command string, timeout time.Duration) error {
+	return p.sendSocketCommandAt(name, command, timeout, os.Geteuid())
+}
+
+// sendSocketCommandAt tries the canonical hashed socket first, then the legacy
+// name-based socket. The canonical directory is validated up front: a private
+// fallback that fails validation returns errPrivateSocketDirValidation (a
+// hostile hijack must be visible), while a merely-absent directory drops the
+// canonical candidate and still allows the addressable legacy socket to answer.
+func (p *Provider) sendSocketCommandAt(name, command string, timeout time.Duration, euid int) error {
+	socketDir := p.socketDirForEUID(euid)
 	var (
 		lastErr            error
 		firstActionableErr error
 	)
-	for _, sp := range []string{p.sockPath(name), p.legacySockPath(name)} {
+	canonicalAvailable := true
+	if err := p.validateSocketDir(socketDir, euid); err != nil {
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("%w: %w", errPrivateSocketDirValidation, err)
+		}
+		canonicalAvailable = false
+		lastErr = err
+	}
+	canonicalPath := filepath.Join(socketDir, p.sockKey(name)+".sock")
+	paths := make([]string, 0, 2)
+	if canonicalAvailable {
+		paths = append(paths, canonicalPath)
+	}
+	paths = append(paths, p.legacySockPath(name))
+	for _, sp := range paths {
 		err := func(sockPath string) error {
 			conn, err := net.DialTimeout("unix", sockPath, timeout)
 			if err != nil {
@@ -558,14 +747,16 @@ func (p *Provider) sendSocketCommand(name, command string, timeout time.Duration
 
 // stopBySocket connects to a session's control socket and asks it to stop.
 func (p *Provider) stopBySocket(name string) error {
-	err := p.sendSocketCommand(name, "stop", 7*time.Second)
+	return p.stopBySocketAt(name, os.Geteuid())
+}
+
+func (p *Provider) stopBySocketAt(name string, euid int) error {
+	err := p.sendSocketCommandAt(name, "stop", 7*time.Second, euid)
 	if err != nil {
 		if isUnavailableSocketError(err) {
 			// Socket doesn't exist or can't connect — session is dead (idempotent).
 			// Clean up stale socket file if it exists.
-			os.Remove(p.sockPath(name)) //nolint:errcheck
-			_ = os.Remove(p.sockNamePath(name))
-			return nil
+			return p.removeSocketArtifactsAt(name, p.socketDirForEUID(euid), euid)
 		}
 		return err
 	}
