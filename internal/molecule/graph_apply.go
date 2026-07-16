@@ -236,9 +236,24 @@ func buildRecipeApplyPlan(recipe *formula.Recipe, opts Options) (*beads.GraphApp
 	// bd delete --cascade from the root still discovers all workflow beads
 	// through the dependency graph without making the workflow root a
 	// readiness blocker for finalizers and teardown work.
+	//
+	// Exception: a single-work-step workflow's only two controller-managed
+	// beads are the root and the workflow-finalize. addWorkflowRootDeps
+	// already wires root--blocks-->finalize, so adding finalize--tracks-->root
+	// here would close a 2-cycle that wedges the root OPEN forever — the
+	// finalize bead never becomes bd-ready and the drain-at-zero dispatcher
+	// scales to zero with the real work already shipped (ga-23md, upstream
+	// #4125). Skip only the finalize tracks edge in that case; the work step
+	// keeps its tracks edge and the root--blocks-->finalize edge still keeps
+	// finalize discoverable for cascade deletion. Multi-step workflows are
+	// unaffected.
 	if graphWorkflow && rootKey != "" {
+		singleStep := graphWorkflowIsSingleStep(plan.Nodes, rootKey)
 		for _, node := range plan.Nodes {
 			if node.Key == rootKey {
+				continue
+			}
+			if singleStep && node.Metadata["gc.kind"] == "workflow-finalize" {
 				continue
 			}
 			plan.Edges = append(plan.Edges, beads.GraphApplyEdge{
@@ -250,6 +265,47 @@ func buildRecipeApplyPlan(recipe *formula.Recipe, opts Options) (*beads.GraphApp
 	}
 
 	return plan, graphWorkflow, rootKey, nil
+}
+
+// graphWorkflowIsSingleStep reports whether the compiled graph.v2 workflow
+// described by nodes contains exactly one work step — the condition under which
+// buildRecipeApplyPlan must drop the finalize->root tracks edge to break the
+// deadlocking 2-cycle (ga-23md, upstream #4125).
+//
+// "Work steps" are the worker-claimable beads whose completion ships the
+// deliverable. After graph+retry+scope expansion these carry an EMPTY gc.kind
+// (plain body steps and v2 attempt beads — verified: a bare single-step formula
+// compiles to root/work(empty)/workflow-finalize) or an explicit run/retry-run
+// attempt kind. Everything else is scaffolding the controller drives: the
+// workflow root and its wisp variant, the finalize latch, spec sidecars, scope
+// latches and their checks, fanout expanders, retry managers and their eval
+// beads, the Ralph loop control, and teardown. A run/check (or attempt/eval)
+// pair therefore counts as a single work step — only the primary attempt
+// counts; the eval/check half is scaffolding.
+//
+// The scaffolding set mirrors the control vocabulary of
+// graphroute.IsControlDispatcherKind + graphroute.IsWorkflowTopologyKind (plus
+// cleanup teardown and the wisp root). It is duplicated here rather than
+// imported to keep the molecule layer off graphroute's session/config
+// dependency tree — the same reason dispatch.isAttemptControlKind keeps its own
+// copy. Counts verified against real compiled formulas: mol-scoped-work (6),
+// mol-review-quorum (3), mol-digest-generate (3), single-step (1).
+func graphWorkflowIsSingleStep(nodes []beads.GraphApplyNode, rootKey string) bool {
+	work := 0
+	for _, node := range nodes {
+		if node.Key == rootKey {
+			continue
+		}
+		switch node.Metadata["gc.kind"] {
+		case "workflow", "wisp", "workflow-finalize", "spec",
+			"scope", "scope-check", "fanout", "check",
+			"retry", "retry-eval", "ralph", "cleanup":
+			// scaffolding / control / topology / teardown — not a work step
+		default:
+			work++
+		}
+	}
+	return work == 1
 }
 
 func deferGraphNodeRouting(node *beads.GraphApplyNode) {

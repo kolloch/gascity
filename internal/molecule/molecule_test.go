@@ -597,6 +597,176 @@ func TestBuildRecipeApplyPlan_GraphWorkflowOwnershipUsesTracks(t *testing.T) {
 	}
 }
 
+func TestBuildRecipeApplyPlan_SingleStepWorkflowSkipsFinalizeTracksEdge(t *testing.T) {
+	// Regression for ga-23md (upstream #4125): a single-work-step v2 workflow
+	// (root + one work step + finalize) must NOT emit the finalize->root tracks
+	// edge. That edge plus the root->finalize blocks edge would close a 2-cycle
+	// that wedges the root OPEN forever — the finalize bead never becomes
+	// bd-ready, so the drain-at-zero dispatcher scales to zero with the real
+	// work already shipped. The work step keeps its tracks edge; the root->
+	// finalize blocks edge is untouched and still makes finalize discoverable
+	// for cascade deletion.
+	//
+	// The work step carries an EMPTY gc.kind on purpose: that is what a plain
+	// graph.v2 body step (and a v2 retry attempt bead) compiles to — the
+	// worker-claimable node the single-step count must recognize. See
+	// graphWorkflowIsSingleStep and the compile-driven test below.
+	recipe := &formula.Recipe{
+		Name: "wf",
+		Steps: []formula.RecipeStep{
+			{ID: "wf", Title: "Workflow", Type: "task", IsRoot: true, Metadata: map[string]string{"gc.kind": "workflow"}},
+			{ID: "wf.work", Title: "Work", Type: "task", Metadata: map[string]string{}},
+			{ID: "wf.workflow-finalize", Title: "Finalize", Type: "task", Metadata: map[string]string{"gc.kind": "workflow-finalize"}},
+		},
+		Deps: []formula.RecipeDep{
+			{StepID: "wf", DependsOnID: "wf.workflow-finalize", Type: "blocks"},
+			{StepID: "wf.workflow-finalize", DependsOnID: "wf.work", Type: "blocks"},
+		},
+	}
+
+	plan, graphWorkflow, rootKey, err := buildRecipeApplyPlan(recipe, Options{})
+	if err != nil {
+		t.Fatalf("buildRecipeApplyPlan: %v", err)
+	}
+	if !graphWorkflow {
+		t.Fatal("graphWorkflow = false, want true")
+	}
+	if rootKey != "wf" {
+		t.Fatalf("rootKey = %q, want wf", rootKey)
+	}
+
+	var rootBlocksFinalize bool
+	var workTracksRoot bool
+	var finalizeTracksRoot bool
+	for _, edge := range plan.Edges {
+		if edge.FromKey == "wf" && edge.ToKey == "wf.workflow-finalize" && edge.Type == "blocks" {
+			rootBlocksFinalize = true
+		}
+		if edge.FromKey == "wf.work" && edge.ToKey == "wf" && edge.Type == "tracks" {
+			workTracksRoot = true
+		}
+		if edge.FromKey == "wf.workflow-finalize" && edge.ToKey == "wf" && edge.Type == "tracks" {
+			finalizeTracksRoot = true
+		}
+	}
+	if !rootBlocksFinalize {
+		t.Fatal("missing root -> workflow-finalize blocks edge")
+	}
+	if !workTracksRoot {
+		t.Fatal("missing work -> root tracks ownership edge")
+	}
+	if finalizeTracksRoot {
+		t.Fatal("single-step workflow must NOT emit finalize -> root tracks edge (deadlock 2-cycle)")
+	}
+}
+
+func TestBuildRecipeApplyPlan_MultiStepWorkflowKeepsFinalizeTracksEdge(t *testing.T) {
+	// Complement to the single-step regression (ga-23md / upstream #4125): a
+	// workflow with more than one work step keeps the finalize->root tracks
+	// edge for cascade-delete discovery. Only the single-work-step case drops
+	// it. Work steps use empty gc.kind, matching compiled graph.v2 body beads.
+	recipe := &formula.Recipe{
+		Name: "wf",
+		Steps: []formula.RecipeStep{
+			{ID: "wf", Title: "Workflow", Type: "task", IsRoot: true, Metadata: map[string]string{"gc.kind": "workflow"}},
+			{ID: "wf.work1", Title: "Work 1", Type: "task", Metadata: map[string]string{}},
+			{ID: "wf.work2", Title: "Work 2", Type: "task", Metadata: map[string]string{}},
+			{ID: "wf.workflow-finalize", Title: "Finalize", Type: "task", Metadata: map[string]string{"gc.kind": "workflow-finalize"}},
+		},
+		Deps: []formula.RecipeDep{
+			{StepID: "wf", DependsOnID: "wf.workflow-finalize", Type: "blocks"},
+			{StepID: "wf.workflow-finalize", DependsOnID: "wf.work1", Type: "blocks"},
+			{StepID: "wf.workflow-finalize", DependsOnID: "wf.work2", Type: "blocks"},
+		},
+	}
+
+	plan, _, _, err := buildRecipeApplyPlan(recipe, Options{})
+	if err != nil {
+		t.Fatalf("buildRecipeApplyPlan: %v", err)
+	}
+
+	var finalizeTracksRoot bool
+	for _, edge := range plan.Edges {
+		if edge.FromKey == "wf.workflow-finalize" && edge.ToKey == "wf" && edge.Type == "tracks" {
+			finalizeTracksRoot = true
+		}
+	}
+	if !finalizeTracksRoot {
+		t.Fatal("multi-step workflow must retain finalize -> root tracks edge")
+	}
+}
+
+func TestBuildRecipeApplyPlan_SingleStepWorkflowFromCompile(t *testing.T) {
+	// End-to-end guard for ga-23md (upstream #4125): compile a real single-step
+	// graph.v2 formula and assert the plan carries no finalize->root tracks
+	// edge, while the multi-step sibling still does. This exercises the whole
+	// compile -> buildRecipeApplyPlan pipeline, so it catches any regression in
+	// how graphWorkflowIsSingleStep reads compiled node kinds (the work bead
+	// ends up with an empty gc.kind, which the count must treat as work).
+	formulatest.EnableV2ForTest(t)
+
+	single := `
+formula = "oneshot"
+description = "Single work-step graph.v2 workflow."
+contract = "graph.v2"
+
+[[steps]]
+id = "do-the-thing"
+title = "Do the thing"
+prompt = "Do it."
+`
+	multi := `
+formula = "twoshot"
+description = "Two work-step graph.v2 workflow."
+contract = "graph.v2"
+
+[[steps]]
+id = "first"
+title = "First"
+prompt = "Do the first thing."
+
+[[steps]]
+id = "second"
+title = "Second"
+needs = ["first"]
+prompt = "Do the second thing."
+`
+
+	finalizeTracks := func(t *testing.T, name, toml string) bool {
+		t.Helper()
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, name+".toml"), []byte(toml), 0o644); err != nil {
+			t.Fatalf("writing formula: %v", err)
+		}
+		recipe, err := formula.Compile(context.Background(), name, []string{dir}, nil)
+		if err != nil {
+			t.Fatalf("Compile(%s): %v", name, err)
+		}
+		plan, graphWorkflow, rootKey, err := buildRecipeApplyPlan(recipe, Options{})
+		if err != nil {
+			t.Fatalf("buildRecipeApplyPlan(%s): %v", name, err)
+		}
+		if !graphWorkflow {
+			t.Fatalf("%s: graphWorkflow = false, want true", name)
+		}
+		finalizeKey := rootKey + ".workflow-finalize"
+		var found bool
+		for _, edge := range plan.Edges {
+			if edge.FromKey == finalizeKey && edge.ToKey == rootKey && edge.Type == "tracks" {
+				found = true
+			}
+		}
+		return found
+	}
+
+	if finalizeTracks(t, "oneshot", single) {
+		t.Fatal("single-step compiled workflow must NOT emit finalize -> root tracks edge")
+	}
+	if !finalizeTracks(t, "twoshot", multi) {
+		t.Fatal("multi-step compiled workflow must retain finalize -> root tracks edge")
+	}
+}
+
 func TestInstantiateGraphApplyPreservesStepMetadata(t *testing.T) {
 	store := &graphApplySpyStore{MemStore: beads.NewMemStore()}
 	prev := IsGraphApplyEnabled()
