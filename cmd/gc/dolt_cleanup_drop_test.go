@@ -591,3 +591,23 @@ func TestProbeLiveSessions_RemovesFromToDrop(t *testing.T) {
 		t.Errorf("DropDatabase called with %v, want [testdb_b]", client.dropped)
 	}
 }
+
+// TestResolveCleanupDoltUserHonorsGCDoltUserEnv verifies the DROP-stage user
+// resolver honors GC_DOLT_USER, so cleanup authenticates as the configured
+// user against external non-root Dolt endpoints instead of hardcoding "root".
+func TestResolveCleanupDoltUserHonorsGCDoltUserEnv(t *testing.T) {
+	t.Setenv("GC_DOLT_USER", "cleanup_bot")
+	if got := resolveCleanupDoltUser(t.TempDir(), "127.0.0.1", "3306"); got != "cleanup_bot" {
+		t.Fatalf("resolveCleanupDoltUser = %q, want %q", got, "cleanup_bot")
+	}
+}
+
+// TestResolveCleanupDoltUserDefaultsToRootWhenUnset verifies the resolver
+// falls back to "root" when GC_DOLT_USER is empty — the historical default and
+// the correct value for a locally-managed Dolt server.
+func TestResolveCleanupDoltUserDefaultsToRootWhenUnset(t *testing.T) {
+	t.Setenv("GC_DOLT_USER", "")
+	if got := resolveCleanupDoltUser(t.TempDir(), "127.0.0.1", "3306"); got != "root" {
+		t.Fatalf("resolveCleanupDoltUser = %q, want %q", got, "root")
+	}
+}

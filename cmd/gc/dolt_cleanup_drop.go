@@ -4,8 +4,11 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
+
+	"github.com/gastownhall/gascity/internal/doltauth"
 )
 
 // CleanupDoltClient is the SQL surface the cleanup engine needs. The
@@ -176,13 +179,32 @@ type sqlCleanupDoltClient struct {
 }
 
 // newSQLCleanupDoltClient opens a connection to the resolved Dolt server.
+// The DROP-stage user is resolved from the environment (GC_DOLT_USER),
+// falling back to "root", so cleanup authenticates correctly against external
+// non-root Dolt endpoints instead of always connecting as "root".
 // Caller must Close() when done.
-func newSQLCleanupDoltClient(host, port string) (CleanupDoltClient, error) {
-	db, err := managedDoltOpenDB(host, port, "root")
+func newSQLCleanupDoltClient(cityPath, host, port string) (CleanupDoltClient, error) {
+	user := resolveCleanupDoltUser(cityPath, host, port)
+	db, err := managedDoltOpenDB(host, port, user)
 	if err != nil {
 		return nil, fmt.Errorf("open dolt connection: %w", err)
 	}
 	return &sqlCleanupDoltClient{db: db}, nil
+}
+
+// resolveCleanupDoltUser resolves the Dolt username the cleanup DROP stage
+// authenticates as. GC_DOLT_USER wins (via the canonical doltauth resolver);
+// absent that, it falls back to "root" — the historical default and the
+// correct value for a locally-managed Dolt server.
+//
+// The DROP stage is server-wide (SHOW DATABASES spans every store), so it
+// authenticates against the city's root store scope; cityPath is that scope
+// root, mirroring internal/api/convoy_sql.go's resolveDoltConnection. Only the
+// user is taken from doltauth here — password resolution stays with
+// managedDoltOpenDB, which reads GC_DOLT_PASSWORD directly.
+func resolveCleanupDoltUser(cityPath, host, port string) string {
+	portNum, _ := strconv.Atoi(strings.TrimSpace(port))
+	return doltauth.Resolve(cityPath, "root", host, portNum).User
 }
 
 func (c *sqlCleanupDoltClient) ListDatabases(ctx context.Context) ([]string, error) {
