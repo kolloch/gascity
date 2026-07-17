@@ -66,6 +66,30 @@ Do not run `bd close`, `gc bd close`, or set `--status=closed`. Only the
 Refinery closes beads after verifying the merge. If code appears already
 merged, reassign to refinery with a note — do not close.
 
+## CRITICAL: Releasing Work Back to the Pool
+
+If you need to return a claimed bead to the polecat pool (rather than
+escalate, submit, or defer), **unset the assignee** — do NOT reassign to
+the Witness, Refinery, or any other singleton agent.
+
+```bash
+gc bd update <issue> --status=open --assignee="" \
+  --set-metadata gc.routed_to="${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}polecat"
+```
+
+The pool spawn query is `bd ready --metadata-field
+gc.routed_to=<rig>/{{ .BindingPrefix }}polecat --unassigned` — it ONLY
+matches beads with `assignee=NULL` (and the polecat routing preserved). If
+you set `assignee=<rig>/{{ .BindingPrefix }}witness` (or refinery, or
+anything other than empty), the bead is invisible to the spawn query and
+stalls in the queue until a human notices.
+
+Before releasing, ask whether you actually should. Most "I can't do this"
+situations are **escalations** (mail Witness) or **deferrals** (real
+blocker — set `bd defer`), not silent releases. Release-to-pool is for
+cases where another polecat has a genuine chance and you haven't done
+any work that needs preserving.
+
 ## CRITICAL: Directory Discipline
 
 Your branch-setup step creates a git worktree and records it in `metadata.work_dir`

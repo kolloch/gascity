@@ -808,6 +808,44 @@ func TestEscalationToMayorFirstForAmbiguity(t *testing.T) {
 	)
 }
 
+// TestPolecatPromptDocumentsReleaseToPool guards the release-to-pool
+// convention added after pe-6mhaz (witness escalation pe-wisp-n2zmk finding
+// #3, 2026-05-21): a polecat tried to "reassign to pool" by setting
+// assignee=zack/gastown.witness — making the bead invisible to the polecat
+// pool spawn query, which requires assignee=NULL. The prompt and the
+// formula must both spell out the canonical form (`--assignee=""` UNSET)
+// and the failure mode (singleton-assigned beads hide from
+// `bd ready --metadata-field gc.routed_to=<rig>/<polecat> --unassigned`).
+func TestPolecatPromptDocumentsReleaseToPool(t *testing.T) {
+	dir := exampleDir()
+
+	promptPath := filepath.Join(dir, "packs", "gastown", "agents", "polecat", "prompt.template.md")
+	promptData, err := os.ReadFile(promptPath)
+	if err != nil {
+		t.Fatalf("reading polecat prompt: %v", err)
+	}
+	assertContainsInOrder(t, string(promptData),
+		"## CRITICAL: Releasing Work Back to the Pool",
+		"**unset the assignee**",
+		"do NOT reassign to",
+		`gc bd update <issue> --status=open --assignee=""`,
+		`--set-metadata gc.routed_to="${GC_RIG:+$GC_RIG/}{{ .BindingPrefix }}polecat"`,
+		"invisible to the spawn query",
+	)
+
+	formulaPath := filepath.Join(dir, "packs", "gastown", "formulas", "mol-polecat-work.toml")
+	formulaData, err := os.ReadFile(formulaPath)
+	if err != nil {
+		t.Fatalf("reading polecat formula: %v", err)
+	}
+	assertContainsInOrder(t, string(formulaData),
+		"Need to release bead back to pool",
+		`gc bd update <id> --status=open --assignee="" --set-metadata gc.routed_to="${GC_RIG:+$GC_RIG/}{{binding_prefix}}polecat"`,
+		"UNSET assignee",
+		"DO NOT assign to Witness, Refinery, or any singleton",
+	)
+}
+
 func TestRefineryFormulaRespectsExistingPRMetadata(t *testing.T) {
 	dir := exampleDir()
 	path := filepath.Join(dir, "packs", "gastown", "formulas", "mol-refinery-patrol.toml")

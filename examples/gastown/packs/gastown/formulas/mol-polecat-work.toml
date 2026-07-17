@@ -35,7 +35,8 @@ refinery. Resume the existing branch — don't redo all the work.
 | Blocked on external | Mail Witness, mark yourself stuck |
 | Context filling | `gc runtime request-restart` (blocks until controller kills you) |
 | Unsure what to do | Mail Witness, don't guess |
-| Decomposition / ambiguity / scope-decision doubt | Mail Mayor (`gc mail send mayor/ -s "AMBIGUITY: ..."`). NEVER add the `needs:human` label yourself — that label is mayor-gated. The mayor reviews and applies the label only if mayor agrees the operator must decide. |"""
+| Decomposition / ambiguity / scope-decision doubt | Mail Mayor (`gc mail send mayor/ -s "AMBIGUITY: ..."`). NEVER add the `needs:human` label yourself — that label is mayor-gated. The mayor reviews and applies the label only if mayor agrees the operator must decide. |
+| Need to release bead back to pool | `gc bd update <id> --status=open --assignee="" --set-metadata gc.routed_to="${GC_RIG:+$GC_RIG/}{{binding_prefix}}polecat"` — UNSET assignee. DO NOT assign to Witness, Refinery, or any singleton — that hides the bead from the pool spawn query (`bd ready --metadata-field gc.routed_to=<rig>/{{binding_prefix}}polecat --unassigned`) and the work stalls. |"""
 formula = "mol-polecat-work"
 extends = ["mol-polecat-base"]
 version = 10
