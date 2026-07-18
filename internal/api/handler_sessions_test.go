@@ -5601,14 +5601,77 @@ func TestHandleSessionMessageRejectsClosedNamedSession(t *testing.T) {
 	req := newPostRequest(cityURL(fs, "/session/sky/messages"), strings.NewReader(`{"message":"hello"}`))
 	h.ServeHTTP(rec, req)
 
-	if rec.Code != http.StatusAccepted {
-		t.Fatalf("message status = %d, want %d; body: %s", rec.Code, http.StatusAccepted, rec.Body.String())
+	// A closed session is not deliverable. The message endpoint now gates
+	// deliverability before the 202-accept, so this is rejected synchronously
+	// (404) instead of accepted and then failed in the post-accept goroutine.
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("message status = %d, want %d; body: %s", rec.Code, http.StatusNotFound, rec.Body.String())
 	}
+}
 
-	accepted := decodeAsyncAccepted(t, rec.Body)
-	_, failure := waitForSessionMessageResult(t, fs.eventProv, accepted.RequestID)
-	if failure == nil {
-		t.Fatalf("expected session message to fail for closed session, got success")
+func TestHandleSessionMessageSubmitGateDeliverability(t *testing.T) {
+	for _, ep := range []struct {
+		name string
+		path string
+	}{
+		{"messages", "/messages"},
+		{"submit", "/submit"},
+	} {
+		t.Run(ep.name, func(t *testing.T) {
+			fs := newSessionFakeState(t)
+			srv := New(fs)
+			h := newTestCityHandlerWith(t, fs, srv)
+
+			// Nonexistent target: gated before the 202-accept and rejected
+			// synchronously (404) instead of black-holing in the delivery
+			// goroutine.
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, newPostRequest(cityURL(fs, "/session/ghost-session"+ep.path), strings.NewReader(`{"message":"hello"}`)))
+			if rec.Code != http.StatusNotFound {
+				t.Fatalf("%s nonexistent target status = %d, want %d; body: %s", ep.name, rec.Code, http.StatusNotFound, rec.Body.String())
+			}
+
+			// A live session is deliverable and still returns 202-accepted.
+			info := createTestSession(t, fs.cityBeadStore, fs.sp, "Live")
+			rec = httptest.NewRecorder()
+			h.ServeHTTP(rec, newPostRequest(cityURL(fs, "/session/")+info.ID+ep.path, strings.NewReader(`{"message":"hello"}`)))
+			if rec.Code != http.StatusAccepted {
+				t.Fatalf("%s live target status = %d, want %d; body: %s", ep.name, rec.Code, http.StatusAccepted, rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestHandleSessionMessageSubmitRejectAmbiguousTarget(t *testing.T) {
+	for _, ep := range []struct {
+		name string
+		path string
+	}{
+		{"messages", "/messages"},
+		{"submit", "/submit"},
+	} {
+		t.Run(ep.name, func(t *testing.T) {
+			fs := newSessionFakeState(t)
+			// A bare name matching configured named sessions in two rigs is
+			// ambiguous: deliverability gating surfaces it as 409 before the
+			// 202-accept rather than accepting then failing asynchronously.
+			fs.cfg.Agents = []config.Agent{
+				{Name: "worker", Dir: "rig-a", Provider: "test-agent"},
+				{Name: "worker", Dir: "rig-b", Provider: "test-agent"},
+			}
+			fs.cfg.NamedSessions = []config.NamedSession{
+				{Template: "worker", Dir: "rig-a"},
+				{Template: "worker", Dir: "rig-b"},
+			}
+			srv := New(fs)
+			h := newTestCityHandlerWith(t, fs, srv)
+
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, newPostRequest(cityURL(fs, "/session/worker"+ep.path), strings.NewReader(`{"message":"hello"}`)))
+			if rec.Code != http.StatusConflict {
+				t.Fatalf("%s ambiguous target status = %d, want %d; body: %s", ep.name, rec.Code, http.StatusConflict, rec.Body.String())
+			}
+		})
 	}
 }
 

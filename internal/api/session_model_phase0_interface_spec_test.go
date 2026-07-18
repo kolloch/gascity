@@ -66,7 +66,9 @@ func TestPhase0APISessionTargetingSurfaces_RejectTemplateFactoryTargets(t *testi
 		},
 	}
 
-	asyncOps := map[string]bool{"POST /messages": true, "POST /submit": true}
+	// Async message/submit now gate deliverability before the 202-accept, so
+	// a template:factory target is rejected synchronously (4xx) just like the
+	// synchronous close/wake/suspend surfaces — no more accept-then-black-hole.
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			fs := newPhase0APIOrdinaryWorkerState(t)
@@ -76,14 +78,8 @@ func TestPhase0APISessionTargetingSurfaces_RejectTemplateFactoryTargets(t *testi
 			rec := httptest.NewRecorder()
 			h.ServeHTTP(rec, tt.req(fs))
 
-			if asyncOps[tt.name] {
-				if rec.Code != http.StatusAccepted {
-					t.Fatalf("%s status = %d, want 202; body=%s", tt.name, rec.Code, rec.Body.String())
-				}
-			} else {
-				if rec.Code < 400 {
-					t.Fatalf("%s accepted template:worker with status %d; body=%s", tt.name, rec.Code, rec.Body.String())
-				}
+			if rec.Code < 400 {
+				t.Fatalf("%s accepted template:worker with status %d; body=%s", tt.name, rec.Code, rec.Body.String())
 			}
 		})
 	}
@@ -126,7 +122,9 @@ func TestPhase0APISessionTargetingSurfaces_BareConfigNameDoesNotCreateOrdinarySe
 		},
 	}
 
-	asyncOps := map[string]bool{"POST /messages": true, "POST /submit": true}
+	// Async message/submit now gate deliverability before the 202-accept, so a
+	// bare ordinary-config name (no configured named session, no live session)
+	// is rejected synchronously (4xx) like the close/wake/suspend surfaces.
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			fs := newPhase0APIOrdinaryWorkerState(t)
@@ -136,14 +134,8 @@ func TestPhase0APISessionTargetingSurfaces_BareConfigNameDoesNotCreateOrdinarySe
 			rec := httptest.NewRecorder()
 			h.ServeHTTP(rec, tt.req(fs))
 
-			if asyncOps[tt.name] {
-				if rec.Code != http.StatusAccepted {
-					t.Fatalf("%s status = %d, want 202; body=%s", tt.name, rec.Code, rec.Body.String())
-				}
-			} else {
-				if rec.Code < 400 {
-					t.Fatalf("%s accepted ordinary config name worker with status %d; body=%s", tt.name, rec.Code, rec.Body.String())
-				}
+			if rec.Code < 400 {
+				t.Fatalf("%s accepted ordinary config name worker with status %d; body=%s", tt.name, rec.Code, rec.Body.String())
 			}
 		})
 	}

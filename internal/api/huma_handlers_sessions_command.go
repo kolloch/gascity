@@ -553,10 +553,13 @@ func providerHasOption(schema []config.ProviderOption, key string) bool {
 
 // humaHandleSessionSubmit is the Huma-typed handler for POST /v0/session/{id}/submit.
 
-func (s *Server) humaHandleSessionSubmit(_ context.Context, input *SessionSubmitInput) (*SessionSubmitOutput, error) {
+func (s *Server) humaHandleSessionSubmit(ctx context.Context, input *SessionSubmitInput) (*SessionSubmitOutput, error) {
 	store := s.state.CityBeadStore()
 	if store == nil {
 		return nil, huma.Error503ServiceUnavailable("no bead store configured")
+	}
+	if err := s.sessionTargetDeliverable(ctx, store, input.ID); err != nil {
+		return nil, humaResolveError(err)
 	}
 
 	intent := input.Body.Intent
@@ -600,10 +603,13 @@ func (s *Server) humaHandleSessionSubmit(_ context.Context, input *SessionSubmit
 
 // humaHandleSessionMessage is the Huma-typed handler for POST /v0/session/{id}/messages.
 
-func (s *Server) humaHandleSessionMessage(_ context.Context, input *SessionMessageInput) (*SessionMessageOutput, error) {
+func (s *Server) humaHandleSessionMessage(ctx context.Context, input *SessionMessageInput) (*SessionMessageOutput, error) {
 	store := s.state.CityBeadStore()
 	if store == nil {
 		return nil, huma.Error503ServiceUnavailable("no bead store configured")
+	}
+	if err := s.sessionTargetDeliverable(ctx, store, input.ID); err != nil {
+		return nil, humaResolveError(err)
 	}
 
 	reqID, reqIDErr := newRequestID()

@@ -495,6 +495,44 @@ func (s *Server) resolveSessionIDMaterializingNamedWithContext(ctx context.Conte
 	return s.resolveSessionTargetIDWithContext(ctx, store, identifier, apiSessionResolveOptions{materialize: true})
 }
 
+// sessionTargetDeliverable reports whether an async message/submit target can
+// be delivered to, without materializing an on-demand named session. It gates
+// the 202-accept in humaHandleSessionMessage / humaHandleSessionSubmit so a
+// typo'd or drifted target fails synchronously (404/409 via humaResolveError)
+// instead of being accepted and silently black-holed in the post-accept
+// delivery goroutine.
+//
+// The check mirrors the async goroutine's
+// resolveSessionIDMaterializingNamedWithContext but stops short of creating a
+// session: a configured named session that has not been materialized yet is
+// still deliverable, because the goroutine materializes it on demand. It
+// therefore treats a matching config spec as deliverable even when the
+// non-materializing resolve reports not-found. Live sessions, ambiguous
+// targets (ErrAmbiguous), and configured-named-session conflicts
+// (errConfiguredNamedSessionConflict) already surface correctly from the
+// non-materializing resolve and are returned as-is.
+func (s *Server) sessionTargetDeliverable(ctx context.Context, store beads.Store, target string) error {
+	if store == nil {
+		return fmt.Errorf("session store unavailable")
+	}
+	_, err := s.resolveSessionTargetIDWithContext(ctx, store, target, apiSessionResolveOptions{})
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, session.ErrSessionNotFound) {
+		return err
+	}
+	// A configured named session that has not yet been materialized resolves
+	// as not-found above, yet remains deliverable: the delivery goroutine
+	// materializes it on demand.
+	if _, ok, specErr := s.findNamedSessionSpecForTarget(store, target); specErr != nil {
+		return specErr
+	} else if ok {
+		return nil
+	}
+	return err
+}
+
 func (s *Server) submitMessageToSession(ctx context.Context, store beads.Store, id, message string, intent session.SubmitIntent) (session.SubmitOutcome, error) {
 	handle, err := s.workerHandleForSession(store, id)
 	if err != nil {
