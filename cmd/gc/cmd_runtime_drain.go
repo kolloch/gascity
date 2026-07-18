@@ -455,11 +455,6 @@ exits 0 cleanly. If the controller has not acted within a bounded
 timeout (max(5*PatrolInterval, 5min), capped at 30min) the command exits
 1 with a diagnostic pointing at controller health.
 
-For on-demand configured named sessions, the controller cannot restart
-the user-attended process. In that case this command reports that
-restart was skipped and returns immediately. No session.draining event
-is emitted when restart is skipped.
-
 This command is designed to be called from within a session context.
 It emits a session.draining event before waiting.`,
 		Args: cobra.NoArgs,
@@ -484,21 +479,6 @@ func cmdRuntimeRequestRestart(stdout, stderr io.Writer) int {
 	store, storeErr := openCityStoreAt(current.cityPath)
 	if storeErr != nil {
 		fmt.Fprintf(stderr, "gc runtime request-restart: opening store: %v\n", storeErr) //nolint:errcheck // best-effort stderr
-	}
-	if store != nil {
-		restartable, err := sessionRestartableByController(store, current.sessionName)
-		if err != nil {
-			fmt.Fprintf(stderr, "gc runtime request-restart: checking session type: %v\n", err) //nolint:errcheck // best-effort stderr
-			return 1
-		}
-		if !restartable {
-			if err := clearRestartRequest(store, dops, current.sessionName); err != nil {
-				fmt.Fprintf(stderr, "gc runtime request-restart: clearing stale restart request: %v\n", err) //nolint:errcheck // best-effort stderr
-				return 1
-			}
-			fmt.Fprintln(stdout, "Restart skipped for named session; controller cannot restart on-demand named sessions.") //nolint:errcheck // best-effort stdout
-			return 0
-		}
 	}
 	rec := openCityRecorderAt(current.cityPath, stderr)
 	cfg, _ := loadCityConfig(current.cityPath, stderr)
