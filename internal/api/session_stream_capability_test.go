@@ -2,7 +2,6 @@ package api
 
 import (
 	"context"
-	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -24,7 +23,7 @@ func (h peekOnlyHandle) Peek(context.Context, int) (string, error) {
 func TestStreamSessionPeekAcceptsPeekCapability(t *testing.T) {
 	srv := New(newSessionFakeState(t))
 	info := session.Info{ID: "sess-1", Template: "probe", Provider: "claude"}
-	rec := httptest.NewRecorder()
+	rec := newSyncResponseRecorder()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
@@ -33,23 +32,19 @@ func TestStreamSessionPeekAcceptsPeekCapability(t *testing.T) {
 		close(done)
 	}()
 
-	deadline := time.Now().Add(250 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		if strings.Contains(rec.Body.String(), "hello from peek") {
-			if !strings.Contains(rec.Body.String(), `"provider":"claude"`) {
-				cancel()
-				<-done
-				t.Fatalf("stream body missing provider envelope: %s", rec.Body.String())
-			}
-			cancel()
-			<-done
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
+	waitForRecorderSubstring(t, rec, "hello from peek", 250*time.Millisecond)
 	cancel()
 	<-done
-	t.Fatalf("stream body missing peek output: %s", rec.Body.String())
+
+	// Read the final body only after the streaming goroutine has returned,
+	// so the recorder is no longer being written concurrently.
+	body := rec.BodyString()
+	if !strings.Contains(body, "hello from peek") {
+		t.Fatalf("stream body missing peek output: %s", body)
+	}
+	if !strings.Contains(body, `"provider":"claude"`) {
+		t.Fatalf("stream body missing provider envelope: %s", body)
+	}
 }
 
 type peekPendingHandle struct {

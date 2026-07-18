@@ -77,6 +77,17 @@ func (f *Fake) CountCalls(method, name string) int {
 	return count
 }
 
+// CallLog returns a snapshot copy of the recorded calls, taken under the
+// lock. Callers that inspect the call log while other goroutines may still
+// be recording — e.g. background nudges spawned by async API handlers —
+// MUST use this instead of ranging over the exported Calls field directly,
+// which races with the concurrent append in every recording method.
+func (f *Fake) CallLog() []Call {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]Call(nil), f.Calls...)
+}
+
 // NewFake returns a ready-to-use [Fake].
 func NewFake() *Fake {
 	return &Fake{

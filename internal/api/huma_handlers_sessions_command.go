@@ -207,13 +207,17 @@ func (s *Server) humaHandleSessionCreate(ctx context.Context, input *SessionCrea
 
 		resp := sessionToResponse(info, s.state.Config())
 		resp.Kind = "agent"
+		// Resolve the title provider before signaling success. It reads the
+		// shared city config (cfg.Providers), and a caller that observes the
+		// success event may mutate that config; reading it first orders the
+		// read before the event-bus hand-off instead of racing the observer.
+		titleProvider := s.resolveTitleProvider()
 		s.emitSessionCreateSucceeded(reqID, resp)
 		s.persistSessionMeta(store, info.ID, body.ProjectID, nil)
 		if !waitForCommandable {
 			s.state.Poke()
 		}
 
-		titleProvider := s.resolveTitleProvider()
 		MaybeGenerateTitleAsync(store, info.ID, body.Title, body.Message, titleProvider, info.WorkDir, func(format string, args ...any) {
 			fmt.Fprintf(os.Stderr, "session %s: "+format+"\n", append([]any{info.ID}, args...)...)
 		})
@@ -358,9 +362,13 @@ func (s *Server) humaCreateProviderSession(_ context.Context, store beads.Store,
 		}
 		resp := sessionToResponse(info, s.state.Config())
 		resp.Kind = "provider"
+		// Resolve the title provider before signaling success. It reads the
+		// shared city config (cfg.Providers), and a caller that observes the
+		// success event may mutate that config; reading it first orders the
+		// read before the event-bus hand-off instead of racing the observer.
+		titleProvider := s.resolveTitleProvider()
 		s.emitSessionCreateSucceeded(reqID, resp)
 		s.persistSessionMeta(store, info.ID, body.ProjectID, optMeta)
-		titleProvider := s.resolveTitleProvider()
 		MaybeGenerateTitleAsync(store, info.ID, body.Title, body.Message, titleProvider, info.WorkDir, func(format string, args ...any) {
 			fmt.Fprintf(os.Stderr, "session %s: "+format+"\n", append([]any{info.ID}, args...)...)
 		})

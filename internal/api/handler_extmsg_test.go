@@ -143,12 +143,13 @@ func TestHandleExtMsgOutboundNotifiesPeerMembersAndMaterializesNamedSessions(t *
 	deadline = time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
 		peerNudges = 0
-		for _, call := range fs.sp.Calls {
+		calls := fs.sp.CallLog()
+		for _, call := range calls {
 			if call.Method != "Nudge" {
 				continue
 			}
 			if call.Name == source.SessionName {
-				t.Fatalf("source session should not receive peer publish nudge; calls=%#v", fs.sp.Calls)
+				t.Fatalf("source session should not receive peer publish nudge; calls=%#v", calls)
 			}
 			if call.Name == peerSessionName && strings.Contains(call.Message, "hello peers") {
 				peerNudges++
@@ -160,7 +161,7 @@ func TestHandleExtMsgOutboundNotifiesPeerMembersAndMaterializesNamedSessions(t *
 		time.Sleep(10 * time.Millisecond)
 	}
 	if peerNudges != 1 {
-		t.Fatalf("peer nudge count = %d, want 1; calls=%#v", peerNudges, fs.sp.Calls)
+		t.Fatalf("peer nudge count = %d, want 1; calls=%#v", peerNudges, fs.sp.CallLog())
 	}
 }
 
@@ -198,9 +199,10 @@ func TestExtmsgNotifyMembersDoesNotMaterializeExcludedNamedSender(t *testing.T) 
 	if _, err := session.ResolveSessionID(fs.cityBeadStore, "myrig/worker"); err == nil {
 		t.Fatal("excluded named sender was materialized")
 	}
-	for _, call := range fs.sp.Calls {
+	excludedCalls := fs.sp.CallLog()
+	for _, call := range excludedCalls {
 		if call.Method == "Nudge" {
-			t.Fatalf("excluded sender should not receive nudge; calls=%#v", fs.sp.Calls)
+			t.Fatalf("excluded sender should not receive nudge; calls=%#v", excludedCalls)
 		}
 	}
 }
@@ -292,7 +294,7 @@ func TestHandleExtMsgOutboundNotifiesDeliveredConversationMembers(t *testing.T) 
 	found := false
 	deadline = time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
-		for _, call := range fs.sp.Calls {
+		for _, call := range fs.sp.CallLog() {
 			if call.Method == "Nudge" && call.Name == peerSessionName && strings.Contains(call.Message, "thread-delivered") {
 				found = true
 				break
@@ -304,7 +306,7 @@ func TestHandleExtMsgOutboundNotifiesDeliveredConversationMembers(t *testing.T) 
 		time.Sleep(10 * time.Millisecond)
 	}
 	if !found {
-		t.Fatalf("delivered conversation peer nudge not found; calls=%#v", fs.sp.Calls)
+		t.Fatalf("delivered conversation peer nudge not found; calls=%#v", fs.sp.CallLog())
 	}
 }
 

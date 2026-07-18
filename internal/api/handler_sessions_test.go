@@ -679,6 +679,29 @@ func waitForRecorderSubstring(t *testing.T, rec *syncResponseRecorder, want stri
 	return rec.BodyString()
 }
 
+// syncLogBuffer is a mutex-guarded bytes.Buffer for capturing log output in
+// tests. The standard logger serializes concurrent writers with its own
+// mutex, but a test reading the sink via bytes.Buffer.String() races those
+// writes when a background goroutine can still log (e.g. a late async
+// result). Routing both the writes (log.SetOutput) and the reads (String)
+// through this buffer's mutex removes that race.
+type syncLogBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncLogBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncLogBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
 func TestHandleSessionList(t *testing.T) {
 	fs := newSessionFakeState(t)
 	srv := New(fs)
@@ -2412,8 +2435,8 @@ func TestHandleSessionCreateAsync(t *testing.T) {
 	if success.Session.Alias != "sky" {
 		t.Fatalf("Alias = %q, want %q", success.Session.Alias, "sky")
 	}
-	if fs.pokeCount != 1 {
-		t.Fatalf("pokeCount = %d, want 1", fs.pokeCount)
+	if got := fs.pokeCount.Load(); got != 1 {
+		t.Fatalf("pokeCount = %d, want 1", got)
 	}
 }
 
@@ -2717,8 +2740,8 @@ func TestHandleProviderSessionCreateRejectsAsync(t *testing.T) {
 	if !strings.Contains(w.Body.String(), "async session creation is only supported for configured agent templates") {
 		t.Fatalf("body = %q, want provider async guidance", w.Body.String())
 	}
-	if fs.pokeCount != 0 {
-		t.Fatalf("pokeCount = %d, want 0", fs.pokeCount)
+	if got := fs.pokeCount.Load(); got != 0 {
+		t.Fatalf("pokeCount = %d, want 0", got)
 	}
 }
 
@@ -4608,7 +4631,7 @@ func TestHandleSessionMessageLogsLateProviderResultAfterTimeout(t *testing.T) {
 		sessionMessageAsyncTimeout = prevTimeout
 	})
 
-	var logs bytes.Buffer
+	var logs syncLogBuffer
 	oldOutput := log.Writer()
 	oldFlags := log.Flags()
 	log.SetOutput(&logs)

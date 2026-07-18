@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -45,7 +46,7 @@ type fakeState struct {
 	autos         []orders.Order
 	allOrders     []orders.Order
 	services      workspacesvc.Registry
-	pokeCount     int
+	pokeCount     atomic.Int64
 	extmsgSvc     *extmsg.Services
 	adapterReg    *extmsg.AdapterRegistry
 }
@@ -106,7 +107,7 @@ func (f *fakeState) OrdersAll() []orders.Order {
 	}
 	return f.autos
 }
-func (f *fakeState) Poke()                                    { f.pokeCount++ }
+func (f *fakeState) Poke()                                    { f.pokeCount.Add(1) }
 func (f *fakeState) ServiceRegistry() workspacesvc.Registry   { return f.services }
 func (f *fakeState) ExtMsgServices() *extmsg.Services         { return f.extmsgSvc }
 func (f *fakeState) AdapterRegistry() *extmsg.AdapterRegistry { return f.adapterReg }
