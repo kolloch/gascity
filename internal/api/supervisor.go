@@ -342,9 +342,16 @@ func (sm *SupervisorMux) getCityServer(name string, state State) *Server {
 	}
 
 	sm.cacheMu.Lock()
+	defer sm.cacheMu.Unlock()
+	// A concurrent miss may have installed a Server for this State while
+	// this candidate was being built (New runs outside the lock). Return
+	// the published instance so all callers converge on one canonical
+	// Server — otherwise duplicate Servers split the per-city idempotency
+	// replay and response caches during the cold-start window.
+	if cached, ok := sm.cache[name]; ok && cached.state == state {
+		return cached.srv
+	}
 	sm.cache[name] = cachedCityServer{state: state, srv: srv}
-	sm.cacheMu.Unlock()
-
 	return srv
 }
 
