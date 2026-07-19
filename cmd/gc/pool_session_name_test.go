@@ -1718,3 +1718,258 @@ func TestReleaseOrphanedPoolAssignment_ObservesRacedReclaim(t *testing.T) {
 		}
 	})
 }
+
+// closeSessionBeadForTest creates a session bead with the given identity
+// metadata and closes it, modeling the reaped owning session of a
+// handoff-orphan work bead. The bead persists in the store (closed, not
+// deleted), which is what lets orphanedPoolAssignmentFallbackRoute recover the
+// pool route from its template/agent_name metadata after reap.
+func closeSessionBeadForTest(t *testing.T, store beads.Store, meta map[string]string) beads.Bead {
+	t.Helper()
+	sb, err := store.Create(beads.Bead{
+		Title:    "reaped worker",
+		Type:     sessionBeadType,
+		Labels:   []string{sessionBeadLabel},
+		Metadata: meta,
+	})
+	if err != nil {
+		t.Fatalf("create session bead: %v", err)
+	}
+	if err := store.Close(sb.ID); err != nil {
+		t.Fatalf("close session bead: %v", err)
+	}
+	sb, err = store.Get(sb.ID)
+	if err != nil {
+		t.Fatalf("reload closed session bead: %v", err)
+	}
+	if sb.Status != "closed" {
+		t.Fatalf("session bead status = %q, want closed", sb.Status)
+	}
+	return sb
+}
+
+// inProgressOrphanWork creates a work bead assigned to a (now-dead) session and
+// marks it in_progress, modeling work stranded when its worker was reaped.
+func inProgressOrphanWork(t *testing.T, store beads.Store, assignee string, meta map[string]string) beads.Bead {
+	t.Helper()
+	work, err := store.Create(beads.Bead{
+		Title:    "handoff-orphan work",
+		Assignee: assignee,
+		Metadata: meta,
+	})
+	if err != nil {
+		t.Fatalf("create work bead: %v", err)
+	}
+	if err := store.Update(work.ID, beads.UpdateOpts{Status: stringPtr("in_progress")}); err != nil {
+		t.Fatalf("mark work in_progress: %v", err)
+	}
+	work, err = store.Get(work.ID)
+	if err != nil {
+		t.Fatalf("reload work bead: %v", err)
+	}
+	return work
+}
+
+func ephemeralWorkerCity() *config.City {
+	return &config.City{Agents: []config.Agent{
+		{Name: "worker", MinActiveSessions: intPtr(0), MaxActiveSessions: intPtr(2)},
+	}}
+}
+
+// A polecat that pushes its branch but dies before completing the refinery
+// handoff can leave its work bead with gc.routed_to cleared. When the worker is
+// reaped, releaseOrphanedPoolAssignments must recover the pool route from the
+// closing session bead's own template metadata and restore gc.routed_to so the
+// reopened bead re-enters pool demand. Otherwise it strands open+unrouted:
+// invisible to both the pool demand probe (keys on gc.routed_to) and this
+// release path (which historically skipped empty-routed beads). Upstream
+// 3399cfc0 / #3377 (ga-fqy9). The dead session is reached via the session_name
+// identity, exercising the closed-bead List lookup.
+func TestReleaseOrphanedPoolAssignments_RestoresPoolRouteForUnroutedOrphan(t *testing.T) {
+	store := beads.NewMemStore()
+	closeSessionBeadForTest(t, store, map[string]string{
+		"session_name":         "worker-mc-dead",
+		"template":             "worker",
+		poolManagedMetadataKey: boolMetadata(true),
+	})
+	work := inProgressOrphanWork(t, store, "worker-mc-dead", map[string]string{
+		"branch": "polecat/ga-fqy9",
+	})
+
+	released := releaseOrphanedPoolAssignments(
+		store, ephemeralWorkerCity(), "", nil,
+		[]beads.Bead{work}, []beads.Store{store}, nil, nil,
+	)
+	if len(released) != 1 || released[0].ID != work.ID {
+		t.Fatalf("released = %v, want [%s]", released, work.ID)
+	}
+	if released[0].Route != "worker" {
+		t.Fatalf("released route = %q, want worker (restored pool route)", released[0].Route)
+	}
+
+	got, err := store.Get(work.ID)
+	if err != nil {
+		t.Fatalf("get work bead: %v", err)
+	}
+	if got.Status != "open" {
+		t.Fatalf("status = %q, want open", got.Status)
+	}
+	if got.Assignee != "" {
+		t.Fatalf("assignee = %q, want empty", got.Assignee)
+	}
+	if got.Metadata["gc.routed_to"] != "worker" {
+		t.Fatalf("gc.routed_to = %q, want worker (recovered from reaped session template so the pool demand probe rediscovers the work)", got.Metadata["gc.routed_to"])
+	}
+	if got.Metadata["branch"] != "polecat/ga-fqy9" {
+		t.Fatalf("branch = %q, want polecat/ga-fqy9 (per-key merge must preserve unrelated metadata)", got.Metadata["branch"])
+	}
+}
+
+// The reaped session can also be referenced by its bead ID (the direct-Get
+// lookup path) rather than session_name. Route recovery must work either way.
+func TestReleaseOrphanedPoolAssignments_RestoresPoolRouteViaSessionBeadID(t *testing.T) {
+	store := beads.NewMemStore()
+	sb := closeSessionBeadForTest(t, store, map[string]string{
+		"session_name": "worker-mc-dead",
+		"template":     "worker",
+	})
+	work := inProgressOrphanWork(t, store, sb.ID, nil)
+
+	released := releaseOrphanedPoolAssignments(
+		store, ephemeralWorkerCity(), "", nil,
+		[]beads.Bead{work}, []beads.Store{store}, nil, nil,
+	)
+	if len(released) != 1 || released[0].ID != work.ID {
+		t.Fatalf("released = %v, want [%s]", released, work.ID)
+	}
+	got, err := store.Get(work.ID)
+	if err != nil {
+		t.Fatalf("get work bead: %v", err)
+	}
+	if got.Metadata["gc.routed_to"] != "worker" {
+		t.Fatalf("gc.routed_to = %q, want worker (recovered via session bead ID lookup)", got.Metadata["gc.routed_to"])
+	}
+}
+
+// Work that still carries a route must be left untouched — route recovery only
+// backfills a genuinely empty route, never clobbers an in-flight one.
+func TestReleaseOrphanedPoolAssignments_LeavesExistingRouteUntouched(t *testing.T) {
+	store := beads.NewMemStore()
+	closeSessionBeadForTest(t, store, map[string]string{
+		"session_name": "worker-mc-dead",
+		"template":     "worker",
+	})
+	work := inProgressOrphanWork(t, store, "worker-mc-dead", map[string]string{
+		"gc.routed_to": "other-worker",
+	})
+
+	cfg := &config.City{Agents: []config.Agent{
+		{Name: "worker", MinActiveSessions: intPtr(0), MaxActiveSessions: intPtr(2)},
+		{Name: "other-worker", MinActiveSessions: intPtr(0), MaxActiveSessions: intPtr(2)},
+	}}
+	released := releaseOrphanedPoolAssignments(
+		store, cfg, "", nil,
+		[]beads.Bead{work}, []beads.Store{store}, nil, nil,
+	)
+	if len(released) != 1 || released[0].ID != work.ID {
+		t.Fatalf("released = %v, want [%s]", released, work.ID)
+	}
+	got, err := store.Get(work.ID)
+	if err != nil {
+		t.Fatalf("get work bead: %v", err)
+	}
+	if got.Metadata["gc.routed_to"] != "other-worker" {
+		t.Fatalf("gc.routed_to = %q, want unchanged other-worker", got.Metadata["gc.routed_to"])
+	}
+}
+
+// When the reaped session bead carries no template/agent_name, there is no pool
+// route to recover. Unlike upstream's releaseWorkFromClosedSessionBead — which
+// releases with the closing session bead in hand and so KNOWS the work was that
+// session's — our release path infers pool ownership solely from the route.
+// With no recoverable route it cannot classify the bead as pool work, so it
+// leaves it untouched for the named-session / consumer-layer paths rather than
+// force-releasing work it cannot attribute to a pool. This is the deliberate
+// divergence from upstream's "no-template-still-releases" behavior.
+func TestReleaseOrphanedPoolAssignments_EmptyRouteWithUntemplatedOwnerLeftUntouched(t *testing.T) {
+	store := beads.NewMemStore()
+	closeSessionBeadForTest(t, store, map[string]string{
+		"session_name": "worker-mc-dead",
+	})
+	work := inProgressOrphanWork(t, store, "worker-mc-dead", nil)
+
+	released := releaseOrphanedPoolAssignments(
+		store, ephemeralWorkerCity(), "", nil,
+		[]beads.Bead{work}, []beads.Store{store}, nil, nil,
+	)
+	if len(released) != 0 {
+		t.Fatalf("released = %v, want none (no recoverable pool route)", released)
+	}
+	got, err := store.Get(work.ID)
+	if err != nil {
+		t.Fatalf("get work bead: %v", err)
+	}
+	if got.Status != "in_progress" || got.Assignee != "worker-mc-dead" {
+		t.Fatalf("bead = {status:%q assignee:%q}, want untouched {in_progress worker-mc-dead}", got.Status, got.Assignee)
+	}
+}
+
+// A bead whose gc.routed_to is empty but which still carries a gc.run_target
+// (an in-flight workflow step) routes via the run_target mechanism, not this
+// pool path. Route recovery must leave it untouched so it is not double-routed.
+func TestReleaseOrphanedPoolAssignments_EmptyRouteWithRunTargetLeftUntouched(t *testing.T) {
+	store := beads.NewMemStore()
+	closeSessionBeadForTest(t, store, map[string]string{
+		"session_name": "worker-mc-dead",
+		"template":     "worker",
+	})
+	work := inProgressOrphanWork(t, store, "worker-mc-dead", map[string]string{
+		"gc.run_target": "graph/worker",
+	})
+
+	released := releaseOrphanedPoolAssignments(
+		store, ephemeralWorkerCity(), "", nil,
+		[]beads.Bead{work}, []beads.Store{store}, nil, nil,
+	)
+	if len(released) != 0 {
+		t.Fatalf("released = %v, want none (run_target routing owns it)", released)
+	}
+	got, err := store.Get(work.ID)
+	if err != nil {
+		t.Fatalf("get work bead: %v", err)
+	}
+	if got.Status != "in_progress" || got.Metadata["gc.routed_to"] != "" {
+		t.Fatalf("bead = {status:%q routed_to:%q}, want untouched {in_progress ''}", got.Status, got.Metadata["gc.routed_to"])
+	}
+}
+
+// The recovered route must gate through the same ephemeral-pool check as an
+// already-routed bead. If the reaped session's template maps to a non-ephemeral
+// agent (max_active_sessions=0), the work is not pool-claimable, so recovery
+// must leave it untouched.
+func TestReleaseOrphanedPoolAssignments_EmptyRouteNonEphemeralTemplateLeftUntouched(t *testing.T) {
+	store := beads.NewMemStore()
+	closeSessionBeadForTest(t, store, map[string]string{
+		"session_name": "frozen-mc-dead",
+		"template":     "frozen",
+	})
+	work := inProgressOrphanWork(t, store, "frozen-mc-dead", nil)
+
+	cfg := &config.City{Agents: []config.Agent{
+		{Name: "frozen", MinActiveSessions: intPtr(0), MaxActiveSessions: intPtr(0)},
+	}}
+	released := releaseOrphanedPoolAssignments(
+		store, cfg, "", nil,
+		[]beads.Bead{work}, []beads.Store{store}, nil, nil,
+	)
+	if len(released) != 0 {
+		t.Fatalf("released = %v, want none (recovered route maps to non-ephemeral agent)", released)
+	}
+	got, err := store.Get(work.ID)
+	if err != nil {
+		t.Fatalf("get work bead: %v", err)
+	}
+	if got.Status != "in_progress" {
+		t.Fatalf("status = %q, want untouched in_progress", got.Status)
+	}
+}

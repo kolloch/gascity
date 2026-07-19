@@ -149,8 +149,33 @@ func releaseOrphanedPoolAssignments(
 		}
 		assignee := strings.TrimSpace(wb.Assignee)
 		template := strings.TrimSpace(wb.Metadata["gc.routed_to"])
+		restoredRoute := ""
 		if template == "" {
-			continue
+			// Empty-route handoff-orphan recovery (ga-fqy9, upstream
+			// 3399cfc0 / #3377). A bead can reach reap with no gc.routed_to
+			// — a non-atomic done-handoff, a manual op, a non-pool formula.
+			// Pool demand keys on gc.routed_to, so an unrouted bead is
+			// invisible to dispatch and the empty-route skip that used to
+			// live here stranded it open forever. Recover the route from the
+			// reaped owning session bead's own template/agent_name metadata
+			// so the reopened bead re-enters pool demand and a fresh worker
+			// re-attempts the idempotent handoff. ZFC-safe: the route is the
+			// session bead's configured template, never a hardcoded role.
+			// Mirrors the ga-kw66 backfill in
+			// unclaimWorkAssignedToRetiredSessionBead.
+			//
+			// Recover only when BOTH routes are empty (upstream's guard): a
+			// bead still carrying gc.run_target routes via that mechanism,
+			// not this pool path, so restoring gc.routed_to would double-route
+			// it. An unassigned bead has no owning session to recover from.
+			if assignee == "" || strings.TrimSpace(wb.Metadata["gc.run_target"]) != "" {
+				continue
+			}
+			restoredRoute = orphanedPoolAssignmentFallbackRoute(store, assignee)
+			if restoredRoute == "" {
+				continue
+			}
+			template = restoredRoute
 		}
 		agentCfg := findAgentByTemplate(cfg, template)
 		if agentCfg == nil || !agentCfg.SupportsGenericEphemeralSessions() {
@@ -192,7 +217,7 @@ func releaseOrphanedPoolAssignments(
 		if !liveWorkAssignmentStillReleasable(ownerStore, wb.ID, assignee) {
 			continue
 		}
-		if !releaseOrphanedPoolAssignment(ownerStore, wb.ID) {
+		if !releaseOrphanedPoolAssignmentWithRoute(ownerStore, wb.ID, restoredRoute) {
 			continue
 		}
 		released = append(released, releasedPoolAssignment{ID: wb.ID, Index: i, PrevAssignee: assignee, Route: template})
@@ -286,6 +311,17 @@ func isRecoverableUnassignedInProgressPoolWork(cfg *config.City, wb beads.Bead) 
 }
 
 func releaseOrphanedPoolAssignment(store beads.Store, id string) bool {
+	return releaseOrphanedPoolAssignmentWithRoute(store, id, "")
+}
+
+// releaseOrphanedPoolAssignmentWithRoute reopens an orphaned pool work bead by
+// clearing its assignee and resetting status to open. When restoredRoute is
+// non-empty (empty-route handoff-orphan recovery), it also backfills
+// gc.routed_to so the reopened bead re-enters pool demand; the per-key metadata
+// merge in Store.Update leaves unrelated metadata (branch, gc.kind, …)
+// untouched. restoredRoute is the empty string for the common
+// route-preserving release, which never writes metadata.
+func releaseOrphanedPoolAssignmentWithRoute(store beads.Store, id, restoredRoute string) bool {
 	if store == nil || id == "" {
 		return false
 	}
@@ -293,11 +329,73 @@ func releaseOrphanedPoolAssignment(store beads.Store, id string) bool {
 		Assignee: stringPtr(""),
 		Status:   stringPtr("open"),
 	}
+	if restoredRoute = strings.TrimSpace(restoredRoute); restoredRoute != "" {
+		opts.Metadata = map[string]string{"gc.routed_to": restoredRoute}
+	}
 	if store.Update(id, opts) != nil {
 		return false
 	}
 	verifyReleasedPoolAssignment(store, id, "")
 	return true
+}
+
+// orphanedPoolAssignmentFallbackRoute recovers the pool route for an
+// empty-routed orphan from its owning session bead's own template/agent_name
+// metadata. The owning session is, by definition of orphan release, no longer
+// live, so this looks up the session bead regardless of status — a reaped pool
+// worker's bead is closed-but-present — keyed by the work bead's assignee
+// identity. Returns "" when no owning session bead is found or it carries no
+// template/agent_name to recover from. ZFC-safe: the route is the session
+// bead's configured template, never a hardcoded role name.
+func orphanedPoolAssignmentFallbackRoute(store beads.Store, assignee string) string {
+	sb, ok := owningSessionBeadForAssignee(store, assignee)
+	if !ok {
+		return ""
+	}
+	return retiredSessionFallbackRoute(sb)
+}
+
+// owningSessionBeadForAssignee finds the session bead (open OR closed) whose
+// identity matches assignee. It mirrors liveOpenSessionAssignmentExists's dual
+// lookup — a direct Get on the bead-ID candidates derived from the assignee,
+// then a label scan — but includes closed beads, because the owning session of
+// an orphaned work bead has usually already been reaped (closed). Returns the
+// first session bead whose sessionBeadAssigneeIdentities contains assignee.
+func owningSessionBeadForAssignee(store beads.Store, assignee string) (beads.Bead, bool) {
+	assignee = strings.TrimSpace(assignee)
+	if store == nil || assignee == "" {
+		return beads.Bead{}, false
+	}
+	for _, id := range directSessionBeadIDCandidates(assignee) {
+		sb, err := store.Get(id)
+		if err != nil || !isSessionBead(sb) {
+			continue
+		}
+		for _, candidate := range sessionBeadAssigneeIdentities(sb) {
+			if assignee == candidate {
+				return sb, true
+			}
+		}
+	}
+	sessions, err := store.List(beads.ListQuery{
+		Label:         sessionBeadLabel,
+		IncludeClosed: true,
+	})
+	if err != nil {
+		log.Printf("releaseOrphanedPoolAssignments: owning-session lookup failed for assignee %q: %v", assignee, err)
+		return beads.Bead{}, false
+	}
+	for _, sb := range sessions {
+		if !isSessionBead(sb) {
+			continue
+		}
+		for _, candidate := range sessionBeadAssigneeIdentities(sb) {
+			if assignee == candidate {
+				return sb, true
+			}
+		}
+	}
+	return beads.Bead{}, false
 }
 
 // verifyReleasedPoolAssignment reads a pool work bead back immediately after
