@@ -203,6 +203,77 @@ func TestPackCommandTemplateBadTemplate(t *testing.T) {
 	}
 }
 
+func TestIsNativePrivateHelperInvocation(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+		want bool
+	}{
+		{"bd-store-bridge", []string{"bd-store-bridge", "--dir", "/x"}, true},
+		{"dolt-config", []string{"dolt-config", "write-managed"}, true},
+		{"dolt-state", []string{"dolt-state", "read-provider"}, true},
+		{"ordinary status still discovers", []string{"status"}, false},
+		{"ordinary bd still discovers", []string{"bd", "list"}, false},
+		{"empty", nil, false},
+		{"city flag (separate) before helper", []string{"--city", "/tmp/city", "dolt-state"}, true},
+		{"city flag (joined) before helper", []string{"--city=/tmp/city", "bd-store-bridge"}, true},
+		{"rig value equal to helper name is not the command", []string{"--rig", "dolt-state", "status"}, false},
+		{"json-schema flag then ordinary command", []string{"--json-schema", "sling"}, false},
+		{"helper name only as rig value", []string{"--rig", "bd-store-bridge"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isNativePrivateHelperInvocation(tc.args); got != tc.want {
+				t.Fatalf("isNativePrivateHelperInvocation(%q) = %v, want %v", tc.args, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestNewRootCmdSkipsPackDiscoveryForNativePrivateHelpers(t *testing.T) {
+	dir := t.TempDir()
+	cityDir := filepath.Join(dir, "city")
+	if err := os.MkdirAll(filepath.Join(cityDir, "commands", "hello"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cityDir, "city.toml"), []byte("[workspace]\nname = \"test\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cityDir, "pack.toml"), []byte("[pack]\nname = \"backstage\"\nschema = 2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cityDir, "commands", "hello", "run.sh"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	oldWd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(cityDir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(oldWd) })
+
+	oldArgs := os.Args
+	t.Cleanup(func() { os.Args = oldArgs })
+
+	// Native private helper invocation: eager discovery is skipped, so the
+	// pack namespace command must be absent (no city-config load performed).
+	os.Args = []string{"gc", "dolt-state", "read-provider"}
+	root := newRootCmd(&bytes.Buffer{}, &bytes.Buffer{})
+	if findSubcommand(root, "backstage") != nil {
+		t.Fatal("pack discovery ran for native private helper; backstage namespace should be absent")
+	}
+
+	// Ordinary command invocation: discovery runs and the pack namespace
+	// command is registered as before.
+	os.Args = []string{"gc", "status"}
+	root = newRootCmd(&bytes.Buffer{}, &bytes.Buffer{})
+	if findSubcommand(root, "backstage") == nil {
+		t.Fatal("pack discovery skipped for ordinary command; backstage namespace should be present")
+	}
+}
+
 func TestNewRootCmdExposesRootPackCommands(t *testing.T) {
 	dir := t.TempDir()
 	cityDir := filepath.Join(dir, "city")

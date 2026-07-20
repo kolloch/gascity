@@ -146,6 +146,11 @@ func discoveredHelpRequested(args []string) bool {
 	return false
 }
 
+// packCommandExecutable resolves the path of the currently-running gc binary
+// used to pin GC_BIN for discovered pack commands. Indirected from
+// os.Executable so tests can exercise the fail-closed path where it errors.
+var packCommandExecutable = os.Executable
+
 func runDiscoveredCommand(entry config.DiscoveredCommand, cityPath, cityName string, args []string, stdinR io.Reader, stdout, stderr io.Writer) int {
 	packDir := entry.PackDir
 	if packDir == "" {
@@ -166,6 +171,15 @@ func runDiscoveredCommand(entry config.DiscoveredCommand, cityPath, cityName str
 		"GC_PACK_NAME="+entry.PackName,
 		"GC_CITY_NAME="+cityName,
 	)
+	// Pin GC_BIN to the invoking gc so a pack command that recursively calls
+	// gc uses THIS build, not a stale ambient GC_BIN inherited from a
+	// different install. Strip any inherited GC_BIN first, then re-add the
+	// canonical path. Fail closed: if os.Executable() errors, leave GC_BIN
+	// unset (the pack falls back to `gc` on PATH) rather than leak a stale path.
+	cmd.Env = removeEnvKey(cmd.Env, "GC_BIN")
+	if exe, err := packCommandExecutable(); err == nil && exe != "" {
+		cmd.Env = append(cmd.Env, "GC_BIN="+exe)
+	}
 
 	if err := cmd.Run(); err != nil {
 		var exitErr *exec.ExitError

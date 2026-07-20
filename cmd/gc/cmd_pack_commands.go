@@ -51,11 +51,61 @@ func quietLoadCityConfig(cityPath string) (*config.City, error) {
 	return loadCityConfig(cityPath, io.Discard)
 }
 
+// nativePrivateHelperCommands are native gc subcommands the Beads provider
+// invokes directly (bd-store-bridge during store operations; dolt-config and
+// dolt-state during managed-dolt lifecycle), sometimes while the controller
+// is reloading and packs are mid-composition. Pack-command discovery re-enters
+// city-config loading, which can contend on the same config cache these
+// helpers touch — and they are native commands that never need pack discovery
+// to resolve — so discovery is skipped when one of them is the invoked command.
+var nativePrivateHelperCommands = map[string]bool{
+	"bd-store-bridge": true,
+	"dolt-config":     true,
+	"dolt-state":      true,
+}
+
+// globalValueFlags are gc's persistent flags that consume the following token
+// as their value in separate-token form (e.g. --city PATH). Arg scanning skips
+// that value so it is not mistaken for the invoked command.
+var globalValueFlags = map[string]bool{
+	"--city": true,
+	"--rig":  true,
+}
+
+// firstPositionalArg returns the first non-flag token in args — the top-level
+// subcommand gc will dispatch to — or "" if there is none. Global persistent
+// flags are skipped; for the value-taking ones in separate-token form the
+// following value token is skipped too. An `=`-joined flag (--city=x) is a
+// single token needing no lookahead.
+func firstPositionalArg(args []string) string {
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if strings.HasPrefix(arg, "-") {
+			if globalValueFlags[arg] {
+				i++
+			}
+			continue
+		}
+		return arg
+	}
+	return ""
+}
+
+// isNativePrivateHelperInvocation reports whether gc was invoked to run one of
+// the native private helper subcommands. See nativePrivateHelperCommands.
+func isNativePrivateHelperInvocation(args []string) bool {
+	return nativePrivateHelperCommands[firstPositionalArg(args)]
+}
+
 // registerPackCommands attempts to discover the city, load config, and
 // register pack-provided CLI commands as top-level subcommands. Fails
 // silently if not in a city or config fails to load — core commands
-// always work.
+// always work. Discovery is skipped entirely for native private-helper
+// invocations so those hot-path helpers never pay for a city-config load.
 func registerPackCommands(root *cobra.Command, stdout, stderr io.Writer) {
+	if isNativePrivateHelperInvocation(os.Args[1:]) {
+		return
+	}
 	cityPath, err := resolveCity()
 	if err != nil {
 		return
@@ -118,6 +168,9 @@ func expandScriptTemplate(script, cityPath, cityName, packDir string) string {
 // one more time. Returns true if a pack command was found and executed.
 func tryPackCommandFallback(args []string, stdout, stderr io.Writer) bool {
 	if len(args) == 0 {
+		return false
+	}
+	if isNativePrivateHelperInvocation(args) {
 		return false
 	}
 

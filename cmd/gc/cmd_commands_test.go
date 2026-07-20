@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -265,6 +266,88 @@ done
 		if !strings.Contains(out, want) {
 			t.Fatalf("stdout missing %q, got:\n%s", want, out)
 		}
+	}
+}
+
+func TestRunDiscoveredCommand_PinsGCBinToInvokingExecutable(t *testing.T) {
+	dir := t.TempDir()
+	sourceDir := filepath.Join(dir, "commands", "status")
+	if err := os.MkdirAll(sourceDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	scriptPath := filepath.Join(sourceDir, "run.sh")
+	if err := os.WriteFile(scriptPath, []byte("#!/bin/sh\necho \"gcbin=$GC_BIN\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// A stale ambient GC_BIN (e.g. from a different gc install) must not leak
+	// through to a discovered pack command that recursively invokes gc.
+	t.Setenv("GC_BIN", "/stale/install/gc")
+
+	entry := config.DiscoveredCommand{
+		BindingName: "gs",
+		PackName:    "mypack",
+		Command:     []string{"status"},
+		RunScript:   scriptPath,
+		SourceDir:   sourceDir,
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := runDiscoveredCommand(entry, dir, "testcity", nil, strings.NewReader(""), &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr: %s", code, stderr.String())
+	}
+
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	out := stdout.String()
+	if !strings.Contains(out, "gcbin="+exe) {
+		t.Fatalf("child GC_BIN not pinned to invoking executable %q, got:\n%s", exe, out)
+	}
+	if strings.Contains(out, "/stale/install/gc") {
+		t.Fatalf("stale ambient GC_BIN leaked into child env, got:\n%s", out)
+	}
+}
+
+func TestRunDiscoveredCommand_FailsClosedWhenExecutableUnavailable(t *testing.T) {
+	dir := t.TempDir()
+	sourceDir := filepath.Join(dir, "commands", "status")
+	if err := os.MkdirAll(sourceDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	scriptPath := filepath.Join(sourceDir, "run.sh")
+	if err := os.WriteFile(scriptPath, []byte("#!/bin/sh\necho \"gcbin=[$GC_BIN]\"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// When os.Executable() errors we must fail closed: strip the stale ambient
+	// GC_BIN and leave it unset rather than leak a path from a different build.
+	t.Setenv("GC_BIN", "/stale/install/gc")
+	orig := packCommandExecutable
+	packCommandExecutable = func() (string, error) { return "", errors.New("no executable") }
+	t.Cleanup(func() { packCommandExecutable = orig })
+
+	entry := config.DiscoveredCommand{
+		PackName:  "mypack",
+		Command:   []string{"status"},
+		RunScript: scriptPath,
+		SourceDir: sourceDir,
+	}
+
+	var stdout, stderr bytes.Buffer
+	code := runDiscoveredCommand(entry, dir, "testcity", nil, strings.NewReader(""), &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0; stderr: %s", code, stderr.String())
+	}
+
+	out := stdout.String()
+	if !strings.Contains(out, "gcbin=[]") {
+		t.Fatalf("GC_BIN should be stripped (fail closed) when executable unavailable, got:\n%s", out)
+	}
+	if strings.Contains(out, "/stale/install/gc") {
+		t.Fatalf("stale ambient GC_BIN retained on fail-closed path, got:\n%s", out)
 	}
 }
 
