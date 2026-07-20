@@ -993,3 +993,103 @@ func TestIsClosedHookCandidate(t *testing.T) {
 		})
 	}
 }
+
+// TestFilterUnreadyHookCandidatesExcludesMessageBeads covers the mail-bead
+// hardening (ga-om6b, upstream #4419 #4442). Mail addressed to a session sets
+// Assignee = recipient, so a message bead can surface as a hook work
+// candidate. Only the `bd ready` tiers already omit messages via ready-logic;
+// the post-filter drops them defensively across every tier so a polecat never
+// parks on a mail bead instead of real routed work.
+func TestFilterUnreadyHookCandidatesExcludesMessageBeads(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	input := `[{"id":"mail-1","issue_type":"message","status":"open"}]`
+
+	got := filterUnreadyHookCandidates(input, now)
+
+	if strings.Contains(got, "mail-1") {
+		t.Fatalf("filterUnreadyHookCandidates kept a message bead: %s", got)
+	}
+}
+
+// TestFilterUnreadyHookCandidatesExcludesInProgressMessageBeads exercises the
+// specific Tier-1 latent gap ga-om6b closes: `bd list --status in_progress
+// --assignee` does not pass through ready-logic, so a message bead somehow
+// status=in_progress AND assigned to a session identity would otherwise be
+// returned as work. It must be dropped while a sibling non-message
+// in_progress row survives.
+func TestFilterUnreadyHookCandidatesExcludesInProgressMessageBeads(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	input := `[{"id":"mail-ip","issue_type":"message","status":"in_progress","assignee":"gascity/gastown.furiosa"},` +
+		`{"id":"task-ip","issue_type":"task","status":"in_progress","assignee":"gascity/gastown.furiosa"}]`
+
+	got := filterUnreadyHookCandidates(input, now)
+
+	if strings.Contains(got, "mail-ip") {
+		t.Fatalf("filterUnreadyHookCandidates kept an in_progress message bead: %s", got)
+	}
+	if !strings.Contains(got, "task-ip") {
+		t.Fatalf("filterUnreadyHookCandidates dropped the sibling in_progress task bead: %s", got)
+	}
+}
+
+// TestDoHookNeverReturnsMessageBead is the end-to-end guarantee from ga-om6b:
+// a type=message bead assigned to the session identity — including one forced
+// to status=in_progress — is never surfaced as work by doHook, while real
+// routed work alongside it still flows.
+func TestDoHookNeverReturnsMessageBead(t *testing.T) {
+	t.Run("in_progress message alone yields no work", func(t *testing.T) {
+		runner := func(string, string) (string, error) {
+			return `[{"id":"mail-1","issue_type":"message","status":"in_progress","assignee":"gascity/gastown.furiosa"}]`, nil
+		}
+		var stdout, stderr bytes.Buffer
+		code := doHook("bd ready", "", false, runner, &stdout, &stderr)
+		if code != 1 {
+			t.Fatalf("doHook(message only) = %d, want 1; stderr=%s", code, stderr.String())
+		}
+		if strings.Contains(stdout.String(), "mail-1") {
+			t.Fatalf("doHook surfaced a message bead as work: %s", stdout.String())
+		}
+	})
+
+	t.Run("message dropped, real work survives", func(t *testing.T) {
+		runner := func(string, string) (string, error) {
+			return `[{"id":"mail-1","issue_type":"message","status":"in_progress","assignee":"gascity/gastown.furiosa"},` +
+				`{"id":"ga-real","issue_type":"task","status":"open"}]`, nil
+		}
+		var stdout, stderr bytes.Buffer
+		code := doHook("bd ready", "", false, runner, &stdout, &stderr)
+		if code != 0 {
+			t.Fatalf("doHook(message + work) = %d, want 0; stderr=%s", code, stderr.String())
+		}
+		if strings.Contains(stdout.String(), "mail-1") {
+			t.Fatalf("doHook surfaced a message bead as work: %s", stdout.String())
+		}
+		if !strings.Contains(stdout.String(), "ga-real") {
+			t.Fatalf("doHook dropped real work alongside the message bead: %s", stdout.String())
+		}
+	})
+}
+
+// TestIsMessageHookCandidate exercises the helper directly across the field
+// shapes a work_query row can present.
+func TestIsMessageHookCandidate(t *testing.T) {
+	cases := []struct {
+		name string
+		item map[string]any
+		want bool
+	}{
+		{"message", map[string]any{"issue_type": "message"}, true},
+		{"message-upper-padded", map[string]any{"issue_type": " Message "}, true},
+		{"task", map[string]any{"issue_type": "task"}, false},
+		{"epic", map[string]any{"issue_type": "epic"}, false},
+		{"missing-issue-type", map[string]any{"id": "hw-x"}, false},
+		{"non-string-issue-type", map[string]any{"issue_type": 3}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isMessageHookCandidate(tc.item); got != tc.want {
+				t.Fatalf("isMessageHookCandidate(%v) = %v, want %v", tc.item, got, tc.want)
+			}
+		})
+	}
+}

@@ -496,13 +496,16 @@ func workQueryHasReadyWork(output string) bool {
 }
 
 // filterUnreadyHookCandidates strips beads from work_query output that fail
-// bd ready semantics: a closed primary status, future defer_until, or any
-// open blocking dep in the row's blocked_by array. The work_query is
-// expected to gate these, but defensive filtering here prevents a single
-// broken query from cascading into agent action on a bead it cannot
+// bd ready semantics: a message issue_type, a closed primary status, future
+// defer_until, or any open blocking dep in the row's blocked_by array. The
+// work_query is expected to gate these, but defensive filtering here prevents
+// a single broken query from cascading into agent action on a bead it cannot
 // progress. The closed-status guard specifically defends against Dolt
 // status secondary-index drift, where a stale index can make
-// `bd list --status=open` return a row whose primary status is closed.
+// `bd list --status=open` return a row whose primary status is closed. The
+// message guard closes the Tier-1 gap where `bd list --status in_progress
+// --assignee` (which skips bd ready-logic) could surface a mail bead
+// addressed to the session as work (ga-om6b, upstream #4419 #4442).
 // Pure function over JSON; takes time.Time so tests stay deterministic.
 func filterUnreadyHookCandidates(output string, now time.Time) string {
 	if output == "" {
@@ -523,6 +526,9 @@ func filterUnreadyHookCandidates(output string, now time.Time) string {
 			filtered = append(filtered, item)
 			continue
 		}
+		if isMessageHookCandidate(obj) {
+			continue
+		}
 		if isClosedHookCandidate(obj) {
 			continue
 		}
@@ -539,6 +545,19 @@ func filterUnreadyHookCandidates(output string, now time.Time) string {
 		return output
 	}
 	return string(reencoded)
+}
+
+// isMessageHookCandidate reports whether a work_query row is a mail bead
+// (issue_type == "message", case-insensitive, trimmed). Mail sent to a session
+// sets Assignee = recipient (see internal/mail/beadmail), so a message bead can
+// otherwise be returned as work — most visibly by the Tier-1
+// `bd list --status in_progress --assignee` query, which does not pass through
+// bd ready-logic (the only tier that already omits messages). Dropping message
+// beads here keeps a polecat from parking on a mail bead instead of real routed
+// work (ga-om6b, upstream #4419 #4442).
+func isMessageHookCandidate(item map[string]any) bool {
+	issueType, ok := item["issue_type"].(string)
+	return ok && strings.EqualFold(strings.TrimSpace(issueType), "message")
 }
 
 // isClosedHookCandidate reports whether a work_query row carries a primary
