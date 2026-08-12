@@ -965,6 +965,27 @@ func healStatePatch(session beads.Bead, alive bool, clk clock.Clock) map[string]
 			batch["pending_create_started_at"] = ""
 		}
 	}
+	// ga-wy6: when pending_create_claim is set but its lease has fully
+	// expired (pendingCreateLeaseActive=false), settle the bead at asleep
+	// and clear the lease in the same batch. Without this, the lifecycle
+	// projection — which is intentionally clock-free for wake-cause
+	// derivation — keeps emitting WakeCausePendingCreate for the lingering
+	// flag, oscillating an asleep bead back to creating each tick and
+	// continuing to count it as in-flight new demand in
+	// poolSessionConsumesNewDemand. The cleanup requires a concrete anchor
+	// (CreatedAt or pending_create_started_at) so legacy zero-CreatedAt
+	// beads — which sessionStartRequested intentionally heals to creating —
+	// keep their pending_create_claim semantics.
+	if clk != nil && !alive && strings.TrimSpace(meta["state"]) != "failed-create" &&
+		strings.TrimSpace(meta["pending_create_claim"]) == "true" &&
+		!pendingCreateLeaseActive(session, clk, 0) {
+		_, hasStartedAt := parseRFC3339Metadata(meta["pending_create_started_at"])
+		if !session.CreatedAt.IsZero() || hasStartedAt {
+			target = string(sessionpkg.StateAsleep)
+			batch["pending_create_claim"] = ""
+			batch["pending_create_started_at"] = ""
+		}
+	}
 	if target == "" {
 		return nil
 	}

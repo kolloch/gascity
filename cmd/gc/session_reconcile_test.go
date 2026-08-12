@@ -1552,6 +1552,69 @@ func TestHealState_StaleCreatingWithoutPendingClaimHealsToAsleep(t *testing.T) {
 	}
 }
 
+// TestHealState_AsleepWithExpiredPendingClaimClearsLease verifies that when
+// a bead is asleep (or healing toward asleep) with pending_create_claim=true
+// and the lease has fully expired (pendingCreateNeverStartedTimeout =
+// 10min passed since the anchor), healState clears the lease so subsequent
+// ticks stop projecting the bead back to creating via WakeCausePendingCreate
+// and so poolSessionConsumesNewDemand stops counting the bead as in-flight
+// new demand. Regression for ga-wy6.
+func TestHealState_AsleepWithExpiredPendingClaimClearsLease(t *testing.T) {
+	store := newTestStore()
+	clk := &clock.Fake{Time: time.Date(2026, 3, 29, 4, 0, 0, 0, time.UTC)}
+
+	tests := []struct {
+		name        string
+		mutate      func(b *beads.Bead)
+		wantCleared bool
+	}{
+		{
+			name: "asleep with expired never-started lease (anchor at CreatedAt)",
+			mutate: func(b *beads.Bead) {
+				b.Metadata["state"] = "asleep"
+				b.Metadata["pending_create_claim"] = "true"
+				b.CreatedAt = clk.Now().Add(-2 * pendingCreateNeverStartedTimeout)
+			},
+			wantCleared: true,
+		},
+		{
+			name: "creating with expired lease heals to asleep and clears lease",
+			mutate: func(b *beads.Bead) {
+				b.Metadata["state"] = "creating"
+				b.Metadata["pending_create_claim"] = "true"
+				b.CreatedAt = clk.Now().Add(-2 * pendingCreateNeverStartedTimeout)
+			},
+			wantCleared: true,
+		},
+		{
+			name: "asleep with fresh lease preserves pending_create_claim",
+			mutate: func(b *beads.Bead) {
+				b.Metadata["state"] = "asleep"
+				b.Metadata["pending_create_claim"] = "true"
+				b.Metadata["pending_create_started_at"] = clk.Now().UTC().Format(time.RFC3339)
+				b.CreatedAt = clk.Now()
+			},
+			wantCleared: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			session := makeBead("b1", map[string]string{})
+			tt.mutate(&session)
+
+			healState(&session, false, store, clk)
+
+			got := strings.TrimSpace(session.Metadata["pending_create_claim"])
+			if tt.wantCleared && got != "" {
+				t.Fatalf("pending_create_claim = %q, want cleared", got)
+			}
+			if !tt.wantCleared && got != "true" {
+				t.Fatalf("pending_create_claim = %q, want preserved (still true)", got)
+			}
+		})
+	}
+}
+
 func TestHealStatePatchProjectsRuntimeLiveness(t *testing.T) {
 	now := time.Date(2026, 4, 15, 14, 0, 0, 0, time.UTC)
 	clk := &clock.Fake{Time: now}
